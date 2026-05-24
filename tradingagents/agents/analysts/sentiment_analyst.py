@@ -1,20 +1,18 @@
 """Sentiment analyst — multi-source sentiment analysis for a target ticker.
 
-Previously named ``social_media_analyst``. Renamed and redesigned because
-the old version had a prompt that demanded social-media analysis but the
-only tool available was Yahoo Finance news — which led LLMs to fabricate
-Reddit/X/StockTwits content under prompt pressure (verified live).
+Monopoly fork status: this module has been *minimally* migrated from the
+upstream stock-sentiment design to keep the agents package import-clean
+after the data-layer cutover. The pre-fetch pipeline now consumes the
+crypto vendor modules (`crypto_reddit`, `crypto_twitter`,
+`crypto_news`-backed `get_news` tool), but the prompt and analysis
+guidance still carry stock-era assumptions.
 
-The redesigned agent pre-fetches three complementary data sources before
-the LLM is invoked and injects them into the prompt as structured blocks:
-
-  1. News headlines     — Yahoo Finance (institutional framing)
-  2. StockTwits messages — retail-trader posts indexed by cashtag, with
-                           user-labeled Bullish/Bearish sentiment tags
-  3. Reddit posts        — r/wallstreetbets, r/stocks, r/investing
-
-The agent does not use tool-calling; the data is in the prompt from
-turn 0. The LLM produces the sentiment report in a single invocation.
+TODO (Week 3, post-Twitter-source decision): rewrite the prompt to
+reflect crypto-native sentiment dynamics (funding-rate sentiment,
+exchange-specific narratives, KOL identification) once the Twitter
+vendor is real. Until then this agent ships with degraded Twitter
+content (a clear "data pending" placeholder) and crypto-subreddit
+Reddit input.
 
 See: https://github.com/TauricResearch/TradingAgents/issues/557
 """
@@ -27,8 +25,9 @@ from tradingagents.agents.utils.agent_utils import (
     get_language_instruction,
     get_news,
 )
-from tradingagents.dataflows.reddit import fetch_reddit_posts
-from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
+from tradingagents.agents.utils.symbol_utils import to_base_symbol
+from tradingagents.dataflows.crypto_reddit import get_reddit
+from tradingagents.dataflows.crypto_twitter import get_tweets
 
 
 def _seven_days_back(trade_date: str) -> str:
@@ -47,21 +46,25 @@ def create_sentiment_analyst(llm):
         ticker = state["company_of_interest"]
         end_date = state["trade_date"]
         start_date = _seven_days_back(end_date)
-        instrument_context = build_instrument_context(ticker)
+        asset_type = state.get("asset_type", "crypto")
+        instrument_context = build_instrument_context(ticker, asset_type)
+
+        # Base-asset code (e.g. BTC-USD → BTC) for symbol-keyword filters.
+        base = to_base_symbol(ticker)
 
         # Pre-fetch all three sources. Each fetcher degrades gracefully and
         # returns a string (no exceptions surface from here), so the LLM
         # always sees something — either real data or a clear placeholder.
         news_block = get_news.func(ticker, start_date, end_date)
-        stocktwits_block = fetch_stocktwits_messages(ticker, limit=30)
-        reddit_block = fetch_reddit_posts(ticker)
+        twitter_block = get_tweets((base,), hours=24 * 7)
+        reddit_block = get_reddit((base,), hours=24 * 7)
 
         system_message = _build_system_message(
             ticker=ticker,
             start_date=start_date,
             end_date=end_date,
             news_block=news_block,
-            stocktwits_block=stocktwits_block,
+            twitter_block=twitter_block,
             reddit_block=reddit_block,
         )
 
@@ -102,30 +105,35 @@ def _build_system_message(
     start_date: str,
     end_date: str,
     news_block: str,
-    stocktwits_block: str,
+    twitter_block: str,
     reddit_block: str,
 ) -> str:
-    """Assemble the sentiment-analyst system message with structured data blocks."""
+    """Assemble the sentiment-analyst system message with structured data blocks.
+
+    Note (Monopoly fork): the prompt body still uses stock-era examples
+    pending the Week-3 crypto-native rewrite. Block names and tool wiring
+    have been migrated; analytical guidance has not. See module docstring.
+    """
     return f"""You are a financial market sentiment analyst. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}, drawing on three complementary data sources that have already been collected for you.
 
 ## Data sources (pre-fetched, in this prompt)
 
-### News headlines — Yahoo Finance, past 7 days
+### News headlines — CoinDesk / CoinTelegraph, past 7 days
 Institutional framing. Fact-driven, slower-moving signal.
 
 <start_of_news>
 {news_block}
 <end_of_news>
 
-### StockTwits messages — retail-trader social platform indexed by cashtag
-Fast-moving signal. Each message carries a user-labeled sentiment tag (Bullish / Bearish / no-label) plus the message body.
+### Twitter posts — crypto-related, past 7 days
+Fast-moving social signal. (Data source pending — see docs/dataflows-decisions.md §6.)
 
-<start_of_stocktwits>
-{stocktwits_block}
-<end_of_stocktwits>
+<start_of_twitter>
+{twitter_block}
+<end_of_twitter>
 
-### Reddit posts — r/wallstreetbets, r/stocks, r/investing (past 7 days)
-Community discussion. Engagement signal via upvote score and comment count. Subreddit character matters (r/wallstreetbets is often contrarian/exuberant; r/stocks more measured; r/investing longer-term).
+### Reddit posts — r/CryptoCurrency, r/Bitcoin, r/ethfinance, r/CryptoMarkets (past 7 days)
+Community discussion. Engagement signal via upvote score and comment count. Subreddit character matters (r/CryptoCurrency is the broad firehose; r/Bitcoin / r/ethfinance more chain-specific; r/CryptoMarkets trader-oriented).
 
 <start_of_reddit>
 {reddit_block}

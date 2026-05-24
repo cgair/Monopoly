@@ -92,11 +92,13 @@ DEFAULT_CONFIG = _apply_env_overrides({
     ],
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
+    # Monopoly fork: crypto perpetual futures data vendors
     "data_vendors": {
-        "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance
-        "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance
-        "fundamental_data": "yfinance",      # Options: alpha_vantage, yfinance
-        "news_data": "yfinance",             # Options: alpha_vantage, yfinance
+        "crypto_market_data": "binance",         # OHLCV / funding rate / open interest
+        "crypto_derivatives": "coinglass",       # liquidations / long-short ratio
+        "crypto_news": "rss",                    # CoinDesk + CoinTelegraph RSS
+        "crypto_social_reddit": "reddit",        # crypto subreddits
+        "crypto_social_twitter": "twitter",      # placeholder (data source pending)
     },
     # Tool-level configuration (takes precedence over category-level)
     "tool_vendors": {

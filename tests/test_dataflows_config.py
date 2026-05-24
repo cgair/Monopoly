@@ -16,46 +16,46 @@ class DataflowsConfigIsolationTests(unittest.TestCase):
 
     def test_get_config_returns_deep_copy(self):
         cfg = get_config()
-        cfg["data_vendors"]["core_stock_apis"] = "alpha_vantage"
-        cfg["tool_vendors"]["get_stock_data"] = "alpha_vantage"
+        cfg["data_vendors"]["crypto_market_data"] = "ccxt"
+        cfg["tool_vendors"]["get_ohlcv"] = "ccxt"
 
         fresh = get_config()
-        self.assertEqual(fresh["data_vendors"]["core_stock_apis"], "yfinance")
-        self.assertNotIn("get_stock_data", fresh["tool_vendors"])
+        self.assertEqual(fresh["data_vendors"]["crypto_market_data"], "binance")
+        self.assertNotIn("get_ohlcv", fresh["tool_vendors"])
 
     def test_set_config_does_not_alias_caller_nested_dicts(self):
         custom = copy.deepcopy(default_config.DEFAULT_CONFIG)
-        custom["data_vendors"]["core_stock_apis"] = "alpha_vantage"
-        custom["tool_vendors"]["get_stock_data"] = "alpha_vantage"
+        custom["data_vendors"]["crypto_market_data"] = "ccxt"
+        custom["tool_vendors"]["get_ohlcv"] = "ccxt"
 
         set_config(custom)
 
-        custom["data_vendors"]["core_stock_apis"] = "yfinance"
-        custom["tool_vendors"]["get_stock_data"] = "yfinance"
+        custom["data_vendors"]["crypto_market_data"] = "binance"
+        custom["tool_vendors"]["get_ohlcv"] = "binance"
 
         fresh = get_config()
-        self.assertEqual(fresh["data_vendors"]["core_stock_apis"], "alpha_vantage")
-        self.assertEqual(fresh["tool_vendors"]["get_stock_data"], "alpha_vantage")
+        self.assertEqual(fresh["data_vendors"]["crypto_market_data"], "ccxt")
+        self.assertEqual(fresh["tool_vendors"]["get_ohlcv"], "ccxt")
 
     def test_partial_nested_update_preserves_existing_defaults(self):
         set_config(
             {
                 "data_vendors": {
-                    "core_stock_apis": "alpha_vantage",
+                    "crypto_market_data": "ccxt",
                 }
             }
         )
 
         fresh = get_config()
-        self.assertEqual(fresh["data_vendors"]["core_stock_apis"], "alpha_vantage")
-        self.assertEqual(fresh["data_vendors"]["technical_indicators"], "yfinance")
-        self.assertEqual(fresh["data_vendors"]["fundamental_data"], "yfinance")
-        self.assertEqual(fresh["data_vendors"]["news_data"], "yfinance")
+        self.assertEqual(fresh["data_vendors"]["crypto_market_data"], "ccxt")
+        self.assertEqual(fresh["data_vendors"]["crypto_derivatives"], "coinglass")
+        self.assertEqual(fresh["data_vendors"]["crypto_news"], "rss")
+        self.assertEqual(fresh["data_vendors"]["crypto_social_reddit"], "reddit")
 
     def test_nested_dict_updates_merge_one_level_deep(self):
-        set_config({"tool_vendors": {"get_stock_data": "alpha_vantage"}})
-        set_config({"tool_vendors": {"get_news": "alpha_vantage"}})
+        set_config({"tool_vendors": {"get_ohlcv": "ccxt"}})
+        set_config({"tool_vendors": {"get_news": "newsapi"}})
 
         fresh = get_config()
-        self.assertEqual(fresh["tool_vendors"]["get_stock_data"], "alpha_vantage")
-        self.assertEqual(fresh["tool_vendors"]["get_news"], "alpha_vantage")
+        self.assertEqual(fresh["tool_vendors"]["get_ohlcv"], "ccxt")
+        self.assertEqual(fresh["tool_vendors"]["get_news"], "newsapi")

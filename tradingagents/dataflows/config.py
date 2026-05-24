@@ -18,7 +18,7 @@ def set_config(config: Dict):
     """Update the configuration with custom values.
 
     Dict-valued keys (e.g. ``data_vendors``) are merged one level deep so a
-    partial update like ``{"data_vendors": {"core_stock_apis": "alpha_vantage"}}``
+    partial update like ``{"data_vendors": {"crypto_market_data": "ccxt"}}``
     keeps the other nested keys from the default; scalar keys are replaced.
     """
     global _config

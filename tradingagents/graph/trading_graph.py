@@ -28,7 +28,9 @@ from tradingagents.dataflows.config import set_config
 
 # Import the new abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
-    get_stock_data,
+    get_market_data,
+    get_funding_rate,
+    get_open_interest,
     get_indicators,
     get_fundamentals,
     get_balance_sheet,
@@ -160,8 +162,10 @@ class TradingAgentsGraph:
         return {
             "market": ToolNode(
                 [
-                    # Core stock data tools
-                    get_stock_data,
+                    # Crypto perpetual-futures market data
+                    get_market_data,
+                    get_funding_rate,
+                    get_open_interest,
                     # Technical indicators
                     get_indicators,
                 ]

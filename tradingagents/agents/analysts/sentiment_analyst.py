@@ -23,9 +23,9 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_language_instruction,
-    get_news,
 )
 from tradingagents.agents.utils.symbol_utils import to_base_symbol
+from tradingagents.dataflows.crypto_news import get_news as crypto_get_news
 from tradingagents.dataflows.crypto_reddit import get_reddit
 from tradingagents.dataflows.crypto_twitter import get_tweets
 
@@ -55,7 +55,7 @@ def create_sentiment_analyst(llm):
         # Pre-fetch all three sources. Each fetcher degrades gracefully and
         # returns a string (no exceptions surface from here), so the LLM
         # always sees something — either real data or a clear placeholder.
-        news_block = get_news.func(ticker, start_date, end_date)
+        news_block = crypto_get_news(symbols=(base,), hours=24 * 7)
         twitter_block = get_tweets((base,), hours=24 * 7)
         reddit_block = get_reddit((base,), hours=24 * 7)
 

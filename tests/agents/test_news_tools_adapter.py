@@ -1,4 +1,12 @@
-"""News tool adapter: legacy (ticker, start, end) signature → crypto vendor."""
+"""News tool wrappers: crypto-native signatures (symbols, hours, sources).
+
+The Week-3 rewrite dropped the legacy (ticker, start, end) adapter. These
+tests pin the new tool surface:
+  * ``get_news`` takes ``symbols`` + ``hours`` and applies symbol filter.
+  * ``get_global_news`` takes ``hours`` only and returns unfiltered news
+    from the same RSS feeds (no longer a "not available" placeholder).
+  * ``get_insider_transactions`` stays as a stock-mode placeholder.
+"""
 
 from __future__ import annotations
 
@@ -36,7 +44,7 @@ class _FakeFeed:
 
 
 @pytest.mark.unit
-def test_get_news_adapter_routes_to_crypto_news(tmp_root):
+def test_get_news_filters_by_symbol(tmp_root):
     entries = [
         _FakeEntry("Bitcoin breaks resistance", "https://coindesk.com/btc-r",
                    "BTC surged...", time.time() - 3600),
@@ -45,7 +53,8 @@ def test_get_news_adapter_routes_to_crypto_news(tmp_root):
     ]
     with patch.object(cn.feedparser, "parse", return_value=_FakeFeed(entries)):
         out = ndt.get_news.invoke({
-            "ticker": "BTC-USD", "start_date": "2026-05-17", "end_date": "2026-05-24",
+            "symbols": ["BTC"],
+            "hours": 24,
         })
     assert "Crypto news" in out
     assert "Bitcoin breaks resistance" in out
@@ -54,23 +63,59 @@ def test_get_news_adapter_routes_to_crypto_news(tmp_root):
 
 
 @pytest.mark.unit
-def test_get_news_adapter_passes_through_unknown_ticker(tmp_root):
-    # unknown ticker shape → symbols=None → no filter, all entries returned
+def test_get_news_normalizes_symbols_case(tmp_root):
     entries = [
-        _FakeEntry("Altcoin headline", "https://coindesk.com/alt", "x", time.time() - 600),
+        _FakeEntry("Ethereum upgrade lands", "https://coindesk.com/eth-1",
+                   "Ether merge moves forward.", time.time() - 1200),
     ]
     with patch.object(cn.feedparser, "parse", return_value=_FakeFeed(entries)):
-        out = ndt.get_news.invoke({
-            "ticker": "WEIRD-FOO", "start_date": "2026-05-23", "end_date": "2026-05-24",
-        })
-    assert "Altcoin headline" in out
+        # lowercase + whitespace should be normalized to ETH
+        out = ndt.get_news.invoke({"symbols": [" eth "], "hours": 24})
+    assert "Ethereum upgrade lands" in out
 
 
 @pytest.mark.unit
-def test_get_global_news_stub_returns_placeholder():
-    out = ndt.get_global_news.invoke({"curr_date": "2026-05-24"})
-    assert "not yet available" in out
-    assert "no global news" in out
+def test_get_news_respects_custom_sources(tmp_root):
+    entries = [
+        _FakeEntry("CoinDesk-only headline", "https://coindesk.com/x",
+                   "BTC ...", time.time() - 600),
+    ]
+    with patch.object(cn.feedparser, "parse", return_value=_FakeFeed(entries)):
+        out = ndt.get_news.invoke({
+            "symbols": ["BTC"],
+            "hours": 24,
+            "sources": ["coindesk"],
+        })
+    assert "sources: coindesk" in out
+    # cointelegraph should not appear in the header when only coindesk is requested
+    assert "cointelegraph" not in out.lower()
+
+
+@pytest.mark.unit
+def test_get_global_news_returns_unfiltered_articles(tmp_root):
+    # An altcoin-only article should appear in global news (no symbol filter)
+    entries = [
+        _FakeEntry("Generic altcoin headline", "https://coindesk.com/alt-99",
+                   "Some altcoin moves.", time.time() - 900),
+    ]
+    with patch.object(cn.feedparser, "parse", return_value=_FakeFeed(entries)):
+        out = ndt.get_global_news.invoke({"hours": 48})
+    assert "Crypto news" in out
+    assert "Generic altcoin headline" in out
+    # Header should show ALL symbols (no filter applied)
+    assert "ALL" in out
+
+
+@pytest.mark.unit
+def test_get_global_news_default_hours(tmp_root):
+    entries = [
+        _FakeEntry("Recent crypto headline", "https://coindesk.com/r1",
+                   "Industry news.", time.time() - 3600),
+    ]
+    with patch.object(cn.feedparser, "parse", return_value=_FakeFeed(entries)):
+        out = ndt.get_global_news.invoke({})
+    # default hours=48 should be reflected in header
+    assert "last 48h" in out
 
 
 @pytest.mark.unit

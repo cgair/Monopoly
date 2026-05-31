@@ -11,8 +11,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tradingagents.agents.managers.portfolio_manager import create_portfolio_manager
 from tradingagents.agents.managers.research_manager import create_research_manager
 from tradingagents.agents.schemas import (
+    FuturesDecision,
+    FuturesProposal,
+    FuturesSide,
+    PortfolioDecision,
     PortfolioRating,
     ResearchPlan,
     TraderAction,
@@ -230,3 +235,156 @@ class TestResearchManagerAgent:
         rm = create_research_manager(llm)
         result = rm(_make_rm_state())
         assert result["investment_plan"] == plain_response
+
+
+# ---------------------------------------------------------------------------
+# Trader agent: crypto-mode routing
+# ---------------------------------------------------------------------------
+
+
+def _make_crypto_trader_state():
+    return {
+        "company_of_interest": "BTC-USD",
+        "asset_type": "crypto",
+        "investment_plan": "**Recommendation**: Buy\n**Rationale**: ETF inflows + funding reset.\n"
+                           "**Strategic Actions**: Enter long, scale over two sessions.",
+    }
+
+
+def _make_pm_state_crypto():
+    return {
+        "company_of_interest": "BTC-USD",
+        "asset_type": "crypto",
+        "past_context": "",
+        "risk_debate_state": {
+            "history": "Aggressive: lean in. Conservative: stop tight. Neutral: trim leverage.",
+            "aggressive_history": "",
+            "conservative_history": "",
+            "neutral_history": "",
+            "judge_decision": "",
+            "current_aggressive_response": "",
+            "current_conservative_response": "",
+            "current_neutral_response": "",
+            "count": 1,
+        },
+        "investment_plan": "Research plan: Buy.",
+        "trader_investment_plan": "Trader: Long 2x.",
+    }
+
+
+def _structured_trader_llm_routing(proposal, expects_schema):
+    """Mock that asserts which schema bind_structured was called with on the matching invoke."""
+    captured = {"schemas": []}
+
+    def _with_structured(schema, **kwargs):
+        captured["schemas"].append(schema)
+        structured = MagicMock()
+        # All bindings can respond, but only the one we expect will be invoked
+        if schema is expects_schema:
+            structured.invoke.return_value = proposal
+        else:
+            structured.invoke.side_effect = AssertionError(
+                f"wrong schema invoked: {schema.__name__}"
+            )
+        return structured
+
+    llm = MagicMock()
+    llm.with_structured_output.side_effect = _with_structured
+    return llm, captured
+
+
+@pytest.mark.unit
+class TestTraderCryptoRouting:
+    def test_crypto_asset_type_emits_futures_proposal(self):
+        proposal = FuturesProposal(
+            side=FuturesSide.LONG,
+            reasoning="ETF inflows + funding reset; analysts aligned long.",
+            entry_price=64500.0,
+            stop_loss=62800.0,
+            take_profit=68000.0,
+            leverage=2.0,
+            position_size_pct=0.01,
+        )
+        llm, captured = _structured_trader_llm_routing(proposal, FuturesProposal)
+        trader = create_trader(llm)
+        result = trader(_make_crypto_trader_state())
+        # Both schemas bound at factory time (one per asset_type path)
+        assert FuturesProposal in captured["schemas"]
+        assert TraderProposal in captured["schemas"]
+        plan = result["trader_investment_plan"]
+        assert "**Side**: Long" in plan
+        assert "**Leverage**: 2.0x" in plan
+        assert "FINAL TRANSACTION PROPOSAL: **BUY**" in plan
+
+    def test_stock_asset_type_still_emits_trader_proposal(self):
+        # Default state (no asset_type set) routes to stock path
+        proposal = TraderProposal(action=TraderAction.BUY, reasoning="Stock fundamentals.")
+        llm, _ = _structured_trader_llm_routing(proposal, TraderProposal)
+        trader = create_trader(llm)
+        result = trader(_make_trader_state())
+        plan = result["trader_investment_plan"]
+        assert "**Action**: Buy" in plan
+        assert "FINAL TRANSACTION PROPOSAL: **BUY**" in plan
+
+
+# ---------------------------------------------------------------------------
+# Portfolio Manager: crypto-mode routing
+# ---------------------------------------------------------------------------
+
+
+def _structured_pm_llm_routing(decision, expects_schema):
+    captured = {"schemas": []}
+
+    def _with_structured(schema, **kwargs):
+        captured["schemas"].append(schema)
+        structured = MagicMock()
+        if schema is expects_schema:
+            structured.invoke.return_value = decision
+        else:
+            structured.invoke.side_effect = AssertionError(
+                f"wrong schema invoked: {schema.__name__}"
+            )
+        return structured
+
+    llm = MagicMock()
+    llm.with_structured_output.side_effect = _with_structured
+    return llm, captured
+
+
+@pytest.mark.unit
+class TestPortfolioManagerCryptoRouting:
+    def test_crypto_asset_type_emits_futures_decision(self):
+        decision = FuturesDecision(
+            side=FuturesSide.LONG,
+            leverage=2.0,
+            position_size_pct=0.01,
+            stop_loss=62800.0,
+            take_profit=68000.0,
+            executive_summary="Enter long with 2x; stop tight below LTF demand.",
+            investment_thesis="Bull case carried debate; conservative concern addressed by reduced size.",
+            time_horizon="2-5 days",
+        )
+        llm, captured = _structured_pm_llm_routing(decision, FuturesDecision)
+        pm = create_portfolio_manager(llm)
+        result = pm(_make_pm_state_crypto())
+        assert FuturesDecision in captured["schemas"]
+        assert PortfolioDecision in captured["schemas"]
+        final = result["final_trade_decision"]
+        assert "**Side**: Long" in final
+        assert "**Leverage**: 2.0x" in final
+        assert "**Stop Loss**: 62800.0" in final
+
+    def test_stock_asset_type_still_emits_portfolio_decision(self):
+        decision = PortfolioDecision(
+            rating=PortfolioRating.OVERWEIGHT,
+            executive_summary="Build gradually over two weeks.",
+            investment_thesis="Bull case carried.",
+        )
+        llm, _ = _structured_pm_llm_routing(decision, PortfolioDecision)
+        pm = create_portfolio_manager(llm)
+        state = _make_pm_state_crypto()
+        state["asset_type"] = "stock"
+        state["company_of_interest"] = "NVDA"
+        result = pm(state)
+        final = result["final_trade_decision"]
+        assert "**Rating**: Overweight" in final

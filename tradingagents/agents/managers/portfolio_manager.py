@@ -1,16 +1,27 @@
 """Portfolio Manager: synthesises the risk-analyst debate into the final decision.
 
-Uses LangChain's ``with_structured_output`` so the LLM produces a typed
-``PortfolioDecision`` directly, in a single call.  The result is rendered
-back to markdown for storage in ``final_trade_decision`` so memory log,
-CLI display, and saved reports continue to consume the same shape they do
-today.  When a provider does not expose structured output, the agent falls
-back gracefully to free-text generation.
+Routes by ``asset_type``:
+
+- ``stock`` (default): emits a :class:`PortfolioDecision` (5-tier rating
+  with executive summary + thesis).
+- ``crypto`` (Monopoly fork, perp futures): emits a :class:`FuturesDecision`
+  with the final side / leverage / sizing / stop / take-profit that the
+  downstream risk gate validates before any order is placed.
+
+Both paths use LangChain's ``with_structured_output`` so the LLM produces
+the typed object directly. The render helpers convert back to markdown so
+``final_trade_decision`` keeps the same shape for memory log, CLI display,
+and saved reports.
 """
 
 from __future__ import annotations
 
-from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision
+from tradingagents.agents.schemas import (
+    FuturesDecision,
+    PortfolioDecision,
+    render_futures_decision,
+    render_pm_decision,
+)
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_language_instruction,
@@ -22,13 +33,15 @@ from tradingagents.agents.utils.structured import (
 
 
 def create_portfolio_manager(llm):
-    structured_llm = bind_structured(llm, PortfolioDecision, "Portfolio Manager")
+    structured_stock = bind_structured(llm, PortfolioDecision, "Portfolio Manager")
+    structured_futures = bind_structured(llm, FuturesDecision, "Portfolio Manager")
 
     def portfolio_manager_node(state) -> dict:
-        instrument_context = build_instrument_context(state["company_of_interest"])
+        asset_type = state.get("asset_type", "stock")
+        instrument_context = build_instrument_context(state["company_of_interest"], asset_type)
 
-        history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
+        history = risk_debate_state["history"]
         research_plan = state["investment_plan"]
         trader_plan = state["trader_investment_plan"]
 
@@ -39,7 +52,67 @@ def create_portfolio_manager(llm):
             else ""
         )
 
-        prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
+        if asset_type == "crypto":
+            prompt = _build_crypto_prompt(
+                instrument_context=instrument_context,
+                research_plan=research_plan,
+                trader_plan=trader_plan,
+                history=history,
+                lessons_line=lessons_line,
+            )
+            final_trade_decision = invoke_structured_or_freetext(
+                structured_futures,
+                llm,
+                prompt,
+                render_futures_decision,
+                "Portfolio Manager",
+            )
+        else:
+            prompt = _build_stock_prompt(
+                instrument_context=instrument_context,
+                research_plan=research_plan,
+                trader_plan=trader_plan,
+                history=history,
+                lessons_line=lessons_line,
+            )
+            final_trade_decision = invoke_structured_or_freetext(
+                structured_stock,
+                llm,
+                prompt,
+                render_pm_decision,
+                "Portfolio Manager",
+            )
+
+        new_risk_debate_state = {
+            "judge_decision": final_trade_decision,
+            "history": risk_debate_state["history"],
+            "aggressive_history": risk_debate_state["aggressive_history"],
+            "conservative_history": risk_debate_state["conservative_history"],
+            "neutral_history": risk_debate_state["neutral_history"],
+            "latest_speaker": "Judge",
+            "current_aggressive_response": risk_debate_state["current_aggressive_response"],
+            "current_conservative_response": risk_debate_state["current_conservative_response"],
+            "current_neutral_response": risk_debate_state["current_neutral_response"],
+            "count": risk_debate_state["count"],
+        }
+
+        return {
+            "risk_debate_state": new_risk_debate_state,
+            "final_trade_decision": final_trade_decision,
+        }
+
+    return portfolio_manager_node
+
+
+def _build_stock_prompt(
+    *,
+    instrument_context: str,
+    research_plan: str,
+    trader_plan: str,
+    history: str,
+    lessons_line: str,
+) -> str:
+    return f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
 
 {instrument_context}
 
@@ -63,30 +136,49 @@ def create_portfolio_manager(llm):
 
 Be decisive and ground every conclusion in specific evidence from the analysts.{get_language_instruction()}"""
 
-        final_trade_decision = invoke_structured_or_freetext(
-            structured_llm,
-            llm,
-            prompt,
-            render_pm_decision,
-            "Portfolio Manager",
-        )
 
-        new_risk_debate_state = {
-            "judge_decision": final_trade_decision,
-            "history": risk_debate_state["history"],
-            "aggressive_history": risk_debate_state["aggressive_history"],
-            "conservative_history": risk_debate_state["conservative_history"],
-            "neutral_history": risk_debate_state["neutral_history"],
-            "latest_speaker": "Judge",
-            "current_aggressive_response": risk_debate_state["current_aggressive_response"],
-            "current_conservative_response": risk_debate_state["current_conservative_response"],
-            "current_neutral_response": risk_debate_state["current_neutral_response"],
-            "count": risk_debate_state["count"],
-        }
+def _build_crypto_prompt(
+    *,
+    instrument_context: str,
+    research_plan: str,
+    trader_plan: str,
+    history: str,
+    lessons_line: str,
+) -> str:
+    return f"""As the Portfolio Manager for a crypto perpetual-futures desk, synthesise the risk analysts' debate and emit the **final** futures decision the risk gate will validate.
 
-        return {
-            "risk_debate_state": new_risk_debate_state,
-            "final_trade_decision": final_trade_decision,
-        }
+{instrument_context}
 
-    return portfolio_manager_node
+---
+
+## Decision shape (FuturesDecision)
+- **side**: exactly one of `Long` / `Short` / `Flat`.
+- **leverage**: required when side != Flat. The risk gate caps at the configured maximum (default 3x); do not exceed it.
+- **position_size_pct**: required when side != Flat. Decimal fraction of equity to risk on this trade (e.g. 0.01 = 1%). The risk gate enforces a per-trade-risk ceiling (default 1%).
+- **stop_loss**: required when side != Flat. Place where the thesis is invalidated, not at a round number. Must be below entry for Long, above for Short.
+- **take_profit**: optional. Aim for ≥ 2:1 reward:risk against the stop.
+- **entry_price**: omit for market entry; specify only if you want a limit at a clear level.
+
+## How to ratify or adjust the Trader's proposal
+- If the risk analysts' debate **supports** the Trader's side, ratify it. You may tighten leverage / sizing if the conservative analyst raises a credible drawdown risk.
+- If the debate **contradicts** the Trader's side strongly, flip the side or move to Flat — but only with explicit reasoning from the debate, not gut feel.
+- If the debate is **balanced**, prefer the Trader's side at *reduced* leverage and sizing rather than flipping to Flat.
+
+## Hard rules
+1. side != Flat requires `leverage`, `position_size_pct`, and `stop_loss`. The risk gate will reject decisions missing these.
+2. Stop-loss must be on the correct side of entry. Do not invert.
+3. Position size and leverage together should respect the per-trade-risk ceiling; if (stop distance × leverage × position_size_pct) implies > 1% equity at risk, scale down.
+4. Investment thesis must cite the analysts and the debate, not generic market commentary.
+
+---
+
+**Context:**
+- Research Manager's investment plan: **{research_plan}**
+- Trader's futures proposal: **{trader_plan}**
+{lessons_line}
+**Risk Analysts Debate History:**
+{history}
+
+---
+
+Be decisive and ground every conclusion in specific evidence from the analysts.{get_language_instruction()}"""

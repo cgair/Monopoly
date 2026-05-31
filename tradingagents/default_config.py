@@ -17,6 +17,13 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
     "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
+    # Futures (crypto perp) — risk gate ceilings
+    "TRADINGAGENTS_FUTURES_MAX_LEVERAGE":              "futures_max_leverage",
+    "TRADINGAGENTS_FUTURES_PER_TRADE_RISK_PCT":        "futures_per_trade_risk_pct",
+    "TRADINGAGENTS_FUTURES_DAILY_DRAWDOWN_HALT_PCT":   "futures_daily_drawdown_halt_pct",
+    "TRADINGAGENTS_FUTURES_COOLDOWN_MINUTES":          "futures_cooldown_after_loss_minutes",
+    "TRADINGAGENTS_FUTURES_MAX_CONCURRENT_POSITIONS":  "futures_max_concurrent_positions",
+    "TRADINGAGENTS_FUTURES_STARTING_EQUITY_USD":       "futures_starting_equity_usd",
 }
 
 
@@ -121,4 +128,18 @@ DEFAULT_CONFIG = _apply_env_overrides({
         ".AX":  "^AXJO",    # Australia (ASX 200)
         "":     "SPY",      # default for US-listed tickers (no suffix)
     },
+    # ----------------------------------------------------------------------
+    # Futures (crypto perp) — risk gate ceilings (Monopoly fork)
+    # ----------------------------------------------------------------------
+    # All can be overridden via TRADINGAGENTS_FUTURES_* env vars; see the
+    # _ENV_OVERRIDES table above.
+    "futures_max_leverage": 3.0,
+    "futures_per_trade_risk_pct": 0.01,           # 1% of equity per trade
+    "futures_daily_drawdown_halt_pct": 0.03,      # -3% halts new entries until next UTC day
+    "futures_cooldown_after_loss_minutes": 60,
+    "futures_max_concurrent_positions": 2,        # matches the BTC + ETH scope
+    "futures_starting_equity_usd": 1000.0,        # used when state doesn't carry live equity yet
+    # Optional override for the risk-gate state file (JSONL event log).
+    # ``None`` → ~/.tradingagents/risk_gate_state.jsonl
+    "futures_risk_state_path": os.getenv("TRADINGAGENTS_RISK_GATE_STATE_PATH"),
 })

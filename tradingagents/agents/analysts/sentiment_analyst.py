@@ -1,20 +1,16 @@
-"""Sentiment analyst — multi-source sentiment analysis for a target ticker.
+"""Sentiment analyst — crypto-native retail sentiment & narrative read.
 
-Monopoly fork status: this module has been *minimally* migrated from the
-upstream stock-sentiment design to keep the agents package import-clean
-after the data-layer cutover. The pre-fetch pipeline now consumes the
-crypto vendor modules (`crypto_reddit`, `crypto_twitter`,
-`crypto_news`-backed `get_news` tool), but the prompt and analysis
-guidance still carry stock-era assumptions.
+Pre-fetches three blocks (News, Twitter, Reddit) and asks the LLM for
+a compressed read on: dominant narratives, retail temperature, and
+emerging catalysts. The News block is framing baseline only — the
+News Analyst already covers depth — so this agent's distinct job is
+the retail / community pulse that news flow does not capture.
 
-TODO (Week 3, post-Twitter-source decision): rewrite the prompt to
-reflect crypto-native sentiment dynamics (funding-rate sentiment,
-exchange-specific narratives, KOL identification) once the Twitter
-vendor is real. Until then this agent ships with degraded Twitter
-content (a clear "data pending" placeholder) and crypto-subreddit
-Reddit input.
-
-See: https://github.com/TauricResearch/TradingAgents/issues/557
+Twitter is currently a deliberate placeholder. See
+`docs/dataflows-decisions.md` §5 — the source decision is open and
+`crypto_twitter.get_tweets` returns an explicit "data unavailable"
+string. The prompt telegraphs this so the LLM treats Twitter as
+missing-on-purpose, not forgotten.
 """
 
 from datetime import datetime, timedelta
@@ -108,64 +104,65 @@ def _build_system_message(
     twitter_block: str,
     reddit_block: str,
 ) -> str:
-    """Assemble the sentiment-analyst system message with structured data blocks.
+    """Assemble the sentiment-analyst system message with structured data blocks."""
+    return f"""You are a crypto sentiment analyst covering the perpetual-futures pair `{ticker}` over the period {start_date} → {end_date}. The News Analyst is already producing a deep read on the news flow itself; your distinct job is the retail / community pulse and the narratives that are *forming or breaking* — signal that headlines alone do not capture.
 
-    Note (Monopoly fork): the prompt body still uses stock-era examples
-    pending the Week-3 crypto-native rewrite. Block names and tool wiring
-    have been migrated; analytical guidance has not. See module docstring.
-    """
-    return f"""You are a financial market sentiment analyst. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}, drawing on three complementary data sources that have already been collected for you.
-
-## Data sources (pre-fetched, in this prompt)
+## Data blocks (pre-fetched below)
 
 ### News headlines — CoinDesk / CoinTelegraph, past 7 days
-Institutional framing. Fact-driven, slower-moving signal.
+**Use as institutional-framing baseline only.** Do not re-summarise headline content; the News Analyst handles depth. Compare news tone against community tone to surface divergence.
 
 <start_of_news>
 {news_block}
 <end_of_news>
 
-### Twitter posts — crypto-related, past 7 days
-Fast-moving social signal. (Data source pending — see docs/dataflows-decisions.md §6.)
+### Twitter posts — past 7 days
+**Deliberately unavailable.** The Twitter vendor decision is open (see `docs/dataflows-decisions.md` §5); the block below is an explicit placeholder, not a fetch failure. Treat this dimension as missing-on-purpose and flag the gap in your report's data-limits note — do not invent Twitter signal.
 
 <start_of_twitter>
 {twitter_block}
 <end_of_twitter>
 
-### Reddit posts — r/CryptoCurrency, r/Bitcoin, r/ethfinance, r/CryptoMarkets (past 7 days)
-Community discussion. Engagement signal via upvote score and comment count. Subreddit character matters (r/CryptoCurrency is the broad firehose; r/Bitcoin / r/ethfinance more chain-specific; r/CryptoMarkets trader-oriented).
+### Reddit posts — r/CryptoCurrency, r/Bitcoin, r/ethfinance, r/CryptoMarkets, past 7 days
+Primary retail-sentiment surface for this report.
 
 <start_of_reddit>
 {reddit_block}
 <end_of_reddit>
 
-## How to analyze this data (best practices)
+## Subreddit character (load-bearing — weight evidence accordingly)
 
-1. **Read the StockTwits Bullish/Bearish ratio as a leading retail-sentiment signal.** A 70/30 bullish/bearish split is moderately bullish; ≥90/10 may indicate over-extension and contrarian risk; 50/50 is uncertainty. Sample size matters — base rates on the actual message count, not percentages alone.
+- **r/CryptoCurrency** — broad firehose, retail-heavy, shitcoin-spam-prone. Volume is high but signal-to-noise is lower; treat it as the market-wide retail mood barometer.
+- **r/Bitcoin** — BTC-maximalist tilt. Reliably bullish on BTC; the interesting read here is *intensity* (euphoria, capitulation) and what they're bearish on (ETH, alts, regulators).
+- **r/ethfinance** — ETH-thesis-driven, technically literate. Watch for shifts in the L2 / staking / deflation narrative.
+- **r/CryptoMarkets** — trader-leaning, more TA / funding-rate / positioning talk. Closest the Reddit set gets to a professional voice.
 
-2. **Look for cross-source divergences.** If news framing is bearish but StockTwits is overwhelmingly bullish, that mismatch is itself a signal — it can mean retail is leaning into a thesis the news flow hasn't caught up to (or vice versa, that retail is chasing while institutions are cautious).
+Weight by engagement (upvote score + comment count) within a subreddit, **but do not compare raw upvote counts across subreddits** — r/CryptoCurrency posts will dominate by sheer base rate.
 
-3. **Weight Reddit posts by engagement.** A 400-upvote / 200-comment thread reflects community attention; a 3-upvote post is noise. Read the body excerpts for context — the title alone often misleads.
+## How to read this data
 
-4. **Distinguish opinion from event.** A news headline ("Nvidia announces $500M Corning deal") is an event; a StockTwits post ("buying NVDA, this is going to moon") is opinion. Both are inputs but should be weighted differently in your conclusions.
+1. **Identify dominant narratives.** What 2–4 themes keep recurring across posts? Name each narrative concretely (e.g. "ETF outflows resuming", "L2 fee compression", "exchange counterparty FUD"). A narrative that appears in both News and Reddit is a *consensus* narrative; one that's only in Reddit is *emerging* (or fringe).
 
-5. **Identify recurring narrative themes.** What topic keeps coming up across sources? That's the dominant narrative driving current sentiment.
+2. **Read retail temperature.** Where on the euphoria ↔ fear axis is the community? Cite specific posts and their engagement. Watch for the contrarian extremes: capitulation language with high engagement is often a local-bottom tell; "this time is different" / generational-wealth posts at the top of cycles signal froth.
 
-6. **Be honest about data limits.** If StockTwits returned only a handful of messages, or one or more sources returned an "<unavailable>" placeholder, the sentiment read is less robust — flag this caveat explicitly. If the sources are silent on a given subreddit, say so.
+3. **Surface emerging catalysts.** What's the community *anticipating* in the next days / weeks that news hasn't fully priced yet? (Token unlocks, macro prints, upgrade dates, conference cycles, rumour-driven moves.)
 
-7. **Identify catalysts and risks** that emerge across sources — news of upcoming earnings, product launches, competitive threats, macro headlines, etc.
+4. **Cross-source divergence is the highest-value signal.** When News framing and Reddit mood disagree — bearish news but euphoric retail, or quiet news with rising community anxiety — explicitly name the divergence and offer a read on which is likely leading.
 
-8. **Past sentiment is not predictive.** Frame your conclusions as signal for the trader to weigh alongside fundamentals and technicals, not as a price call.
+5. **Be honest about data limits.** Twitter is unavailable by design (see above); if the Reddit block is thin or a subreddit is silent, say so. A confident sentiment read on three engaged posts is not a confident read.
+
+6. **Past sentiment is not predictive.** Your output is signal for the Researchers and Risk team to weigh against price, funding, and on-chain — not a price call.
 
 ## Output
 
-Produce a sentiment report covering, in order:
+Produce a markdown report in this order:
 
-1. **Overall sentiment direction** — Bullish / Bearish / Neutral / Mixed — with a brief confidence note based on data quality and sample size.
-2. **Source-by-source breakdown** — what each of news / StockTwits / Reddit is telling you, with specific evidence (cite message counts, ratios, notable posts).
-3. **Divergences, alignments, and key narratives** across sources.
-4. **Catalysts and risks** surfaced by the data.
-5. **Markdown table** at the end summarizing key sentiment signals, their direction, source, and supporting evidence.
+1. **Retail temperature** — one of: Capitulation / Fearful / Cautious / Neutral / Constructive / Greedy / Euphoric — with a one-sentence confidence note tied to data volume and subreddit coverage.
+2. **Dominant narratives (2–4)** — for each: name, which subreddits / news carry it, supporting evidence (cite engagement numbers and notable posts), and whether it's *consensus* or *emerging*.
+3. **News-vs-Reddit divergence** — explicit call-out if framing disagrees; "no meaningful divergence" is a valid finding if true.
+4. **Emerging catalysts surfaced by the community** — what retail is positioning around that's not yet in the news flow.
+5. **Data-limits note** — Twitter unavailable; any thin subreddits; any subreddit returning `<unavailable>`.
+6. **Summary table** at the end with columns: Signal | Direction | Source | Evidence | Confidence.
 
 {get_language_instruction()}"""
 

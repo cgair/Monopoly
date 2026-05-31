@@ -6,7 +6,10 @@ Routes by ``asset_type``:
   with executive summary + thesis).
 - ``crypto`` (Monopoly fork, perp futures): emits a :class:`FuturesDecision`
   with the final side / leverage / sizing / stop / take-profit that the
-  downstream risk gate validates before any order is placed.
+  downstream risk gate validates before any order is placed. The
+  crypto path also surfaces the structured object as
+  ``final_decision_structured`` so the risk-gate node consumes it
+  directly without re-parsing the rendered markdown.
 
 Both paths use LangChain's ``with_structured_output`` so the LLM produces
 the typed object directly. The render helpers convert back to markdown so
@@ -15,6 +18,8 @@ and saved reports.
 """
 
 from __future__ import annotations
+
+import logging
 
 from tradingagents.agents.schemas import (
     FuturesDecision,
@@ -30,6 +35,8 @@ from tradingagents.agents.utils.structured import (
     bind_structured,
     invoke_structured_or_freetext,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def create_portfolio_manager(llm):
@@ -52,6 +59,7 @@ def create_portfolio_manager(llm):
             else ""
         )
 
+        structured_decision = None
         if asset_type == "crypto":
             prompt = _build_crypto_prompt(
                 instrument_context=instrument_context,
@@ -60,13 +68,23 @@ def create_portfolio_manager(llm):
                 history=history,
                 lessons_line=lessons_line,
             )
-            final_trade_decision = invoke_structured_or_freetext(
-                structured_futures,
-                llm,
-                prompt,
-                render_futures_decision,
-                "Portfolio Manager",
-            )
+            # Inline the structured-then-fallback flow so we can capture
+            # the typed FuturesDecision object for the downstream risk
+            # gate. ``invoke_structured_or_freetext`` only returns the
+            # rendered markdown, which the gate would have to re-parse.
+            try:
+                structured_decision = structured_futures.invoke(prompt)
+                final_trade_decision = render_futures_decision(structured_decision)
+            except Exception as exc:
+                logger.warning(
+                    "Portfolio Manager: structured FuturesDecision failed (%s); "
+                    "falling back to free text — risk gate will reject for missing "
+                    "structured decision",
+                    exc,
+                )
+                response = llm.invoke(prompt)
+                final_trade_decision = response.content
+                structured_decision = None
         else:
             prompt = _build_stock_prompt(
                 instrument_context=instrument_context,
@@ -99,6 +117,7 @@ def create_portfolio_manager(llm):
         return {
             "risk_debate_state": new_risk_debate_state,
             "final_trade_decision": final_trade_decision,
+            "final_decision_structured": structured_decision,
         }
 
     return portfolio_manager_node

@@ -373,6 +373,23 @@ class TestPortfolioManagerCryptoRouting:
         assert "**Side**: Long" in final
         assert "**Leverage**: 2.0x" in final
         assert "**Stop Loss**: 62800.0" in final
+        # The structured object is also surfaced for the risk-gate node
+        assert result["final_decision_structured"] is decision
+
+    def test_stock_path_does_not_emit_structured_decision(self):
+        # Stock path uses the existing helper which only returns the rendered
+        # markdown; structured object stays None in state.
+        decision = PortfolioDecision(
+            rating=PortfolioRating.HOLD,
+            executive_summary="x",
+            investment_thesis="y",
+        )
+        llm, _ = _structured_pm_llm_routing(decision, PortfolioDecision)
+        pm = create_portfolio_manager(llm)
+        state = _make_pm_state_crypto()
+        state["asset_type"] = "stock"
+        result = pm(state)
+        assert result["final_decision_structured"] is None
 
     def test_stock_asset_type_still_emits_portfolio_decision(self):
         decision = PortfolioDecision(

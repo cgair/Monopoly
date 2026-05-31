@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Any
 from typing_extensions import TypedDict
 from langgraph.graph import MessagesState
 
@@ -72,3 +72,21 @@ class AgentState(MessagesState):
     ]
     final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]
     past_context: Annotated[str, "Memory log context injected at run start (same-ticker decisions + cross-ticker lessons)"]
+
+    # ------------------------------------------------------------------
+    # Futures (crypto perp) — Monopoly fork
+    # ------------------------------------------------------------------
+    # Populated only on the crypto path (asset_type == "crypto"); stock
+    # runs leave these unset.
+    final_decision_structured: Annotated[
+        Any, "Structured PortfolioDecision / FuturesDecision object (crypto path uses FuturesDecision so risk gate can read leverage / stop_loss directly)"
+    ]
+    mark_price: Annotated[float, "Current mark price for the symbol; needed by the executor when entry is market"]
+    equity_usd: Annotated[float, "Current account equity in USD; consumed by risk gate (drawdown) and executor (sizing)"]
+    execution_intent: Annotated[
+        dict, "ExecutionIntent emitted by the risk gate, or None on rejection"
+    ]
+    execution_result: Annotated[
+        dict, "ExecutionResult emitted by the executor, or None when no order was attempted"
+    ]
+    risk_gate_rejection_reason: Annotated[str, "Why the risk gate rejected this run; None on approval"]

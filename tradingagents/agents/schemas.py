@@ -302,16 +302,17 @@ class FuturesProposal(BaseModel):
     leverage: Optional[float] = Field(
         default=None,
         description=(
-            "Requested leverage multiplier (e.g. 2.0 = 2x). The risk gate "
-            "caps this at the configured maximum. Omit for Flat."
+            "Requested leverage multiplier (e.g. 2.0 = 2x). MUST be <= 3.0 — "
+            "the risk gate rejects anything higher. Omit for Flat."
         ),
     )
     position_size_pct: Optional[float] = Field(
         default=None,
         description=(
             "Fraction of equity to risk on this trade, expressed as a decimal "
-            "(0.01 = 1%). The risk gate enforces the per-trade-risk ceiling. "
-            "Omit for Flat."
+            "(0.01 = 1%). MUST be <= 0.01 — the risk gate rejects anything higher. "
+            "Common LLM mistake: writing 0.1 thinking it is small — 0.1 = 10% = "
+            "REJECTED. Use 0.001-0.01 only. Omit for Flat."
         ),
     )
 
@@ -362,15 +363,20 @@ class FuturesDecision(BaseModel):
     leverage: Optional[float] = Field(
         default=None,
         description=(
-            "Final leverage multiplier. Required when side != Flat; capped by "
-            "the risk gate's configured maximum."
+            "Final leverage multiplier (e.g. 2.0 = 2x). Required when side != Flat. "
+            "MUST be <= 3.0 — the risk gate rejects anything higher. Typical values: "
+            "1.0 conservative, 2.0 default, 3.0 high conviction at the ceiling."
         ),
     )
     position_size_pct: Optional[float] = Field(
         default=None,
         description=(
             "Final fraction of equity to risk on this trade (decimal; 0.01 = 1%). "
-            "Required when side != Flat."
+            "Required when side != Flat. MUST be <= 0.01 — the risk gate rejects "
+            "anything higher. Examples: 0.003 (0.3%, low conviction), 0.005 (0.5%, "
+            "moderate), 0.010 (1.0%, high conviction at the ceiling). "
+            "Common LLM mistake: writing 0.1 thinking it is small — 0.1 = 10% = REJECTED. "
+            "Always check the value is between 0.001 and 0.01."
         ),
     )
     entry_price: Optional[float] = Field(

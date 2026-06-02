@@ -173,7 +173,11 @@ def _build_crypto_prompt(
 ## Decision shape (FuturesDecision)
 - **side**: exactly one of `Long` / `Short` / `Flat`.
 - **leverage**: required when side != Flat. The risk gate caps at the configured maximum (default 3x); do not exceed it.
-- **position_size_pct**: required when side != Flat. Decimal fraction of equity to risk on this trade (e.g. 0.01 = 1%). The risk gate enforces a per-trade-risk ceiling (default 1%).
+- **position_size_pct**: required when side != Flat. Decimal fraction of equity to risk on this trade. The risk gate enforces a HARD CEILING at 0.01 (= 1%). Anything above is rejected and the trade is skipped.
+    - 0.003 (= 0.3%)  — low conviction
+    - 0.005 (= 0.5%)  — moderate; default starting point when in doubt
+    - 0.010 (= 1.0%)  — high conviction; AT the ceiling
+    - **Common LLM mistake**: writing `0.1` thinking it is small. `0.1 = 10%` = 10× the ceiling = REJECTED. Always check: the value you write should be 0.001 to 0.01.
 - **stop_loss**: required when side != Flat. Place where the thesis is invalidated, not at a round number. Must be below entry for Long, above for Short.
 - **take_profit**: optional. Aim for ≥ 2:1 reward:risk against the stop.
 - **entry_price**: omit for market entry; specify only if you want a limit at a clear level.
@@ -186,8 +190,9 @@ def _build_crypto_prompt(
 ## Hard rules
 1. side != Flat requires `leverage`, `position_size_pct`, and `stop_loss`. The risk gate will reject decisions missing these.
 2. Stop-loss must be on the correct side of entry. Do not invert.
-3. Position size and leverage together should respect the per-trade-risk ceiling; if (stop distance × leverage × position_size_pct) implies > 1% equity at risk, scale down.
-4. Investment thesis must cite the analysts and the debate, not generic market commentary.
+3. `position_size_pct` MUST be <= 0.01. Re-read the examples above before writing. If unsure, write 0.005.
+4. `leverage` MUST be <= 3.0. Typical values: 1.0 (conservative), 2.0 (default), 3.0 (high conviction, at ceiling).
+5. Investment thesis must cite the analysts and the debate, not generic market commentary.
 
 ---
 

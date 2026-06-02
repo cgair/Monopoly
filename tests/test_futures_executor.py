@@ -205,10 +205,15 @@ class TestTestnetExecutor:
         stop_call = client.futures_create_order.call_args_list[1].kwargs
         assert stop_call["type"] == "STOP_MARKET"
         assert stop_call["side"] == "SELL"
-        assert stop_call["closePosition"] is True
+        # Use reduceOnly + quantity instead of closePosition=True (see executor docstring)
+        assert stop_call["reduceOnly"] is True
+        assert "closePosition" not in stop_call
+        assert stop_call["quantity"] == client.futures_create_order.call_args_list[0].kwargs["quantity"]
         assert stop_call["stopPrice"] == "62800.0"
         tp_call = client.futures_create_order.call_args_list[2].kwargs
         assert tp_call["type"] == "TAKE_PROFIT_MARKET"
+        assert tp_call["reduceOnly"] is True
+        assert "closePosition" not in tp_call
 
     def test_market_entry_omits_take_profit_when_none(self):
         cls, client = _mock_binance_client_class()
@@ -234,6 +239,44 @@ class TestTestnetExecutor:
         assert not result.success
         assert "RuntimeError" in result.error
         assert "invalid key" in result.error
+
+    def test_silent_failure_with_missing_order_id_is_caught(self):
+        """Regression: stop_resp missing orderId/algoId must surface as success=False.
+
+        Live-fire validation on 2026-06-02 hit a case where Binance
+        returned a non-error response without orderId for the stop
+        order, and the executor reported success=True with a naked
+        position. The fix requires every order response to carry an
+        identifier — this test pins that behaviour.
+        """
+        cls, client = _mock_binance_client_class()
+        client.futures_create_order.side_effect = [
+            {"orderId": 1111, "avgPrice": "64500.5"},   # open: ok
+            {"status": "weird-no-orderId"},              # stop: no identifier
+        ]
+        ex = TestnetExecutor("k", "s", client_cls=cls)
+        result = ex.place_order(_intent_long(), equity_usd=1000.0, mark_price=64600.0)
+        assert not result.success
+        assert "stop_loss" in result.error
+
+    def test_algo_id_accepted_for_conditional_orders(self):
+        """Regression: conditional orders return ``algoId`` instead of ``orderId``.
+
+        Observed on Futures Testnet 2026-06-02. The executor accepts
+        either identifier and stores it as the order id string.
+        """
+        cls, client = _mock_binance_client_class()
+        client.futures_create_order.side_effect = [
+            {"orderId": 1111, "avgPrice": "64500.5"},                   # open
+            {"algoId": 1000000093875506, "algoType": "CONDITIONAL"},    # stop
+            {"algoId": 1000000093875507, "algoType": "CONDITIONAL"},    # tp
+        ]
+        ex = TestnetExecutor("k", "s", client_cls=cls)
+        result = ex.place_order(_intent_long(), equity_usd=1000.0, mark_price=64600.0)
+        assert result.success
+        assert result.order_id == "1111"
+        assert result.stop_order_id == "1000000093875506"
+        assert result.take_profit_order_id == "1000000093875507"
 
 
 # ---------------------------------------------------------------------------

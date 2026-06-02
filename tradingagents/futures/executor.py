@@ -227,8 +227,24 @@ class TestnetExecutor:
     Order shape per intent:
     1. ``futures_change_leverage`` for the symbol (idempotent).
     2. Opening order: ``MARKET`` if ``entry_price is None``, else ``LIMIT``.
-    3. Stop-loss: ``STOP_MARKET`` with ``closePosition=True``.
-    4. Take-profit (optional): ``TAKE_PROFIT_MARKET`` with ``closePosition=True``.
+    3. Stop-loss: ``STOP_MARKET`` with ``reduceOnly=True`` and explicit ``quantity``.
+    4. Take-profit (optional): ``TAKE_PROFIT_MARKET`` with ``reduceOnly=True``
+       and explicit ``quantity``.
+
+    Why ``reduceOnly + quantity`` instead of ``closePosition=True``: the
+    latter is rejected by Binance with code -4130 in some account states
+    ("An open stop or take profit order with GTE and closePosition in
+    the direction is existing") even when no such order actually exists.
+    The reduceOnly + quantity pattern is universally accepted and
+    quantitatively equivalent — both close exactly the opened qty.
+
+    Sanity-checking: every order response is required to carry an
+    identifier — ``orderId`` for regular orders, ``algoId`` for the
+    conditional (algo) orders Binance uses for STOP_MARKET /
+    TAKE_PROFIT_MARKET on some account configurations. We accept
+    either, but raise loudly if neither is present so the outer
+    try/except returns ``success=False``. Earlier silent failures
+    left positions naked.
 
     Known gaps (deferred): orphan-order cleanup when one of stop / TP
     fills (Binance has no native futures-OCO), and position-closure
@@ -292,26 +308,32 @@ class TestnetExecutor:
                     quantity=qty_rounded,
                     price=str(intent.entry_price),
                 )
+            open_order_id = _extract_order_id(open_resp, "open")
 
             stop_resp = self.client.futures_create_order(
                 symbol=binance_symbol,
                 side=close_side,
                 type="STOP_MARKET",
                 stopPrice=str(intent.stop_loss),
-                closePosition=True,
+                quantity=qty_rounded,
+                reduceOnly=True,
                 workingType="MARK_PRICE",
             )
+            stop_order_id = _extract_order_id(stop_resp, "stop_loss")
 
             tp_resp = None
+            tp_order_id = None
             if intent.take_profit is not None:
                 tp_resp = self.client.futures_create_order(
                     symbol=binance_symbol,
                     side=close_side,
                     type="TAKE_PROFIT_MARKET",
                     stopPrice=str(intent.take_profit),
-                    closePosition=True,
+                    quantity=qty_rounded,
+                    reduceOnly=True,
                     workingType="MARK_PRICE",
                 )
+                tp_order_id = _extract_order_id(tp_resp, "take_profit")
 
             return ExecutionResult(
                 success=True,
@@ -323,10 +345,10 @@ class TestnetExecutor:
                 quantity=qty_rounded,
                 notional_usd=notional,
                 margin_required_usd=margin,
-                order_id=str(open_resp.get("orderId")),
+                order_id=open_order_id,
                 avg_fill_price=_safe_float(open_resp.get("avgPrice")),
-                stop_order_id=str(stop_resp.get("orderId")),
-                take_profit_order_id=str(tp_resp.get("orderId")) if tp_resp else None,
+                stop_order_id=stop_order_id,
+                take_profit_order_id=tp_order_id,
                 raw={"open": open_resp, "stop": stop_resp, "take_profit": tp_resp},
             )
         except Exception as exc:  # binance.exceptions.BinanceAPIException, others
@@ -492,3 +514,25 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _extract_order_id(response: Any, label: str) -> str:
+    """Return the order identifier from a ``futures_create_order`` response.
+
+    Binance returns ``orderId`` for plain orders (MARKET / LIMIT) and
+    ``algoId`` for conditional / algo orders (STOP_MARKET /
+    TAKE_PROFIT_MARKET on accounts where conditionals are routed to
+    the algo-order system — observed on Futures Testnet 2026-06-02).
+    Either is treated as a valid identifier; both can be passed back
+    to Binance's cancel endpoints. If neither is present, raise so
+    the outer try/except returns ``success=False`` — silent failures
+    left positions naked before this guard existed.
+    """
+    if not isinstance(response, dict):
+        raise RuntimeError(f"{label} order response not a dict: {response!r}")
+    for key in ("orderId", "algoId"):
+        if key in response:
+            return str(response[key])
+    raise RuntimeError(
+        f"{label} order response missing orderId/algoId: {response!r}"
+    )

@@ -217,3 +217,10 @@ __marimo__/
 
 # Cache
 **/data_cache/
+
+# macOS
+.DS_Store
+
+# generated walkthrough artifacts (rebuild with docs/walkthrough/build_pdf.py)
+docs/walkthrough/monopoly-walkthrough.pdf
+docs/walkthrough/monopoly-walkthrough.html

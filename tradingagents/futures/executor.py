@@ -28,6 +28,8 @@ equity, the order is rejected with a clear error rather than placed.
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -37,6 +39,8 @@ from tradingagents.agents.schemas import FuturesSide
 from tradingagents.agents.utils.symbol_utils import to_binance_symbol
 from tradingagents.futures.risk_gate import ExecutionIntent
 from tradingagents.futures.risk_state import append_event, default_state_path, utcnow_iso
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +71,11 @@ class ExecutionResult:
     take_profit_order_id: Optional[str] = None
     raw: dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
+    position_naked: bool = False
+    """True iff an opening order filled but the protective stop failed AND the
+    automatic unwind also failed — the position is live on the exchange with
+    no stop. Operators must intervene manually. The executor node escalates
+    this to a distinct ``position_naked`` event in the risk-state log."""
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +113,26 @@ def compute_sizing(
     risk budget and the stop distance — see module docstring.
     """
     reference_price = intent.entry_price if intent.entry_price is not None else mark_price
+
+    # Stop-direction sanity against the actual reference price. The risk
+    # gate only validates stop side when a limit ``entry_price`` is set
+    # (it has no price feed); for market entries the first concrete price
+    # is here. A wrong-side stop on a market order would open the position
+    # and then have Binance reject the STOP_MARKET with -2021 ("would
+    # immediately trigger"), leaving a naked position — so we fail before
+    # placing anything. Raised as ValueError so both adapters' existing
+    # error paths surface it as success=False.
+    if intent.side == FuturesSide.LONG and intent.stop_loss >= reference_price:
+        raise ValueError(
+            f"long stop_loss {intent.stop_loss} >= reference price {reference_price} "
+            f"— stop must be below entry"
+        )
+    if intent.side == FuturesSide.SHORT and intent.stop_loss <= reference_price:
+        raise ValueError(
+            f"short stop_loss {intent.stop_loss} <= reference price {reference_price} "
+            f"— stop must be above entry"
+        )
+
     risk_usd = intent.risk_pct * equity_usd
     risk_per_unit = abs(reference_price - intent.stop_loss)
     if risk_per_unit <= 0:
@@ -267,49 +296,85 @@ class TestnetExecutor:
         equity_usd: float,
         mark_price: float,
     ) -> ExecutionResult:
+        # Validation-phase guard: a LIMIT entry needs a fill-then-protect
+        # monitor we have not built yet — Binance rejects a reduceOnly
+        # stop/TP while the position is still unfilled, so the protective
+        # orders cannot attach at placement time and the limit could fill
+        # naked. Reject loudly until the position monitor lands (spec §8).
+        if intent.entry_price is not None:
+            return self._error_result(
+                intent,
+                error=("LIMIT entry disabled in validation phase — reduceOnly "
+                       "stop/TP cannot attach before the limit fills; use market entry"),
+            )
+
         try:
-            reference_price, qty, notional, margin = compute_sizing(
+            # The raw notional/margin are recomputed below from the rounded
+            # qty + floored leverage, so only the reference price and qty are
+            # taken from compute_sizing here.
+            reference_price, qty, _notional, _margin = compute_sizing(
                 intent, equity_usd=equity_usd, mark_price=mark_price,
             )
         except ValueError as e:
             return self._error_result(intent, error=str(e))
 
-        if margin > equity_usd:
+        # Round DOWN to the step size and floor leverage to an int. Both must
+        # match what Binance actually receives, so margin is recomputed from
+        # the rounded values before the equity check — otherwise the check
+        # could pass on a theoretical (smaller) margin while the real order
+        # commits more. Flooring qty also guarantees the check is conservative.
+        leverage_int = max(1, int(intent.leverage))
+        qty_rounded = self._round_qty(qty)
+        if qty_rounded <= 0:
             return self._error_result(
                 intent,
-                error=(f"insufficient equity: margin required ${margin:.2f} > "
+                error=(f"quantity {qty:.8f} rounds to zero at step {self._STEP} — "
+                       f"risk budget too small for this price"),
+            )
+        notional_rounded = qty_rounded * reference_price
+        margin_required = notional_rounded / leverage_int
+
+        if margin_required > equity_usd:
+            return self._error_result(
+                intent,
+                error=(f"insufficient equity: margin required ${margin_required:.2f} > "
                        f"equity ${equity_usd:.2f}"),
-                quantity=qty, notional_usd=notional, margin_required_usd=margin,
+                quantity=qty_rounded,
+                notional_usd=notional_rounded,
+                margin_required_usd=margin_required,
             )
 
         binance_symbol = to_binance_symbol(intent.symbol)
         binance_side = _intent_to_binance_side(intent.side)
         close_side = "SELL" if binance_side == "BUY" else "BUY"
-        qty_rounded = self._round_qty(qty)
 
+        # Phase 1 — leverage + opening order. A failure here leaves nothing
+        # on the book, so we just report it.
         try:
             self.client.futures_change_leverage(
-                symbol=binance_symbol, leverage=int(round(intent.leverage)),
+                symbol=binance_symbol, leverage=leverage_int,
+            )
+            open_resp = self.client.futures_create_order(
+                symbol=binance_symbol,
+                side=binance_side,
+                type="MARKET",
+                quantity=qty_rounded,
+            )
+            open_order_id = _extract_order_id(open_resp, "open")
+        except Exception as exc:  # binance.exceptions.BinanceAPIException, others
+            return self._error_result(
+                intent,
+                error=f"open failed: {type(exc).__name__}: {exc}",
+                quantity=qty_rounded,
+                notional_usd=notional_rounded,
+                margin_required_usd=margin_required,
             )
 
-            if intent.entry_price is None:
-                open_resp = self.client.futures_create_order(
-                    symbol=binance_symbol,
-                    side=binance_side,
-                    type="MARKET",
-                    quantity=qty_rounded,
-                )
-            else:
-                open_resp = self.client.futures_create_order(
-                    symbol=binance_symbol,
-                    side=binance_side,
-                    type="LIMIT",
-                    timeInForce="GTC",
-                    quantity=qty_rounded,
-                    price=str(intent.entry_price),
-                )
-            open_order_id = _extract_order_id(open_resp, "open")
-
+        # Phase 2 — protective orders. The position now EXISTS. Any failure
+        # here leaves it naked, so we attempt a market unwind before
+        # returning. If the unwind also fails, flag position_naked so the
+        # caller escalates for manual intervention.
+        try:
             stop_resp = self.client.futures_create_order(
                 symbol=binance_symbol,
                 side=close_side,
@@ -334,35 +399,74 @@ class TestnetExecutor:
                     workingType="MARK_PRICE",
                 )
                 tp_order_id = _extract_order_id(tp_resp, "take_profit")
-
-            return ExecutionResult(
-                success=True,
-                intent_id=intent.intent_id,
-                mode=self.mode,
-                placed_at=utcnow_iso(),
-                symbol=intent.symbol,
-                side=binance_side,
-                quantity=qty_rounded,
-                notional_usd=notional,
-                margin_required_usd=margin,
-                order_id=open_order_id,
-                avg_fill_price=_safe_float(open_resp.get("avgPrice")),
-                stop_order_id=stop_order_id,
-                take_profit_order_id=tp_order_id,
-                raw={"open": open_resp, "stop": stop_resp, "take_profit": tp_resp},
+        except Exception as exc:  # protective order failed — position is naked
+            unwound, unwind_err = self._try_unwind(
+                binance_symbol, close_side, qty_rounded,
             )
-        except Exception as exc:  # binance.exceptions.BinanceAPIException, others
+            if unwound:
+                return self._error_result(
+                    intent,
+                    error=(f"protective order failed, position unwound: "
+                           f"{type(exc).__name__}: {exc}"),
+                    quantity=qty_rounded,
+                    notional_usd=notional_rounded,
+                    margin_required_usd=margin_required,
+                )
             return self._error_result(
                 intent,
-                error=f"{type(exc).__name__}: {exc}",
-                quantity=qty, notional_usd=notional, margin_required_usd=margin,
+                error=(f"protective order failed AND unwind failed — POSITION NAKED, "
+                       f"manual intervention required. stop_err={type(exc).__name__}: {exc}; "
+                       f"unwind_err={unwind_err}"),
+                quantity=qty_rounded,
+                notional_usd=notional_rounded,
+                margin_required_usd=margin_required,
+                position_naked=True,
             )
+
+        return ExecutionResult(
+            success=True,
+            intent_id=intent.intent_id,
+            mode=self.mode,
+            placed_at=utcnow_iso(),
+            symbol=intent.symbol,
+            side=binance_side,
+            quantity=qty_rounded,
+            notional_usd=notional_rounded,
+            margin_required_usd=margin_required,
+            order_id=open_order_id,
+            avg_fill_price=_safe_float(open_resp.get("avgPrice")),
+            stop_order_id=stop_order_id,
+            take_profit_order_id=tp_order_id,
+            raw={"open": open_resp, "stop": stop_resp, "take_profit": tp_resp},
+        )
+
+    def _try_unwind(
+        self, binance_symbol: str, close_side: str, qty: float,
+    ) -> tuple[bool, Optional[str]]:
+        """Best-effort market close of a just-opened position whose stop failed.
+
+        Returns ``(True, None)`` on success, ``(False, error_str)`` if the
+        unwind order itself raised — in which case the position is naked and
+        the caller must escalate.
+        """
+        try:
+            self.client.futures_create_order(
+                symbol=binance_symbol,
+                side=close_side,
+                type="MARKET",
+                quantity=qty,
+                reduceOnly=True,
+            )
+            return True, None
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
 
     def _error_result(self, intent: ExecutionIntent, *,
                       error: str,
                       quantity: float = 0.0,
                       notional_usd: float = 0.0,
-                      margin_required_usd: float = 0.0) -> ExecutionResult:
+                      margin_required_usd: float = 0.0,
+                      position_naked: bool = False) -> ExecutionResult:
         return ExecutionResult(
             success=False,
             intent_id=intent.intent_id,
@@ -374,18 +478,23 @@ class TestnetExecutor:
             notional_usd=notional_usd,
             margin_required_usd=margin_required_usd,
             error=error,
+            position_naked=position_naked,
         )
 
-    @staticmethod
-    def _round_qty(qty: float) -> float:
-        """Round to a sensible step size.
+    _STEP = 0.001
+    """Quantity step size. Binance enforces per-symbol step sizes from the
+    exchange info; for validation we keep a conservative 0.001 that fits BTC
+    and ETH. Real-world this should consult ``/fapi/v1/exchangeInfo``."""
 
-        Binance enforces per-symbol step sizes from the exchange info.
-        For validation we keep a conservative 0.001 step that fits BTC
-        and ETH; real-world this should consult ``/fapi/v1/exchangeInfo``.
+    @classmethod
+    def _round_qty(cls, qty: float) -> float:
+        """Floor ``qty`` to the step size.
+
+        Flooring (not rounding) keeps the committed quantity at or below the
+        risk-budgeted size, so the margin check computed from the rounded qty
+        is never undershot by a round-up.
         """
-        step = 0.001
-        return round(qty / step) * step
+        return math.floor(qty / cls._STEP) * cls._STEP
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +592,31 @@ def create_executor_node(config: dict):
                 "quantity": result.quantity,
                 "notional_usd": result.notional_usd,
             })
+        elif result.position_naked:
+            # The opening order filled but the stop failed AND the unwind
+            # failed: a live, unprotected position is on the exchange. Record
+            # it as opened (so the gate's concurrent-position count includes
+            # it and blocks new entries) AND raise a distinct naked alert for
+            # the operator. Do NOT log trade_skipped — that would undercount.
+            append_event(state_path, {
+                "type": "position_opened",
+                "ts": result.placed_at,
+                "intent_id": intent.intent_id,
+                "symbol": intent.symbol,
+                "mode": result.mode,
+                "order_id": result.order_id,
+                "quantity": result.quantity,
+                "notional_usd": result.notional_usd,
+            })
+            append_event(state_path, {
+                "type": "position_naked", "ts": result.placed_at,
+                "intent_id": intent.intent_id, "symbol": intent.symbol,
+                "reason": result.error or "naked position — manual intervention required",
+            })
+            logger.error(
+                "NAKED POSITION on %s (intent %s): %s",
+                intent.symbol, intent.intent_id, result.error,
+            )
         else:
             append_event(state_path, {
                 "type": "trade_skipped", "ts": result.placed_at,

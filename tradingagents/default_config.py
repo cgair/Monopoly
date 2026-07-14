@@ -126,6 +126,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
         ".L":   "^FTSE",    # London (FTSE 100)
         ".TO":  "^GSPTSE",  # Toronto (TSX Composite)
         ".AX":  "^AXJO",    # Australia (ASX 200)
+        "-USD": "BTC-USD",  # crypto perp (Monopoly): alpha vs BTC (spec §2.1)
         "":     "SPY",      # default for US-listed tickers (no suffix)
     },
     # ----------------------------------------------------------------------

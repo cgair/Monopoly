@@ -1,6 +1,6 @@
 # Monopoly 开发计划(PLAN.md)
 
-- **更新**: 2026-07-14
+- **更新**: 2026-07-14(晚:T0–T4 全部完成并合并回 `dev`,433 passed;剩 T5/T6/T7/T8 + 手工 testnet 验证)
 - **来源**: `~/Desktop/AI/become rich/docs/monopoly-spec.md` §3 / §5 / §8 + 工作区未提交改动盘点
 - **用法**: 每个任务设计为可由一个独立 Claude Code 实例(worktree 或新会话)冷启动执行。
   开工前先读任务卡里的「上下文锚点」,完成后勾选并在 spec §8 追加恢复点。
@@ -15,11 +15,11 @@
 ## 任务依赖图
 
 ```
-T0 (提交基线) ──┬── T1 (position monitor) ── T2 (algo 撤单) ──┐
-               ├── T3 (Reddit 403)                            ├── T5 (OpenClaw trade_execute + 审批)
-               ├── T4 (OpenClaw trade_analyze / trade_review) ─┘
-               ├── T6 (L4 监控告警)
-               └── T7 (Hermes memory adapter)
+T0 ✅ ──┬── T1 ✅ ── T2 ✅ ──┐
+        ├── T3 ✅            ├── [手工验证清单] ── T5 (trade_execute + 审批) ← 下一个
+        ├── T4 ✅ ───────────┘
+        ├── T6 (L4 监控告警) ← 可随时开工(T1 已合并,冲突约束解除)
+        └── T7 (Hermes memory adapter)
 T8 (On-Chain analyst) —— 被数据源选型阻塞,需人工决策后开工
 ```
 
@@ -28,7 +28,7 @@ T8 (On-Chain analyst) —— 被数据源选型阻塞,需人工决策后开工
 
 ---
 
-## T0 — 提交未提交的加固改动(必须最先做,主仓库内做,不开 worktree)
+## T0 — 提交未提交的加固改动 ✅ 完成(2026-07-14,`dbf15e3`…`a3c5b9b`)
 
 **优先级**: P0(阻塞所有并行任务)
 **触碰文件**: 工作区现有 9 个 modified 文件 + `docs/walkthrough/`
@@ -55,7 +55,13 @@ T8 (On-Chain analyst) —— 被数据源选型阻塞,需人工决策后开工
 
 ---
 
-## T1 — Position Monitor / 持仓对账(剩余工作中优先级最高)
+## T1 — Position Monitor / 持仓对账 ✅ 完成(2026-07-14,`943558a` 合并)
+
+> **遗留(验证阶段限制,待 testnet 实测后决定是否收紧)**:
+> ① 对账写的 `position_closed` 事件 `pnl_usd=0.0` — 日回撤熔断看不到这些亏损;outcome 默认
+> 推断为 `"stop"` 会触发 cooldown,方向上过度保守而非漏防,可接受但要知情。
+> ② stop vs TP 的精确区分需查订单历史,当前是启发式。
+> ③ **手工 testnet 验证未做**(见 §手工验证清单)。
 
 **优先级**: P1
 **新建文件**: `tradingagents/futures/position_monitor.py` + `tests/test_futures_position_monitor.py`
@@ -80,7 +86,10 @@ T8 (On-Chain analyst) —— 被数据源选型阻塞,需人工决策后开工
 
 ---
 
-## T2 — Algo 单程序化撤销
+## T2 — Algo 单程序化撤销 ✅ 完成(2026-07-14,与 T1 同 commit 合并)
+
+> 实现:`DELETE /fapi/v1/algoOrder` + `GET /fapi/v1/algoOpenOrders`,经 python-binance
+> `_request_futures_api` 底层签名直调。**endpoint 未经真实 testnet 验证**(见 §手工验证清单)。
 
 **优先级**: P1(与 T1 同一 worktree 做,顺序:先 T1 后 T2)
 **触碰文件**: `tradingagents/futures/executor.py`(或新建 `futures/binance_algo.py`)+ 测试
@@ -99,7 +108,11 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 
 ---
 
-## T3 — Sentiment Analyst Reddit 403 排查
+## T3 — Sentiment Analyst Reddit 403 排查 ✅ 完成(2026-07-14,`a9c54b9` 合并)
+
+> 实现:合规 UA(`REDDIT_USERNAME` env 可覆盖)+ 403/429 指数退避 + `old.reddit.com`
+> fallback + 全失败时 `data_gap` 优雅降级。**真实代理环境实测未做**——如果两端点都被
+> IP 级封锁,现在会降级而非崩溃,但数据缺口仍在(备选:OAuth API / RSS)。
 
 **优先级**: P2(独立,随时可并行)
 **触碰文件**: `tradingagents/dataflows/crypto_reddit.py` + 对应测试
@@ -117,7 +130,12 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 
 ---
 
-## T4 — OpenClaw skill: trade_analyze + trade_review(Week 5 前半)
+## T4 — OpenClaw skill: trade_analyze + trade_review ✅ 完成(2026-07-14,`b5c6049` 合并)
+
+> 实现:`python -m cli.main analyze_json`(强制 dryrun,JSON 到 stdout / 日志到 stderr)、
+> `python -m cli.main trade_review --symbol --hours`(纯读 memory log + risk JSONL,无 LLM 调用)、
+> `cli/json_output.py` 序列化、`futures/trade_review.py` 汇总、`openclaw/skills/*/SKILL.md` 两份。
+> **OpenClaw 侧安装 + Telegram bot 配置是用户手工步骤**(见 SKILL.md 内说明)。
 
 **优先级**: P2
 **产出位置**: OpenClaw 的 skill 目录(在 OpenClaw 侧新建,Monopoly 仓库内可能需要补一个稳定的 CLI 入口/JSON 输出)
@@ -134,7 +152,8 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 
 ## T5 — OpenClaw skill: trade_execute + 人工审批闭环(Week 5 后半)
 
-**优先级**: P2(**依赖 T1、T2、T4 合并后开工**)
+**优先级**: P2(依赖已解除:T1/T2/T4 均已合并。**建议先做完 §手工验证清单再开工**——
+trade_execute 建在 executor + monitor 之上,先确认它们在 testnet 真实可用)
 **背景**: 人工审批当初有意跳过 Monopoly graph 内的 Telegram 节点,决定落在 OpenClaw 层。这是核心约束
 「最终下单前必须人工确认」目前唯一缺失的防线,**T5 完成前不得切 mainnet**。
 
@@ -188,6 +207,17 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 **注意**: 不要改造 `fundamentals_analyst.py` — fork 已在 crypto 模式下过滤掉它,On-Chain 是全新节点(spec §2.3 修正)。
 
 ---
+
+## 手工验证清单(2026-07-14 合并后,需要用户环境/API key,T5 开工前完成)
+
+1. **Position monitor testnet 实测**(T1):testnet 开一仓(带 stop/TP)→ UI 手动触发或等 stop 打掉 →
+   跑 `reconcile_positions()` → 确认 JSONL 出现 `position_closed`、gate 重新放行、UI 无孤儿单。
+2. **Algo 撤单 endpoint 实测**(T2):挂一对 stop/TP → 调 `cancel_all_algo_orders(symbol)` →
+   UI 确认消失。若 `DELETE /fapi/v1/algoOrder` 路径不对会 fail-loud,届时抓 UI "Cancel All" 的请求路径修正。
+3. **Reddit 真实代理实测**(T3):跑一次完整 graph,确认 sentiment 阶段拿到数据或干净的 `data_gap`(无 403 裸异常)。
+4. **OpenClaw 侧安装**(T4):拷 `openclaw/skills/trade_analyze`、`trade_review` 到 OpenClaw skill 目录,
+   配置 Telegram bot,手机上跑 `/trade_analyze` 和 `/trade_review`。
+5. `git push origin dev` 备份(本地已领先若干 commit)。
 
 ## 其他挂起项(不单开任务)
 

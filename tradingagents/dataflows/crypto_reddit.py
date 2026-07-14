@@ -7,6 +7,13 @@ mapping (e.g. BTC → "Bitcoin OR BTC").
 
 Two-layer pattern: ``_get_reddit`` returns ``Response[SocialPost]``
 for cache + tests, ``get_reddit`` returns prompt plaintext.
+
+HTTP retry strategy:
+- Primary: https://www.reddit.com (modern endpoint)
+- Fallback 1: https://old.reddit.com (legacy endpoint)
+- Fallback 2: Empty result with data_gap note (graceful degradation)
+
+User-Agent follows Reddit's requirement: ``platform:app-id:version (by /u/username)``
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
@@ -26,8 +34,8 @@ from .crypto_types import Meta, Response, SocialPost
 logger = logging.getLogger(__name__)
 
 _REDDIT_TTL = 120  # 2 min per docs/dataflows-decisions.md §4.2
-_API = "https://www.reddit.com/r/{sub}/search.json?{qs}"
-_UA = "monopoly/0.1 (+https://github.com/cgair/Monopoly)"
+_REDDIT_USERNAME = os.environ.get("REDDIT_USERNAME", "monopoly-trader")
+_UA = f"trading-agent:monopoly-crypto:1.0 (by /u/{_REDDIT_USERNAME})"
 
 DEFAULT_SUBREDDITS = ("CryptoCurrency", "Bitcoin", "ethfinance", "CryptoMarkets")
 
@@ -50,20 +58,84 @@ def _symbol_query(symbol: str) -> str:
     return _SYMBOL_QUERIES.get(symbol.upper(), symbol)
 
 
-def _fetch_subreddit(query: str, sub: str, limit: int, timeout: float) -> list[dict]:
+def _fetch_subreddit_with_retry(
+    query: str, sub: str, limit: int, timeout: float, max_retries: int = 2
+) -> tuple[list[dict], bool]:
+    """Fetch subreddit posts with exponential backoff retry and fallback endpoints.
+
+    Returns:
+        (posts, success): posts list and whether fetch succeeded (not degraded)
+    """
     qs = urlencode({
         "q": query, "restrict_sr": "on", "sort": "new", "t": "week", "limit": limit,
     })
-    url = _API.format(sub=sub, qs=qs)
-    req = Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read())
-    except (HTTPError, URLError, json.JSONDecodeError, TimeoutError) as exc:
-        logger.warning("reddit fetch failed for r/%s · %s: %s", sub, query, exc)
-        return []
-    children = (payload.get("data") or {}).get("children") or []
-    return [c.get("data", {}) for c in children if isinstance(c, dict)]
+
+    # Try endpoints in order: primary (reddit.com), fallback (old.reddit.com)
+    endpoints = [
+        f"https://www.reddit.com/r/{sub}/search.json?{qs}",
+        f"https://old.reddit.com/r/{sub}/search.json?{qs}",
+    ]
+
+    for endpoint_idx, endpoint_url in enumerate(endpoints):
+        for attempt in range(max_retries + 1):
+            try:
+                req = Request(
+                    endpoint_url,
+                    headers={
+                        "User-Agent": _UA,
+                        "Accept": "application/json",
+                    }
+                )
+                with urlopen(req, timeout=timeout) as resp:
+                    payload = json.loads(resp.read())
+
+                children = (payload.get("data") or {}).get("children") or []
+                posts = [c.get("data", {}) for c in children if isinstance(c, dict)]
+
+                if posts or endpoint_idx == 0:  # success on any endpoint, or primary returned empty
+                    return posts, True
+
+            except HTTPError as e:
+                # 403 Forbidden, 429 Too Many Requests: exponential backoff + retry
+                if e.code in (403, 429):
+                    wait_time = min(2 ** attempt, 8)  # cap at 8 seconds
+                    if attempt < max_retries:
+                        logger.debug(
+                            "reddit HTTP %d (r/%s, attempt %d/%d), waiting %.1fs before retry on %s",
+                            e.code, sub, attempt + 1, max_retries + 1, wait_time,
+                            "fallback" if endpoint_idx > 0 else "primary"
+                        )
+                        time.sleep(wait_time)
+                    else:
+                        logger.debug(
+                            "reddit HTTP %d (r/%s) exhausted retries on %s endpoint",
+                            e.code, sub, "fallback" if endpoint_idx > 0 else "primary"
+                        )
+                    continue  # try next attempt on same endpoint
+                else:
+                    # Other HTTP errors (4xx, 5xx not 403/429): log and skip this endpoint
+                    logger.debug("reddit HTTP %d (r/%s): %s", e.code, sub, e.reason)
+                    break  # try next endpoint
+
+            except (URLError, json.JSONDecodeError, TimeoutError) as exc:
+                logger.debug("reddit fetch error (r/%s · %s, attempt %d/%d): %s",
+                            sub, query, attempt + 1, max_retries + 1, type(exc).__name__)
+                if attempt < max_retries:
+                    wait_time = min(2 ** attempt, 8)
+                    time.sleep(wait_time)
+                else:
+                    break  # try next endpoint
+                continue
+
+    # All endpoints exhausted
+    logger.warning("reddit fetch failed for r/%s · %s: all endpoints exhausted", sub, query)
+    return [], False
+
+
+def _fetch_subreddit(query: str, sub: str, limit: int, timeout: float) -> list[dict]:
+    """Legacy interface: returns posts only, discards success flag."""
+    posts, _ = _fetch_subreddit_with_retry(query, sub, limit, timeout)
+    return posts
 
 
 def _to_social_post(sub: str, raw: dict) -> SocialPost:
@@ -109,33 +181,46 @@ def _get_reddit(symbols: tuple[str, ...],
             )
 
     fetched_any = False
+    fetch_failures = 0
     errors: list[str] = []
+
     for symbol in symbols:
         query = _symbol_query(symbol)
         for idx, sub in enumerate(subreddits):
             if idx > 0 or symbol != symbols[0]:
                 time.sleep(inter_request_delay)
-            raw_posts = _fetch_subreddit(query, sub, limit_per_sub, timeout)
+            raw_posts, success = _fetch_subreddit_with_retry(query, sub, limit_per_sub, timeout)
             if raw_posts:
                 fetched_any = True
                 cache.upsert_social([_to_social_post(sub, r) for r in raw_posts])
             else:
+                if not success:  # explicit failure (403/429 all retries exhausted, etc.)
+                    fetch_failures += 1
                 errors.append(f"r/{sub} ({query}): no posts")
 
     if fetched_any:
         cache.set_meta(scope, now)
 
     items = cache.read_social(platform="reddit", since_ms=since_ms, until_ms=now)
+
+    # Determine response quality:
+    # 1. If fresh fetch succeeded with data: ok=True
+    # 2. If fresh fetch had failures but cache has old data: ok=True, is_stale=True
+    # 3. If all fetches failed (no fresh posts + no cache): ok=False, data_gap=True
     if items and fetched_any:
         return Response(data=items, meta=Meta(fetched_at=now, vendor="reddit", ok=True))
-    if items:
+
+    if items:  # cached but stale
         return Response(data=items, meta=Meta(
             fetched_at=cache.get_meta(scope) or 0, vendor="reddit",
             ok=True, is_stale=True, note="; ".join(errors[:3]),
         ))
+
+    # No data and fresh fetch failed: graceful degradation with data_gap marker
     return Response(data=[], meta=Meta(
         fetched_at=now, vendor="reddit", ok=False,
-        note="no reddit posts retrieved" + (f"; {errors[0]}" if errors else ""),
+        note="data_gap: no reddit posts retrieved; all endpoints/retries exhausted"
+             + (f"; {errors[0]}" if errors else ""),
     ))
 
 

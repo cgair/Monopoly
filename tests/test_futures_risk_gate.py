@@ -14,12 +14,15 @@ from tradingagents.futures.risk_gate import (
     REASON_COOLDOWN_ACTIVE,
     REASON_DAILY_DRAWDOWN_HALT,
     REASON_FLAT,
+    REASON_LEVERAGE_BELOW_MIN,
     REASON_LEVERAGE_OVER_CAP,
     REASON_MAX_POSITIONS,
     REASON_MISSING_LEVERAGE,
     REASON_MISSING_RISK_PCT,
     REASON_MISSING_STOP,
+    REASON_RISK_NON_POSITIVE,
     REASON_RISK_OVER_CAP,
+    REASON_STOP_NON_POSITIVE,
     REASON_STOP_WRONG_SIDE,
     RiskGateConfig,
     create_risk_gate_node,
@@ -201,6 +204,43 @@ class TestEvaluateRejections:
         assert not result.approved
         assert REASON_RISK_OVER_CAP in result.reason
 
+    def test_leverage_zero_rejected(self):
+        # leverage=0 would pass every upper-bound check and then divide-by-zero
+        # in the executor's sizing. The gate rejects it as below the 1x floor.
+        d = _ok_long(leverage=0.0)
+        result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
+                          config=RiskGateConfig(), now=NOW, snapshot=_empty_snapshot())
+        assert not result.approved
+        assert REASON_LEVERAGE_BELOW_MIN in result.reason
+
+    def test_leverage_below_one_rejected(self):
+        d = _ok_long(leverage=0.5)
+        result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
+                          config=RiskGateConfig(), now=NOW, snapshot=_empty_snapshot())
+        assert not result.approved
+        assert REASON_LEVERAGE_BELOW_MIN in result.reason
+
+    def test_negative_risk_pct_rejected(self):
+        d = _ok_long(position_size_pct=-0.005)
+        result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
+                          config=RiskGateConfig(), now=NOW, snapshot=_empty_snapshot())
+        assert not result.approved
+        assert REASON_RISK_NON_POSITIVE in result.reason
+
+    def test_zero_risk_pct_rejected(self):
+        d = _ok_long(position_size_pct=0.0)
+        result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
+                          config=RiskGateConfig(), now=NOW, snapshot=_empty_snapshot())
+        assert not result.approved
+        assert REASON_RISK_NON_POSITIVE in result.reason
+
+    def test_non_positive_stop_rejected(self):
+        d = _ok_long(stop_loss=0.0)
+        result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
+                          config=RiskGateConfig(), now=NOW, snapshot=_empty_snapshot())
+        assert not result.approved
+        assert REASON_STOP_NON_POSITIVE in result.reason
+
     def test_long_stop_above_entry_rejected(self):
         d = _ok_long(entry_price=64500.0, stop_loss=64600.0)
         result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
@@ -217,7 +257,9 @@ class TestEvaluateRejections:
 
     def test_stop_side_skipped_when_entry_market(self):
         # entry_price=None → market order. The gate cannot validate stop side
-        # without entry, so it must let it through (executor will check after fill).
+        # without a price feed, so it lets it through; the executor re-checks
+        # against the live mark price before placing any order (see
+        # compute_sizing) so a wrong-side market stop is still caught.
         d = _ok_long(entry_price=None)
         result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
                           config=RiskGateConfig(), now=NOW, snapshot=_empty_snapshot())

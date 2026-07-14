@@ -134,7 +134,10 @@ REASON_MISSING_LEVERAGE = "leverage missing on non-Flat decision"
 REASON_MISSING_RISK_PCT = "position_size_pct missing on non-Flat decision"
 REASON_MISSING_STOP = "stop_loss missing on non-Flat decision"
 REASON_LEVERAGE_OVER_CAP = "leverage exceeds configured max_leverage"
+REASON_LEVERAGE_BELOW_MIN = "leverage below 1x — not a valid futures position"
 REASON_RISK_OVER_CAP = "position_size_pct exceeds configured per_trade_risk_pct"
+REASON_RISK_NON_POSITIVE = "position_size_pct must be > 0"
+REASON_STOP_NON_POSITIVE = "stop_loss must be a positive price"
 REASON_STOP_WRONG_SIDE = "stop_loss is on the wrong side of entry"
 REASON_DAILY_DRAWDOWN_HALT = "daily drawdown halt active until next UTC day"
 REASON_COOLDOWN_ACTIVE = "cooldown window active after recent stop-out"
@@ -198,6 +201,32 @@ def evaluate(
         return GateResult(approved=False, reason=REASON_MISSING_RISK_PCT, snapshot=snapshot)
     if decision.stop_loss is None:
         return GateResult(approved=False, reason=REASON_MISSING_STOP, snapshot=snapshot)
+
+    # 2.5) Positivity / lower-bound checks. The ceiling checks below only
+    # guard the upper end; a free-text fallback or a confused LLM can emit
+    # zero or negative values that would otherwise pass every upper-bound
+    # test and then explode in the executor (e.g. leverage=0 →
+    # ZeroDivisionError in compute_sizing, or a negative risk_pct that
+    # silently sizes a negative-quantity order). The gate is the floor, so
+    # it rejects these here rather than letting them reach the wire.
+    if decision.leverage < 1.0:
+        return GateResult(
+            approved=False,
+            reason=f"{REASON_LEVERAGE_BELOW_MIN} ({decision.leverage}x)",
+            snapshot=snapshot,
+        )
+    if decision.position_size_pct <= 0.0:
+        return GateResult(
+            approved=False,
+            reason=f"{REASON_RISK_NON_POSITIVE} ({decision.position_size_pct})",
+            snapshot=snapshot,
+        )
+    if decision.stop_loss <= 0.0:
+        return GateResult(
+            approved=False,
+            reason=f"{REASON_STOP_NON_POSITIVE} ({decision.stop_loss})",
+            snapshot=snapshot,
+        )
 
     # 3) Ceiling checks.
     if decision.leverage > config.max_leverage:

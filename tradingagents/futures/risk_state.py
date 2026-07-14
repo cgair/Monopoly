@@ -53,10 +53,13 @@ class RiskGateSnapshot:
 def append_event(path: Path | str, event: dict) -> None:
     """Append a single JSON event to ``path``, creating parents as needed.
 
-    Events are appended line-by-line so concurrent appenders cannot tear
-    each other's writes. The OS guarantees atomicity for writes under
-    PIPE_BUF (≥ 512 bytes on all real-world POSIX systems); our events
-    are well under that.
+    Each event is one line written with a single ``write()`` to a file
+    opened in append mode. On local POSIX filesystems an ``O_APPEND`` write
+    of a small buffer is effectively atomic — the kernel resolves the file
+    offset and copies the buffer under the inode lock — so concurrent
+    appenders do not interleave partial lines. (This is a filesystem
+    property, not the PIPE_BUF guarantee, which is about pipes/FIFOs.)
+    Our events are a few hundred bytes, well within that.
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)

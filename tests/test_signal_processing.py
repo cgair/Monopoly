@@ -61,6 +61,42 @@ class TestParseRating:
         for r in RATINGS_5_TIER:
             assert parse_rating(f"Rating: {r}") == r
 
+    def test_crypto_side_long_maps_to_buy(self):
+        # Crypto FuturesDecision renders "**Side**: Long" with no Rating line.
+        assert parse_rating("**Side**: Long\n\n**Executive Summary**: ...") == "Buy"
+
+    def test_crypto_side_short_maps_to_sell(self):
+        assert parse_rating("**Side**: Short\n\n**Executive Summary**: ...") == "Sell"
+
+    def test_crypto_side_flat_maps_to_hold(self):
+        assert parse_rating("**Side**: Flat\n\n**Executive Summary**: ...") == "Hold"
+
+    def test_rendered_futures_decision_shape(self):
+        # The exact shape produced by render_futures_decision must parse to a
+        # side-mapped rating, not the prose-fallback default.
+        from tradingagents.agents.schemas import (
+            FuturesDecision,
+            FuturesSide,
+            render_futures_decision,
+        )
+
+        decision = FuturesDecision(
+            side=FuturesSide.SHORT,
+            leverage=2.0,
+            position_size_pct=0.005,
+            stop_loss=66500.0,
+            executive_summary="Fade the failed breakout; downside to 60k.",
+            investment_thesis="Funding overheated; OI divergence supports the short.",
+        )
+        assert parse_rating(render_futures_decision(decision)) == "Sell"
+
+    def test_downside_in_prose_does_not_false_match_side(self):
+        # "downside"/"upside" contain "side" — the anchored regex must not
+        # treat them as a Side header. With no real Side/Rating line, the
+        # parser falls through to the prose scan / default.
+        text = "Executive Summary: Significant downside risk remains; stay cautious."
+        assert parse_rating(text) == "Hold"
+
 
 # ---------------------------------------------------------------------------
 # SignalProcessor: thin adapter over the heuristic

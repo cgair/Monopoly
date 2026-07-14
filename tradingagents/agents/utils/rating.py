@@ -26,6 +26,13 @@ _RATING_SET = {r.lower() for r in RATINGS_5_TIER}
 # bold wrappers and either a colon or hyphen separator.
 _RATING_LABEL_RE = re.compile(r"rating.*?[:\-][\s*]*(\w+)", re.IGNORECASE)
 
+# Crypto futures decisions render a "**Side**: Long/Short/Flat" header instead
+# of a "Rating" line (see render_futures_decision). Map those to the shared
+# 5-tier scale so downstream consumers (CLI display, memory-log tag) keep
+# working: Long → Buy, Short → Sell, Flat → Hold.
+_SIDE_LABEL_RE = re.compile(r"^\s*\*{0,2}side\*{0,2}\s*[:\-]\s*(\w+)", re.IGNORECASE)
+_SIDE_TO_RATING = {"long": "Buy", "short": "Sell", "flat": "Hold"}
+
 
 def parse_rating(text: str, default: str = "Hold") -> str:
     """Heuristically extract a 5-tier rating from prose text.
@@ -40,6 +47,12 @@ def parse_rating(text: str, default: str = "Hold") -> str:
         m = _RATING_LABEL_RE.search(line)
         if m and m.group(1).lower() in _RATING_SET:
             return m.group(1).capitalize()
+
+    # Crypto-mode decisions carry a "**Side**:" header rather than "Rating".
+    for line in text.splitlines():
+        m = _SIDE_LABEL_RE.search(line)
+        if m and m.group(1).lower() in _SIDE_TO_RATING:
+            return _SIDE_TO_RATING[m.group(1).lower()]
 
     for line in text.splitlines():
         for word in line.lower().split():

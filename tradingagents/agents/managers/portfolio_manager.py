@@ -72,19 +72,27 @@ def create_portfolio_manager(llm):
             # the typed FuturesDecision object for the downstream risk
             # gate. ``invoke_structured_or_freetext`` only returns the
             # rendered markdown, which the gate would have to re-parse.
-            try:
-                structured_decision = structured_futures.invoke(prompt)
-                final_trade_decision = render_futures_decision(structured_decision)
-            except Exception as exc:
-                logger.warning(
-                    "Portfolio Manager: structured FuturesDecision failed (%s); "
-                    "falling back to free text — risk gate will reject for missing "
-                    "structured decision",
-                    exc,
-                )
+            if structured_futures is None:
+                # Provider doesn't support structured output — go straight to
+                # free text (no alarming "failed" warning; bind_structured
+                # already logged the capability gap at construction time).
                 response = llm.invoke(prompt)
                 final_trade_decision = response.content
                 structured_decision = None
+            else:
+                try:
+                    structured_decision = structured_futures.invoke(prompt)
+                    final_trade_decision = render_futures_decision(structured_decision)
+                except Exception as exc:
+                    logger.warning(
+                        "Portfolio Manager: structured FuturesDecision failed (%s); "
+                        "falling back to free text — risk gate will reject for missing "
+                        "structured decision",
+                        exc,
+                    )
+                    response = llm.invoke(prompt)
+                    final_trade_decision = response.content
+                    structured_decision = None
         else:
             prompt = _build_stock_prompt(
                 instrument_context=instrument_context,

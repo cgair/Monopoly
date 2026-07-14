@@ -1,0 +1,24 @@
+graph LR
+    PM[Portfolio Manager<br/>writes:<br/>final_decision_structured<br/>final_trade_decision] --> COND{asset_type<br/>== crypto?}
+    COND -- NO --> END1([END])
+    COND -- YES --> RG[Risk Gate<br/>reads: final_decision_structured<br/>writes: execution_intent<br/>OR rejection_reason]
+    RG -- intent OR None --> MP[Mark Price<br/>reads: execution_intent<br/>fetch fapi mainnet OR reuse<br/>writes: mark_price]
+    MP --> EX[Executor<br/>reads: intent + mark_price<br/>dryrun OR testnet adapter<br/>writes: execution_result<br/>appends JSONL events]
+    EX --> END2([END])
+
+    EX -.success.-> J1[(position_opened)]
+    EX -.naked.-> J2[(position_opened<br/>+ position_naked)]
+    EX -.skip / fail.-> J3[(trade_skipped)]
+    RG -.reject.-> J3
+
+    classDef manager fill:#e8f5e9,stroke:#388e3c
+    classDef futures fill:#fff9c4,stroke:#f9a825,stroke-width:2px
+    classDef cond fill:#ffe0b2,stroke:#fb8c00
+    classDef endpoint fill:#fff,stroke:#000,stroke-width:2px
+    classDef jsonl fill:#ffebee,stroke:#c62828
+
+    class PM manager
+    class RG,MP,EX futures
+    class COND cond
+    class END1,END2 endpoint
+    class J1,J2,J3 jsonl

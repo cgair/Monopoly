@@ -1,0 +1,17 @@
+graph TB
+    IN([Msg Clear Fundamentals]) --> BR[Bull Researcher<br/>count += 1<br/>current_response = Bull...]
+    BR --> C1{count ><br/>2 * max_rounds?}
+    C1 -- NO --> BE[Bear Researcher<br/>count += 1<br/>current_response = Bear...]
+    BE --> C2{count ><br/>2 * max_rounds?}
+    C2 -- NO --> BR
+    C1 -- YES --> RM[Research Manager<br/>writes investment_plan]
+    C2 -- YES --> RM
+    RM --> OUT([Trader])
+
+    classDef debate fill:#fce4ec,stroke:#c2185b
+    classDef manager fill:#e8f5e9,stroke:#388e3c
+    classDef cond fill:#ffe0b2,stroke:#fb8c00
+
+    class BR,BE debate
+    class RM manager
+    class C1,C2 cond

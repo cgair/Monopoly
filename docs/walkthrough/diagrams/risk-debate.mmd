@@ -1,0 +1,20 @@
+graph TB
+    IN([Trader]) --> AG[Aggressive Analyst<br/>count += 1<br/>latest_speaker = Aggressive]
+    AG --> C1{count ><br/>3 * max_rounds?}
+    C1 -- NO --> CO[Conservative Analyst<br/>count += 1<br/>latest_speaker = Conservative]
+    CO --> C2{count ><br/>3 * max_rounds?}
+    C2 -- NO --> NE[Neutral Analyst<br/>count += 1<br/>latest_speaker = Neutral]
+    NE --> C3{count ><br/>3 * max_rounds?}
+    C3 -- NO --> AG
+    C1 -- YES --> PM[Portfolio Manager]
+    C2 -- YES --> PM
+    C3 -- YES --> PM
+    PM --> OUT([Futures Tail / END])
+
+    classDef debate fill:#fce4ec,stroke:#c2185b
+    classDef manager fill:#e8f5e9,stroke:#388e3c
+    classDef cond fill:#ffe0b2,stroke:#fb8c00
+
+    class AG,CO,NE debate
+    class PM manager
+    class C1,C2,C3 cond

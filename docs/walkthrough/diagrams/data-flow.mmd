@@ -1,0 +1,65 @@
+sequenceDiagram
+    autonumber
+    participant U as User / CLI
+    participant TG as TradingAgentsGraph
+    participant LG as LangGraph runtime
+    participant AN as Analysts (×4)
+    participant DB as Bull/Bear + RM
+    participant TR as Trader
+    participant RD as Risk Debators (×3)
+    participant PM as Portfolio Manager
+    participant RG as Risk Gate
+    participant MP as Mark Price
+    participant EX as Executor
+    participant BN as Binance Testnet
+    participant FS as JSONL Log
+
+    U->>TG: propagate(ticker, date, asset_type=crypto)
+    TG->>LG: graph.invoke(initial_state)
+    LG->>AN: market / sentiment / news / fundamentals
+    AN-->>LG: *_report 字段
+    LG->>DB: Bull / Bear loop
+    DB-->>LG: investment_plan
+    LG->>TR: 读 plan + analyst 报告
+    TR-->>LG: trader_investment_plan (FuturesProposal)
+    LG->>RD: Aggressive / Conservative / Neutral loop
+    RD-->>LG: risk_debate_state.history
+    LG->>PM: 读辩论 + plan + proposal
+    PM-->>LG: final_decision_structured (FuturesDecision)
+    LG->>RG: 读 final_decision_structured + equity
+    RG->>FS: 读 events → derive snapshot
+    alt 规则通过
+        RG-->>LG: execution_intent (dict)
+        LG->>MP: 读 intent
+        MP->>BN: GET fapi mainnet premiumIndex
+        BN-->>MP: mark price
+        MP-->>LG: mark_price
+        LG->>EX: 读 intent + mark_price
+        EX->>BN: change_leverage + MARKET open
+        BN-->>EX: orderId
+        EX->>BN: STOP_MARKET reduceOnly
+        alt 保护单成功
+            BN-->>EX: orderId / algoId
+            EX->>BN: TAKE_PROFIT_MARKET (可选)
+            BN-->>EX: orderId / algoId
+            EX->>FS: append position_opened
+            EX-->>LG: execution_result (success)
+        else 保护单失败
+            EX->>BN: MARKET reduceOnly (unwind)
+            alt unwind 成功
+                BN-->>EX: ok
+                EX->>FS: append trade_skipped
+                EX-->>LG: execution_result (success=False)
+            else unwind 失败
+                BN--xEX: error
+                EX->>FS: position_opened + position_naked
+                EX-->>LG: execution_result (position_naked=True)
+            end
+        end
+    else 规则拒绝
+        RG->>FS: append trade_skipped
+        RG-->>LG: execution_intent = None
+        Note over MP,EX: 下游节点全部短路 no-op
+    end
+    LG-->>TG: final_state
+    TG-->>U: (final_state, processed_signal)

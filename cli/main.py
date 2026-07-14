@@ -1285,3 +1285,160 @@ def analyze(
 
 if __name__ == "__main__":
     app()
+
+
+# ============================================================================
+# JSON Analysis Mode + Trade Review Commands (OpenClaw integration)
+# ============================================================================
+
+import sys
+from cli.json_output import build_analysis_result, output_json
+from tradingagents.futures.trade_review import analyze_trade_review
+
+
+def run_analysis_json(checkpoint: bool = False) -> int:
+    """Non-interactive JSON analysis mode for OpenClaw integration.
+    
+    Runs full analysis with automated selections and outputs JSON to stdout.
+    Logs go to stderr. Execution mode is forced to dryrun.
+    
+    Returns:
+        0 on success, 1 on error.
+    """
+    import json
+    import os
+    from tradingagents.default_config import DEFAULT_CONFIG
+    from tradingagents.futures.risk_state import default_state_path, load_events, derive_state
+    from tradingagents.agents.utils.symbol_utils import infer_asset_type
+    from datetime import datetime, timezone
+    
+    try:
+        # Auto-select minimal config for JSON mode
+        ticker = os.getenv("TRADINGAGENTS_JSON_TICKER", "BTC-USD")
+        asset_type = infer_asset_type(ticker)
+        
+        # Minimal analyst selection (market only for speed)
+        selected_analysts = ["market"]
+        
+        # Create config with dryrun enforced
+        config = DEFAULT_CONFIG.copy()
+        config["max_debate_rounds"] = 1
+        config["quick_think_llm"] = "gemini"
+        config["deep_think_llm"] = "gemini"
+        config["backend_url"] = os.getenv("TRADINGAGENTS_BACKEND_URL", config.get("backend_url"))
+        config["llm_provider"] = os.getenv("TRADINGAGENTS_LLM_PROVIDER", "google").lower()
+        config["output_language"] = os.getenv("TRADINGAGENTS_OUTPUT_LANGUAGE", "English")
+        config["checkpoint_enabled"] = checkpoint
+        # Force dryrun mode
+        os.environ["TRADINGAGENTS_FUTURES_EXECUTOR_MODE"] = "dryrun"
+        
+        stats_handler = StatsCallbackHandler()
+        
+        # Build analysis plan
+        analyst_execution_plan = build_analyst_execution_plan(
+            selected_analysts,
+            concurrency_limit=config["analyst_concurrency_limit"],
+        )
+        
+        # Create graph
+        graph = TradingAgentsGraph(
+            selected_analysts,
+            config=config,
+            debug=False,  # Suppress debug output for JSON mode
+            callbacks=[stats_handler],
+        )
+        
+        # Initialize state
+        analysis_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        init_agent_state = graph.propagator.create_initial_state(
+            ticker,
+            analysis_date,
+            asset_type=asset_type,
+        )
+        args = graph.propagator.get_graph_args(callbacks=[stats_handler])
+        
+        # Stream analysis (collect state without display)
+        final_state = {}
+        for chunk in graph.graph.stream(init_agent_state, **args):
+            final_state.update(chunk)
+        
+        # Process decision
+        decision = graph.process_signal(final_state.get("final_trade_decision"))
+        
+        # Load current risk state for inclusion in output
+        risk_state_path = default_state_path()
+        risk_events = load_events(risk_state_path)
+        risk_snapshot = derive_state(risk_events, now=datetime.now(timezone.utc))
+        
+        # Build result
+        result = build_analysis_result(
+            final_state,
+            {"ticker": ticker, "analysis_date": analysis_date, "analysts": selected_analysts},
+            decision,
+            asset_type,
+        )
+        result["risk_state"] = {
+            "open_positions": risk_snapshot.open_positions,
+            "daily_realised_pnl_usd": risk_snapshot.daily_realised_pnl_usd,
+        }
+        
+        output_json(result)
+        return 0
+        
+    except Exception as e:
+        result = {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        output_json(result)
+        return 1
+
+
+@app.command()
+def analyze_json(
+    checkpoint: bool = typer.Option(
+        False,
+        "--checkpoint",
+        help="Enable checkpoint/resume mode.",
+    ),
+):
+    """Run analysis in JSON mode for machine consumption (OpenClaw integration).
+    
+    Non-interactive. Outputs JSON to stdout, logs to stderr.
+    Execution is forced to dryrun mode (no real trades).
+    """
+    sys.exit(run_analysis_json(checkpoint=checkpoint))
+
+
+@app.command()
+def trade_review(
+    symbol: Optional[str] = typer.Option(
+        None,
+        "--symbol",
+        help="Filter by symbol (e.g. BTCUSDT). If omitted, analyze all.",
+    ),
+    hours: int = typer.Option(
+        24,
+        "--hours",
+        help="Time window in hours to look back.",
+    ),
+):
+    """Review recent trade decisions, positions, and gate rejections.
+    
+    Reads memory log and risk_gate_state.jsonl. Outputs JSON summary.
+    """
+    try:
+        summary = analyze_trade_review(
+            symbol=symbol,
+            time_window_hours=hours,
+        )
+        output_json(summary.to_dict())
+    except Exception as e:
+        result = {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        output_json(result)
+        sys.exit(1)

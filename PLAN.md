@@ -57,11 +57,12 @@ T8 (On-Chain analyst) —— 被数据源选型阻塞,需人工决策后开工
 
 ## T1 — Position Monitor / 持仓对账 ✅ 完成(2026-07-14,`943558a` 合并)
 
-> **遗留(验证阶段限制,待 testnet 实测后决定是否收紧)**:
+> **✅ 2026-07-18 testnet 实弹验证通过**:开仓(带 stop/TP)→ reduceOnly 平仓模拟交易所侧关闭 →
+> `reconcile_positions()` 正确写入 `position_closed`、清理孤儿单、账户状态干净。
+> **遗留(验证阶段限制)**:
 > ① 对账写的 `position_closed` 事件 `pnl_usd=0.0` — 日回撤熔断看不到这些亏损;outcome 默认
 > 推断为 `"stop"` 会触发 cooldown,方向上过度保守而非漏防,可接受但要知情。
 > ② stop vs TP 的精确区分需查订单历史,当前是启发式。
-> ③ **手工 testnet 验证未做**(见 §手工验证清单)。
 
 **优先级**: P1
 **新建文件**: `tradingagents/futures/position_monitor.py` + `tests/test_futures_position_monitor.py`
@@ -88,8 +89,12 @@ T8 (On-Chain analyst) —— 被数据源选型阻塞,需人工决策后开工
 
 ## T2 — Algo 单程序化撤销 ✅ 完成(2026-07-14,与 T1 同 commit 合并)
 
-> 实现:`DELETE /fapi/v1/algoOrder` + `GET /fapi/v1/algoOpenOrders`,经 python-binance
-> `_request_futures_api` 底层签名直调。**endpoint 未经真实 testnet 验证**(见 §手工验证清单)。
+> **✅ 2026-07-18 testnet 实弹验证通过(修正了两处 agent 调研错误)**:
+> ① 列表端点是 `GET /fapi/v1/openAlgoOrders`(不是 `algoOpenOrders`,后者仅作 DELETE 全撤);
+> ② 当前安装的 python-binance 已**原生暴露** `futures_get_open_algo_orders` /
+> `futures_cancel_algo_order`(需 symbol+algoId)/ `futures_cancel_all_algo_open_orders`,
+> 无需手拼 `_request_futures_api` 路径(手拼还会双重前缀 `/fapi/v1//fapi/v1/...`)。
+> spec §8 里"1.0.36 没有此 API"的信息已过时。实测一发清掉 4 张 algo 单。
 
 **优先级**: P1(与 T1 同一 worktree 做,顺序:先 T1 后 T2)
 **触碰文件**: `tradingagents/futures/executor.py`(或新建 `futures/binance_algo.py`)+ 测试
@@ -111,8 +116,11 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 ## T3 — Sentiment Analyst Reddit 403 排查 ✅ 完成(2026-07-14,`a9c54b9` 合并)
 
 > 实现:合规 UA(`REDDIT_USERNAME` env 可覆盖)+ 403/429 指数退避 + `old.reddit.com`
-> fallback + 全失败时 `data_gap` 优雅降级。**真实代理环境实测未做**——如果两端点都被
-> IP 级封锁,现在会降级而非崩溃,但数据缺口仍在(备选:OAuth API / RSS)。
+> fallback + 全失败时 `data_gap` 优雅降级。
+> **2026-07-18 真实代理实测**:降级路径工作正常(`ok=False` + `data_gap`,无裸异常),但
+> www 和 old 两端点均 403(合规 UA 也一样)→ **代理出口 IP 被 Reddit 封禁,代码层无解**。
+> 数据恢复的两条路:换代理出口节点重测,或注册 Reddit script app 走 OAuth API(免费 tier,
+> oauth.reddit.com 对 DC IP 通常放行)——后者可开小任务 T3b。
 
 **优先级**: P2(独立,随时可并行)
 **触碰文件**: `tradingagents/dataflows/crypto_reddit.py` + 对应测试
@@ -135,7 +143,7 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 > 实现:`python -m cli.main analyze_json`(强制 dryrun,JSON 到 stdout / 日志到 stderr)、
 > `python -m cli.main trade_review --symbol --hours`(纯读 memory log + risk JSONL,无 LLM 调用)、
 > `cli/json_output.py` 序列化、`futures/trade_review.py` 汇总、`openclaw/skills/*/SKILL.md` 两份。
-> **OpenClaw 侧安装 + Telegram bot 配置是用户手工步骤**(见 SKILL.md 内说明)。
+> **OpenClaw 侧安装 + Discord bot 配置是用户手工步骤**(见 SKILL.md 内说明)。
 
 **优先级**: P2
 **产出位置**: OpenClaw 的 skill 目录(在 OpenClaw 侧新建,Monopoly 仓库内可能需要补一个稳定的 CLI 入口/JSON 输出)
@@ -144,9 +152,9 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 **内容**(spec §3 Week 5,方案 A):
 - `trade_analyze`:调 Monopoly CLI 跑完整分析,拿回 JSON 决策(不执行)。需要确认 CLI 有机器可读输出;没有就先加。
 - `trade_review`:读 `~/.tradingagents/memory/` 的 memory log + `risk_gate_state.jsonl`,汇总近期决策/持仓/gate 拒绝原因。
-- Telegram bot 配置(OpenClaw 侧)。
+- Discord bot 配置(OpenClaw 侧)。
 
-**验收**: 手机 Telegram 发消息 → OpenClaw 触发 `trade_analyze` → 返回决策摘要;`trade_review` 能报当前持仓与最近一次 run 的结果。
+**验收**: 手机 Discord 发消息 → OpenClaw 触发 `trade_analyze` → 返回决策摘要;`trade_review` 能报当前持仓与最近一次 run 的结果。
 
 ---
 
@@ -154,11 +162,11 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 
 **优先级**: P2(依赖已解除:T1/T2/T4 均已合并。**建议先做完 §手工验证清单再开工**——
 trade_execute 建在 executor + monitor 之上,先确认它们在 testnet 真实可用)
-**背景**: 人工审批当初有意跳过 Monopoly graph 内的 Telegram 节点,决定落在 OpenClaw 层。这是核心约束
+**背景**: 人工审批当初有意跳过 Monopoly graph 内的 Discord 节点,决定落在 OpenClaw 层。这是核心约束
 「最终下单前必须人工确认」目前唯一缺失的防线,**T5 完成前不得切 mainnet**。
 
 **内容**:
-- `trade_execute`:接收 `trade_analyze` 的 JSON 决策 → Telegram 推送决策卡片(方向/杠杆/size/SL/TP/gate 快照)→ 用户 Yes/No → Yes 才调 executor。
+- `trade_execute`:接收 `trade_analyze` 的 JSON 决策 → Discord 推送决策卡片(方向/杠杆/size/SL/TP/gate 快照)→ 用户 Yes/No → Yes 才调 executor。
 - 审批超时策略:超时自动取消(spec §5.2 开放问题,默认建议 15 分钟超时取消,做成可配)。
 - 拒绝/超时都要写 `trade_skipped` 事件进 JSONL(带 reason)。
 
@@ -175,7 +183,7 @@ trade_execute 建在 executor + monitor 之上,先确认它们在 testnet 真实
 
 **内容**:
 - 读 `risk_gate_state.jsonl`,统计窗口期内 gate 拒绝次数/原因分布、`position_naked` 事件、executor error。
-- 超阈值(如 24h 内拒绝 ≥3 次,或出现任何 position_naked)→ 告警。通道:先落地本地日志 + 退出码(launchd 可挂),Telegram 推送等 T5 的 bot 通了以后复用。
+- 超阈值(如 24h 内拒绝 ≥3 次,或出现任何 position_naked)→ 告警。通道:先落地本地日志 + 退出码(launchd 可挂),Discord 推送等 T5 的 bot 通了以后复用。
 - 顺带覆盖 spec §5.4:Mac mini 离线、API 连续报错、连续亏损告警,能做多少做多少,做不完的列 TODO 注释。
 
 **验收**: 单测构造异常 JSONL → 告警触发;正常 JSONL → 静默。
@@ -208,15 +216,15 @@ trade_execute 建在 executor + monitor 之上,先确认它们在 testnet 真实
 
 ---
 
-## 手工验证清单(2026-07-14 合并后,需要用户环境/API key,T5 开工前完成)
+## 手工验证清单(2026-07-18 更新:1–3 已由 Claude 实弹完成,剩 4–5 需用户)
 
-1. **Position monitor testnet 实测**(T1):testnet 开一仓(带 stop/TP)→ UI 手动触发或等 stop 打掉 →
-   跑 `reconcile_positions()` → 确认 JSONL 出现 `position_closed`、gate 重新放行、UI 无孤儿单。
-2. **Algo 撤单 endpoint 实测**(T2):挂一对 stop/TP → 调 `cancel_all_algo_orders(symbol)` →
-   UI 确认消失。若 `DELETE /fapi/v1/algoOrder` 路径不对会 fail-loud,届时抓 UI "Cancel All" 的请求路径修正。
-3. **Reddit 真实代理实测**(T3):跑一次完整 graph,确认 sentiment 阶段拿到数据或干净的 `data_gap`(无 403 裸异常)。
-4. **OpenClaw 侧安装**(T4):拷 `openclaw/skills/trade_analyze`、`trade_review` 到 OpenClaw skill 目录,
-   配置 Telegram bot,手机上跑 `/trade_analyze` 和 `/trade_review`。
+1. ~~Position monitor testnet 实测~~ ✅ 2026-07-18:开仓→平仓→对账→`position_closed` 写入、孤儿单清零、账户干净。
+2. ~~Algo 撤单 endpoint 实测~~ ✅ 2026-07-18:修正 endpoint 后一发清掉 4 张 algo 单(详见 T2 任务卡注记)。
+3. ~~Reddit 真实代理实测~~ ✅ 2026-07-18:降级路径正常;**代理出口 IP 被 Reddit 封禁**,数据恢复见 T3 注记
+   (换出口节点 / T3b OAuth)。
+4. **OpenClaw 侧安装**(T4,需用户在 Mac mini 上操作):拷 `openclaw/skills/trade_analyze`、`trade_review`
+   到 OpenClaw skill 目录,配置 **Discord bot**(交互渠道已定为 Discord,非 Telegram),
+   手机 Discord 跑 `/trade_analyze` 和 `/trade_review`。
 5. `git push origin dev` 备份(本地已领先若干 commit)。
 
 ## 其他挂起项(不单开任务)

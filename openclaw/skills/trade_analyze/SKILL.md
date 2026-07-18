@@ -101,7 +101,7 @@ python -m cli.main analyze_json --checkpoint
 | `investment_thesis` | string | Detailed reasoning from analysts' debate (multi-paragraph). |
 | `time_horizon` | string | Optional: e.g., "2-5 days", "intraday", "1 week". |
 
-## Integration with OpenClaw / Telegram
+## Integration with OpenClaw / Discord
 
 ### 1. Copy the skill to OpenClaw
 
@@ -112,7 +112,7 @@ cp -r ~/Monopoly/openclaw/skills/trade_analyze \
       ~/.local/share/OpenClaw/skills/
 ```
 
-### 2. Configure OpenClaw bot (Telegram)
+### 2. Configure OpenClaw bot (Discord)
 
 In your OpenClaw configuration (typically `~/.config/OpenClaw/config.yaml`):
 
@@ -126,9 +126,9 @@ skills:
     output_format: json
 ```
 
-### 3. Telegram usage
+### 3. Discord usage
 
-Send a message to your OpenClaw bot (via Telegram):
+Send a message to your OpenClaw bot (via Discord):
 
 ```
 /trade_analyze

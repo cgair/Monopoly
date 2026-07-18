@@ -205,18 +205,13 @@ class TestnetExchange:
 
 
     def cancel_algo_order(self, symbol: str, algo_id: int) -> bool:
-        """Cancel a specific algo order by ID.
-        
-        Uses DELETE /fapi/v1/algoOrder endpoint with algoId parameter.
-        See: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/Cancel-Algo-Order
+        """Cancel a specific algo order (DELETE /fapi/v1/algoOrder).
+
+        ``symbol`` is required by the endpoint alongside ``algoId``.
+        Verified live on testnet 2026-07-18.
         """
         try:
-            self.client._request_futures_api(
-                "delete",
-                "/fapi/v1/algoOrder",
-                True,
-                data={"algoId": algo_id},
-            )
+            self.client.futures_cancel_algo_order(symbol=symbol, algoId=algo_id)
             logger.info("Cancelled algo order %d for %s", algo_id, symbol)
             return True
         except Exception as exc:
@@ -224,36 +219,25 @@ class TestnetExchange:
             return False
 
     def cancel_all_algo_orders(self, symbol: str) -> int:
-        """Cancel all algo orders for a symbol.
-        
-        Fetches active algo orders via GET /fapi/v1/algoOpenOrders, then
-        cancels each via DELETE /fapi/v1/algoOrder.
-        See: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/Current-All-Algo-Open-Orders
+        """Cancel all open algo orders for a symbol.
+
+        Lists via GET /fapi/v1/openAlgoOrders to report an accurate count,
+        then cancels in one shot via DELETE /fapi/v1/algoOpenOrders. Both
+        are exposed by python-binance as ``futures_get_open_algo_orders`` /
+        ``futures_cancel_all_algo_open_orders``. Verified live on testnet
+        2026-07-18.
         """
         try:
-            # Fetch all open algo orders for this symbol
-            orders = self.client._request_futures_api(
-                "get",
-                "/fapi/v1/algoOpenOrders",
-                True,
-                data={"symbol": symbol},
-            )
+            resp = self.client.futures_get_open_algo_orders(symbol=symbol)
+            # Endpoint may return a bare list or {"total": n, "orders": [...]}.
+            orders = resp.get("orders", resp) if isinstance(resp, dict) else resp
             if not orders:
                 logger.info("No open algo orders for %s", symbol)
                 return 0
 
-            # Cancel each one
-            cancelled_count = 0
-            for order in orders:
-                algo_id = order.get("algoId")
-                if algo_id is None:
-                    logger.warning("Algo order missing algoId: %s", order)
-                    continue
-                if self.cancel_algo_order(symbol, int(algo_id)):
-                    cancelled_count += 1
-
-            logger.info("Cancelled %d algo orders for %s", cancelled_count, symbol)
-            return cancelled_count
+            self.client.futures_cancel_all_algo_open_orders(symbol=symbol)
+            logger.info("Cancelled %d algo orders for %s", len(orders), symbol)
+            return len(orders)
         except Exception as exc:
             logger.error("Failed to cancel all algo orders for %s: %s", symbol, exc)
             return 0

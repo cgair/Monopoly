@@ -494,100 +494,78 @@ class TestAlgoOrderCancellation:
         assert "BTCUSDT" in ex.cancelled_symbols
 
     def test_testnet_cancel_algo_order_success(self):
-        """TestnetExchange.cancel_algo_order calls the delete API."""
+        """TestnetExchange.cancel_algo_order delegates to the native client method."""
         mock_client = Mock()
-        mock_client._request_futures_api.return_value = {"code": 200}
+        mock_client.futures_cancel_algo_order.return_value = {"code": 200}
         ex = TestnetExchange("key", "secret", client_cls=lambda *a, **kw: mock_client)
-        
+
         result = ex.cancel_algo_order("BTCUSDT", 12345)
-        
+
         assert result is True
-        mock_client._request_futures_api.assert_called_once_with(
-            "delete",
-            "/fapi/v1/algoOrder",
-            True,
-            data={"algoId": 12345},
+        mock_client.futures_cancel_algo_order.assert_called_once_with(
+            symbol="BTCUSDT", algoId=12345,
         )
 
     def test_testnet_cancel_algo_order_failure(self):
         """TestnetExchange.cancel_algo_order returns False on error."""
         mock_client = Mock()
-        mock_client._request_futures_api.side_effect = Exception("API error")
+        mock_client.futures_cancel_algo_order.side_effect = Exception("API error")
         ex = TestnetExchange("key", "secret", client_cls=lambda *a, **kw: mock_client)
-        
+
         result = ex.cancel_algo_order("BTCUSDT", 12345)
-        
+
         assert result is False
 
     def test_testnet_cancel_all_algo_orders_empty(self):
-        """TestnetExchange.cancel_all_algo_orders returns 0 when no orders."""
+        """TestnetExchange.cancel_all_algo_orders returns 0 and skips the delete when no orders."""
         mock_client = Mock()
-        mock_client._request_futures_api.return_value = []  # No open orders
+        mock_client.futures_get_open_algo_orders.return_value = []
         ex = TestnetExchange("key", "secret", client_cls=lambda *a, **kw: mock_client)
-        
+
         count = ex.cancel_all_algo_orders("BTCUSDT")
-        
+
         assert count == 0
-        # Should call GET to fetch orders
-        call_args = mock_client._request_futures_api.call_args_list[0]
-        assert call_args[0][:2] == ("get", "/fapi/v1/algoOpenOrders")
+        mock_client.futures_get_open_algo_orders.assert_called_once_with(symbol="BTCUSDT")
+        mock_client.futures_cancel_all_algo_open_orders.assert_not_called()
 
     def test_testnet_cancel_all_algo_orders_multiple(self):
-        """TestnetExchange.cancel_all_algo_orders cancels all open orders."""
+        """TestnetExchange.cancel_all_algo_orders cancels via one delete-all call."""
         mock_client = Mock()
-        # Simulate two open algo orders
-        mock_client._request_futures_api.side_effect = [
-            [  # GET response: list of open orders
-                {"algoId": 111, "symbol": "BTCUSDT", "side": "SELL"},
-                {"algoId": 222, "symbol": "BTCUSDT", "side": "SELL"},
-            ],
-            True,  # DELETE response for order 111
-            True,  # DELETE response for order 222
+        mock_client.futures_get_open_algo_orders.return_value = [
+            {"algoId": 111, "symbol": "BTCUSDT", "side": "SELL"},
+            {"algoId": 222, "symbol": "BTCUSDT", "side": "SELL"},
         ]
         ex = TestnetExchange("key", "secret", client_cls=lambda *a, **kw: mock_client)
-        
-        count = ex.cancel_all_algo_orders("BTCUSDT")
-        
-        assert count == 2
-        # Should have 3 calls: GET + DELETE + DELETE
-        assert mock_client._request_futures_api.call_count == 3
 
-    def test_testnet_cancel_all_algo_orders_partial_failure(self):
-        """TestnetExchange.cancel_all_algo_orders continues even if some cancels fail."""
-        mock_client = Mock()
-        call_count = [0]
-        
-        def side_effect_func(*args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                # GET response - return list of open orders
-                return [
-                    {"algoId": 111, "symbol": "BTCUSDT"},
-                    {"algoId": 222, "symbol": "BTCUSDT"},
-                ]
-            elif call_count[0] == 2:
-                # First cancel succeeds
-                return {"code": 200}
-            else:
-                # Second cancel fails
-                raise Exception("API error")
-        
-        mock_client._request_futures_api.side_effect = side_effect_func
-        ex = TestnetExchange("key", "secret", client_cls=lambda *a, **kw: mock_client)
-        
         count = ex.cancel_all_algo_orders("BTCUSDT")
-        
-        # Only the successful one is counted
+
+        assert count == 2
+        mock_client.futures_cancel_all_algo_open_orders.assert_called_once_with(
+            symbol="BTCUSDT",
+        )
+
+    def test_testnet_cancel_all_algo_orders_dict_response(self):
+        """The list endpoint may wrap orders as {"total": n, "orders": [...]}."""
+        mock_client = Mock()
+        mock_client.futures_get_open_algo_orders.return_value = {
+            "total": 1,
+            "orders": [{"algoId": 111, "symbol": "BTCUSDT"}],
+        }
+        ex = TestnetExchange("key", "secret", client_cls=lambda *a, **kw: mock_client)
+
+        count = ex.cancel_all_algo_orders("BTCUSDT")
+
         assert count == 1
+        mock_client.futures_cancel_all_algo_open_orders.assert_called_once()
 
     def test_testnet_cancel_all_algo_orders_api_failure(self):
-        """TestnetExchange.cancel_all_algo_orders returns 0 on GET failure."""
+        """TestnetExchange.cancel_all_algo_orders returns 0 on any API failure."""
         mock_client = Mock()
-        mock_client._request_futures_api.side_effect = Exception("Network error")
+        mock_client.futures_get_open_algo_orders.side_effect = Exception("Network error")
         ex = TestnetExchange("key", "secret", client_cls=lambda *a, **kw: mock_client)
-        
+
         count = ex.cancel_all_algo_orders("BTCUSDT")
-        
+
         assert count == 0
 
     def test_reconcile_calls_cancel_all_algo_orders(self, temp_jsonl: Path):

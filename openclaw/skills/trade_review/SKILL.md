@@ -99,7 +99,7 @@ python -m cli.main trade_review --hours 168
 | `gate_rejections` | array | Aggregated rejection reasons (all-time, within window) |
 | `recent_gate_rejections` | array | Raw rejection events within time window |
 
-## Integration with OpenClaw / Telegram
+## Integration with OpenClaw / Discord
 
 ### 1. Copy the skill
 
@@ -131,7 +131,7 @@ skills:
     output_format: json
 ```
 
-### 3. Telegram usage
+### 3. Discord usage
 
 ```
 /trade_review

@@ -1283,10 +1283,6 @@ def analyze(
     run_analysis(checkpoint=checkpoint)
 
 
-if __name__ == "__main__":
-    app()
-
-
 # ============================================================================
 # JSON Analysis Mode + Trade Review Commands (OpenClaw integration)
 # ============================================================================
@@ -1395,7 +1391,7 @@ def run_analysis_json(checkpoint: bool = False) -> int:
         return 1
 
 
-@app.command()
+@app.command("analyze_json")
 def analyze_json(
     checkpoint: bool = typer.Option(
         False,
@@ -1411,7 +1407,7 @@ def analyze_json(
     sys.exit(run_analysis_json(checkpoint=checkpoint))
 
 
-@app.command()
+@app.command("trade_review")
 def trade_review(
     symbol: Optional[str] = typer.Option(
         None,
@@ -1444,7 +1440,7 @@ def trade_review(
         sys.exit(1)
 
 
-@app.command()
+@app.command("trade_execute")
 def trade_execute(
     decision_file: Optional[Path] = typer.Option(
         None,
@@ -1483,7 +1479,9 @@ def trade_execute(
     """
     import json
     import os
-    from datetime import timezone
+    # Module top-level does `import datetime` (the module); bind the class
+    # locally or every `datetime.now(...)` below hits the module and crashes.
+    from datetime import datetime, timezone
     from pathlib import Path
 
     from tradingagents.futures.approval import (
@@ -1592,9 +1590,12 @@ def trade_execute(
             sys.exit(1)
 
         # ===== Gate re-evaluation =====
+        # Executor mode comes from config (dryrun default; testnet via
+        # TRADINGAGENTS_FUTURES_EXECUTOR_MODE). Unlike analyze_json, this
+        # command is the human-approved execution path, so the configured
+        # mode must be honoured — forcing dryrun here would make approval
+        # a no-op.
         config = DEFAULT_CONFIG.copy()
-        # Force dryrun mode
-        os.environ["TRADINGAGENTS_FUTURES_EXECUTOR_MODE"] = "dryrun"
 
         equity_usd = float(config.get("futures_starting_equity_usd", 1000.0))
         intent, gate_reason = reconstruct_intent_from_decision(
@@ -1622,7 +1623,28 @@ def trade_execute(
 
         # ===== Execution =====
         executor = create_executor(config)
-        mark_price = decision.entry_price or 60000.0  # fallback for pricing
+        from tradingagents.futures.market_data import fetch_mark_price
+
+        mark_price = fetch_mark_price(symbol)
+        if mark_price is None:
+            # A LIMIT decision still carries a usable reference price; a
+            # market entry must never be sized off a fabricated number.
+            if decision.entry_price:
+                mark_price = decision.entry_price
+            else:
+                reason = "mark price unavailable — refusing to size market order"
+                write_trade_skipped_event(
+                    reason,
+                    symbol=symbol,
+                    approval_metadata=approval_meta,
+                )
+                output_json({
+                    "status": "error",
+                    "symbol": symbol,
+                    "reason": reason,
+                    "timestamp": now.isoformat(),
+                })
+                sys.exit(2)
         exec_result = executor.place_order(intent, equity_usd=equity_usd, mark_price=mark_price)
 
         if exec_result.success:
@@ -1672,3 +1694,9 @@ def trade_execute(
         }
         output_json(result)
         sys.exit(2)
+
+
+# Must stay at the very end of the module: running `python -m cli.main`
+# executes top-down, so app() only sees commands registered above this line.
+if __name__ == "__main__":
+    app()

@@ -150,8 +150,11 @@ class TestParseDecisionJson:
         assert isinstance(ts, datetime)
 
     def test_parses_just_decision_dict(self):
+        # A bare decision dict must carry its own timestamp — the top-level
+        # analyze_json timestamp is not available in this shape.
         full_json = _sample_decision_json()
-        decision_json = full_json["decision"]
+        decision_json = dict(full_json["decision"])
+        decision_json["timestamp"] = full_json["timestamp"]
         decision, ts = parse_decision_json(decision_json)
 
         assert isinstance(decision, FuturesDecision)
@@ -187,12 +190,14 @@ class TestParseDecisionJson:
         with pytest.raises(KeyError):
             parse_decision_json(decision_json)
 
-    def test_defaults_timestamp_to_now_if_missing(self):
-        decision_json = {"decision": _sample_decision_json()["decision"]}
-        decision, ts = parse_decision_json(decision_json)
-        # Should not raise; ts should be close to now
-        assert isinstance(ts, datetime)
-        assert ts.tzinfo is not None
+    def test_missing_timestamp_fails_closed(self):
+        # An undated decision must NOT default to "now" — that would make it
+        # permanently fresh and bypass the approval-timeout staleness brake.
+        decision_json = {"decision": dict(_sample_decision_json()["decision"])}
+        decision_json["decision"].pop("timestamp", None)
+        decision_json["decision"].pop("created_at", None)
+        with pytest.raises(ValueError, match="timestamp"):
+            parse_decision_json(decision_json)
 
 
 # ---------------------------------------------------------------------------

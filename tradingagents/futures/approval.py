@@ -106,7 +106,10 @@ def parse_decision_json(decision_json: dict) -> tuple[FuturesDecision, datetime]
     KeyError, ValueError
         If required fields are missing or malformed.
     """
-    # Handle both full output and just the decision dict
+    # Handle both full analyze_json output and just the decision dict.
+    # analyze_json stamps the timestamp at the TOP level (build_analysis_result),
+    # so capture it before narrowing to the nested decision.
+    outer_ts = decision_json.get("timestamp") or decision_json.get("created_at")
     if "decision" in decision_json:
         decision_json = decision_json["decision"]
 
@@ -139,15 +142,18 @@ def parse_decision_json(decision_json: dict) -> tuple[FuturesDecision, datetime]
         time_horizon=decision_json.get("time_horizon", ""),
     )
 
-    # Parse timestamp from the decision or analysis level
-    ts_str = decision_json.get("timestamp") or decision_json.get("created_at")
+    # Parse timestamp from the decision or analysis level. Fail closed: an
+    # undated decision cannot be staleness-checked, and defaulting to "now"
+    # would make it permanently fresh — a bypass of the approval timeout.
+    ts_str = decision_json.get("timestamp") or decision_json.get("created_at") or outer_ts
     if not ts_str:
-        # Fall back to "now" if no timestamp found (for tests/offline scenarios)
-        ts = datetime.now(timezone.utc)
-    else:
-        if ts_str.endswith("Z"):
-            ts_str = ts_str[:-1] + "+00:00"
-        ts = datetime.fromisoformat(ts_str)
+        raise ValueError(
+            "decision JSON has no timestamp/created_at — cannot verify "
+            "staleness, refusing to treat an undated decision as fresh"
+        )
+    if ts_str.endswith("Z"):
+        ts_str = ts_str[:-1] + "+00:00"
+    ts = datetime.fromisoformat(ts_str)
 
     return decision, ts
 

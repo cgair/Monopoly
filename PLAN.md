@@ -19,6 +19,7 @@ T0 ✅ ── T1 ✅ ── T2 ✅ ── T3 ✅ ── T4 ✅ ── T5 ✅ ─
 剩余:[用户] Mac mini OpenClaw + Discord bot 配置(验证清单 4)
       T3b Reddit OAuth(可选,数据缺口恢复)
       T8 On-Chain analyst(阻塞:数据源选型)
+搁置:Hermes 侧集成(代码已在库,用户决定现有工作流够用,暂不配置)
 ```
 
 **T0 必须最先在主仓库完成**(worktree 从已提交的 commit 分出,未提交改动不会带过去)。
@@ -206,7 +207,9 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 > 实现:`futures/hermes_memory_adapter.py`,`python -m tradingagents.futures.hermes_memory_adapter
 > --output-dir <dir>` 汇出 `hermes_memory.md`(决策摘要 + 人工否决记录 + gate 拒绝模式),
 > 按 intent_id 去重幂等,默认 7 天窗口。Hermes 记忆体系为 markdown-based(MEMORY.md/USER.md/
-> skill 文件,来源:NousResearch/hermes-agent)。Hermes 侧挂载 + launchd 周期任务待用户配置。
+> skill 文件,来源:NousResearch/hermes-agent)。
+> **Hermes 侧集成已搁置(2026-07-19 用户决定:现有工作流已够用)**——adapter 代码保留在库中,
+> 将来要启用时只需配置 Hermes 挂载 + launchd 周期任务,无需再开发。
 
 **优先级**: P4(低,不阻塞任何任务)
 **新建文件**: `tradingagents/futures/hermes_memory_adapter.py` + 测试

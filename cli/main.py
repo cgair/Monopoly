@@ -1425,7 +1425,7 @@ def trade_review(
     ),
 ):
     """Review recent trade decisions, positions, and gate rejections.
-    
+
     Reads memory log and risk_gate_state.jsonl. Outputs JSON summary.
     """
     try:
@@ -1442,3 +1442,233 @@ def trade_review(
         }
         output_json(result)
         sys.exit(1)
+
+
+@app.command()
+def trade_execute(
+    decision_file: Optional[Path] = typer.Option(
+        None,
+        "--decision-file",
+        help="Path to decision JSON file. If omitted, reads from stdin.",
+    ),
+    approved: bool = typer.Option(
+        False,
+        "--approved",
+        help="User approves execution. REQUIRED for execution (--rejected takes precedence).",
+    ),
+    approved_by: Optional[str] = typer.Option(
+        None,
+        "--approved-by",
+        help="Discord username or identifier of the approver. REQUIRED if --approved.",
+    ),
+    rejected: bool = typer.Option(
+        False,
+        "--rejected",
+        help="User rejects execution. Only writes trade_skipped event.",
+    ),
+):
+    """Execute a trade decision with mandatory human approval.
+
+    Workflow:
+    1. Read decision JSON (from --decision-file or stdin).
+    2. Check staleness (default 15 min timeout, env TRADINGAGENTS_FUTURES_APPROVAL_TIMEOUT_MIN).
+    3. Verify explicit approval: --approved + --approved-by REQUIRED (no defaults).
+    4. Re-evaluate through risk gate with current state (gate may now reject).
+    5. Execute via create_executor (dryrun default, env-selected).
+    6. Output JSON result to stdout, logs to stderr.
+
+    Rejection path: --rejected --approved-by <who> writes trade_skipped without executing.
+
+    Exit codes: 0=success, 1=rejection/timeout/gate-fail, 2=error.
+    """
+    import json
+    import os
+    from datetime import timezone
+    from pathlib import Path
+
+    from tradingagents.futures.approval import (
+        ApprovalMetadata,
+        check_staleness,
+        parse_decision_json,
+        reconstruct_intent_from_decision,
+        write_trade_skipped_event,
+    )
+    from tradingagents.futures.executor import create_executor
+    from tradingagents.futures.risk_state import default_state_path
+
+    try:
+        # ===== Input & Validation =====
+        # 1. Read decision JSON
+        if decision_file:
+            decision_json = json.loads(decision_file.read_text(encoding="utf-8"))
+        else:
+            decision_json = json.load(sys.stdin)
+
+        # Extract decision and timestamp
+        decision, decision_ts = parse_decision_json(decision_json)
+        symbol = decision_json.get("analysis", {}).get("ticker", "UNKNOWN")
+
+        # 2. Approval metadata
+        now = datetime.now(timezone.utc)
+        approval_meta = ApprovalMetadata(
+            approved=approved and not rejected,
+            approved_by=approved_by or "unknown",
+            approved_at=now.replace(microsecond=0).isoformat(),
+        )
+
+        # ===== Rejection path (explicit user No) =====
+        if rejected:
+            reason = "human rejected"
+            write_trade_skipped_event(
+                reason,
+                symbol=symbol,
+                approval_metadata=approval_meta,
+            )
+            result = {
+                "status": "rejected",
+                "symbol": symbol,
+                "reason": reason,
+                "approved_by": approved_by,
+                "timestamp": now.isoformat(),
+            }
+            output_json(result)
+            sys.exit(1)
+
+        # ===== Staleness check =====
+        approval_timeout_min = int(
+            os.getenv("TRADINGAGENTS_FUTURES_APPROVAL_TIMEOUT_MIN", "15")
+        )
+        is_stale, stale_reason = check_staleness(
+            decision_ts.isoformat(),
+            now=now,
+            approval_timeout_minutes=approval_timeout_min,
+        )
+        if is_stale:
+            write_trade_skipped_event(
+                stale_reason,
+                symbol=symbol,
+                approval_metadata=approval_meta,
+            )
+            result = {
+                "status": "stale",
+                "symbol": symbol,
+                "reason": stale_reason,
+                "timestamp": now.isoformat(),
+            }
+            output_json(result)
+            sys.exit(1)
+
+        # ===== Explicit approval check =====
+        if not approved:
+            reason = "missing --approved flag"
+            write_trade_skipped_event(
+                reason,
+                symbol=symbol,
+                approval_metadata=approval_meta,
+            )
+            result = {
+                "status": "unapproved",
+                "symbol": symbol,
+                "reason": reason,
+                "timestamp": now.isoformat(),
+            }
+            output_json(result)
+            sys.exit(1)
+
+        if not approved_by:
+            reason = "missing --approved-by parameter"
+            write_trade_skipped_event(
+                reason,
+                symbol=symbol,
+                approval_metadata=approval_meta,
+            )
+            result = {
+                "status": "unapproved",
+                "symbol": symbol,
+                "reason": reason,
+                "timestamp": now.isoformat(),
+            }
+            output_json(result)
+            sys.exit(1)
+
+        # ===== Gate re-evaluation =====
+        config = DEFAULT_CONFIG.copy()
+        # Force dryrun mode
+        os.environ["TRADINGAGENTS_FUTURES_EXECUTOR_MODE"] = "dryrun"
+
+        equity_usd = float(config.get("futures_starting_equity_usd", 1000.0))
+        intent, gate_reason = reconstruct_intent_from_decision(
+            decision,
+            symbol=symbol,
+            equity_usd=equity_usd,
+            config=config,
+            now=now,
+        )
+
+        if intent is None:
+            write_trade_skipped_event(
+                gate_reason or "gate re-evaluation rejected",
+                symbol=symbol,
+                approval_metadata=approval_meta,
+            )
+            result = {
+                "status": "gate_rejected",
+                "symbol": symbol,
+                "reason": gate_reason,
+                "timestamp": now.isoformat(),
+            }
+            output_json(result)
+            sys.exit(1)
+
+        # ===== Execution =====
+        executor = create_executor(config)
+        mark_price = decision.entry_price or 60000.0  # fallback for pricing
+        exec_result = executor.place_order(intent, equity_usd=equity_usd, mark_price=mark_price)
+
+        if exec_result.success:
+            # Log position_opened event
+            from tradingagents.futures.risk_state import append_event
+            append_event(
+                default_state_path(),
+                {
+                    "type": "position_opened",
+                    "ts": exec_result.placed_at,
+                    "intent_id": exec_result.intent_id,
+                    "symbol": exec_result.symbol,
+                },
+            )
+
+        result = {
+            "status": "executed" if exec_result.success else "execution_failed",
+            "symbol": exec_result.symbol,
+            "side": exec_result.side,
+            "quantity": exec_result.quantity,
+            "notional_usd": exec_result.notional_usd,
+            "margin_required_usd": exec_result.margin_required_usd,
+            "mode": exec_result.mode,
+            "order_id": exec_result.order_id,
+            "avg_fill_price": exec_result.avg_fill_price,
+            "placed_at": exec_result.placed_at,
+            "error": exec_result.error,
+            "approved_by": approved_by,
+            "timestamp": now.isoformat(),
+        }
+        output_json(result)
+        sys.exit(0 if exec_result.success else 1)
+
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        result = {
+            "status": "error",
+            "error": f"invalid decision JSON: {str(e)}",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        output_json(result)
+        sys.exit(2)
+    except Exception as e:
+        result = {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        output_json(result)
+        sys.exit(2)

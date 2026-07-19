@@ -1,6 +1,6 @@
 # Monopoly 开发计划(PLAN.md)
 
-- **更新**: 2026-07-14(晚:T0–T4 全部完成并合并回 `dev`,433 passed;剩 T5/T6/T7/T8 + 手工 testnet 验证)
+- **更新**: 2026-07-19(**T0–T7 全部完成**并合并回 `dev`,512 passed;剩:用户在 Mac mini 配 OpenClaw+Discord、T3b Reddit OAuth(可选)、T8 On-Chain(等数据源决策))
 - **来源**: `~/Desktop/AI/become rich/docs/monopoly-spec.md` §3 / §5 / §8 + 工作区未提交改动盘点
 - **用法**: 每个任务设计为可由一个独立 Claude Code 实例(worktree 或新会话)冷启动执行。
   开工前先读任务卡里的「上下文锚点」,完成后勾选并在 spec §8 追加恢复点。
@@ -15,12 +15,10 @@
 ## 任务依赖图
 
 ```
-T0 ✅ ──┬── T1 ✅ ── T2 ✅ ──┐
-        ├── T3 ✅            ├── [手工验证清单] ── T5 (trade_execute + 审批) ← 下一个
-        ├── T4 ✅ ───────────┘
-        ├── T6 (L4 监控告警) ← 可随时开工(T1 已合并,冲突约束解除)
-        └── T7 (Hermes memory adapter)
-T8 (On-Chain analyst) —— 被数据源选型阻塞,需人工决策后开工
+T0 ✅ ── T1 ✅ ── T2 ✅ ── T3 ✅ ── T4 ✅ ── T5 ✅ ── T6 ✅ ── T7 ✅
+剩余:[用户] Mac mini OpenClaw + Discord bot 配置(验证清单 4)
+      T3b Reddit OAuth(可选,数据缺口恢复)
+      T8 On-Chain analyst(阻塞:数据源选型)
 ```
 
 **T0 必须最先在主仓库完成**(worktree 从已提交的 commit 分出,未提交改动不会带过去)。
@@ -158,10 +156,17 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 
 ---
 
-## T5 — OpenClaw skill: trade_execute + 人工审批闭环(Week 5 后半)
+## T5 — OpenClaw skill: trade_execute + 人工审批闭环 ✅ 完成(2026-07-19,`cf8e515` 合并)
 
-**优先级**: P2(依赖已解除:T1/T2/T4 均已合并。**建议先做完 §手工验证清单再开工**——
-trade_execute 建在 executor + monitor 之上,先确认它们在 testnet 真实可用)
+> 实现:`futures/approval.py`(staleness / 审批元数据 / gate 复评)+ `cli/main.py trade_execute`
+> + `openclaw/skills/trade_execute/SKILL.md`。审批语义:`--approved --approved-by` 缺一不可、
+> 决策超 15 分钟即过期(env 可配)、**缺时间戳 fail-closed**、执行前用当前 JSONL 重跑 gate、
+> 拒绝/过期/未批准全部写 `trade_skipped` 审计事件。dryrun 端到端四路径已实测。
+> **实弹修复 5 处 agent 遗留 bug**(`cf8e515`,函数级测试全绿但 CLI 本体全断的教训):
+> 命令注册在 `app()` 之后(顺带修好 T4 的 analyze_json/trade_review 同款问题)、typer 连字符
+> 化与文档不符、`datetime` 模块名遮蔽导致所有路径首行崩溃、强制 dryrun 使审批形同虚设、
+> 硬编码 60000 假价格 → 改用 `fetch_mark_price()` 且无价格时拒绝下单。
+> **待用户**:OpenClaw/Discord 侧按 SKILL.md 配置后,跑一次真实审批链路。
 **背景**: 人工审批当初有意跳过 Monopoly graph 内的 Discord 节点,决定落在 OpenClaw 层。这是核心约束
 「最终下单前必须人工确认」目前唯一缺失的防线,**T5 完成前不得切 mainnet**。
 
@@ -174,7 +179,13 @@ trade_execute 建在 executor + monitor 之上,先确认它们在 testnet 真实
 
 ---
 
-## T6 — L4 监控告警
+## T6 — L4 监控告警 ✅ 完成(2026-07-19,`01aa45e` 合并)
+
+> 实现:`futures/alerts.py`,`python -m tradingagents.futures.alerts` 入口。规则:24h 窗口内
+> gate 拒绝 ≥3 → warn;任何 `position_naked` → critical;executor error ≥5 → warn;连续
+> 止损 ≥3 → warn。退出码 0/1/2,阈值 `TRADINGAGENTS_FUTURES_ALERT_*` env 可配。
+> 已用真实 JSONL 实测(空 → ok/0;3 条拒绝 → warn/1)。launchd plist 示例在 agent 报告中,
+> Discord 推送留 TODO(复用 T5 的 bot)。
 
 **优先级**: P3
 **新建文件**: `tradingagents/futures/alerts.py`(或并入 position_monitor)+ 测试
@@ -190,7 +201,12 @@ trade_execute 建在 executor + monitor 之上,先确认它们在 testnet 真实
 
 ---
 
-## T7 — Hermes memory adapter(Week 6,方案 B)
+## T7 — Hermes memory adapter ✅ 完成(2026-07-19,`d242d0e` 合并)
+
+> 实现:`futures/hermes_memory_adapter.py`,`python -m tradingagents.futures.hermes_memory_adapter
+> --output-dir <dir>` 汇出 `hermes_memory.md`(决策摘要 + 人工否决记录 + gate 拒绝模式),
+> 按 intent_id 去重幂等,默认 7 天窗口。Hermes 记忆体系为 markdown-based(MEMORY.md/USER.md/
+> skill 文件,来源:NousResearch/hermes-agent)。Hermes 侧挂载 + launchd 周期任务待用户配置。
 
 **优先级**: P4(低,不阻塞任何任务)
 **新建文件**: `tradingagents/futures/hermes_memory_adapter.py` + 测试

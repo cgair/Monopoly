@@ -1,6 +1,6 @@
 # Monopoly 开发计划(PLAN.md)
 
-- **更新**: 2026-07-19(**T0–T7 全部完成**并合并回 `dev`,512 passed;剩:用户在 Mac mini 配 OpenClaw+Discord、T3b Reddit OAuth(可选)、T8 On-Chain(等数据源决策))
+- **更新**: 2026-07-19(**T0–T7 全部完成**并合并回 `dev`,512 passed;剩:用户在 Mac mini 配 OpenClaw+Discord、T3b Reddit OAuth(可选);Hermes 与 T8 On-Chain 均搁置/观察)
 - **来源**: `~/Desktop/AI/become rich/docs/monopoly-spec.md` §3 / §5 / §8 + 工作区未提交改动盘点
 - **用法**: 每个任务设计为可由一个独立 Claude Code 实例(worktree 或新会话)冷启动执行。
   开工前先读任务卡里的「上下文锚点」,完成后勾选并在 spec §8 追加恢复点。
@@ -18,8 +18,8 @@
 T0 ✅ ── T1 ✅ ── T2 ✅ ── T3 ✅ ── T4 ✅ ── T5 ✅ ── T6 ✅ ── T7 ✅
 剩余:[用户] Mac mini OpenClaw + Discord bot 配置(验证清单 4)
       T3b Reddit OAuth(可选,数据缺口恢复)
-      T8 On-Chain analyst(阻塞:数据源选型)
 搁置:Hermes 侧集成(代码已在库,用户决定现有工作流够用,暂不配置)
+      T8 On-Chain analyst(观察后再决定:testnet 复盘发现链上信号盲区才启动)
 ```
 
 **T0 必须最先在主仓库完成**(worktree 从已提交的 commit 分出,未提交改动不会带过去)。
@@ -223,9 +223,12 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 
 ---
 
-## T8 — On-Chain Analyst 节点(被阻塞)
+## T8 — On-Chain Analyst 节点(观察后再决定,2026-07-19)
 
-**优先级**: 阻塞中 — **先要人工决策数据源**(spec §5.1):Glassnode(付费)/ CryptoQuant(付费)/ 链上 RPC(免费但开发量大)。
+**状态**: **非必须,暂不开发**。现有三 analyst(技术面/新闻/情绪)+ 完整链路已闭环,On-Chain
+是分析质量增强项而非结构依赖。决策方式:testnet 阶段用三 analyst 配置攒决策样本,复盘时若
+发现"链上早有信号但系统看不到"的亏损类别(如巨鲸砸盘打止损),再启动本任务——届时数据源
+选型(Glassnode/CryptoQuant 付费 vs 链上 RPC 自建)也有了实际依据;若决策质量够用则永久搁置。
 **决策后的工作**:
 - 新建 `dataflows/crypto_onchain.py`(交易所净流入、巨鲸地址)。
 - 新建 `agents/analysts/onchain_analyst.py`,注册 `AnalystType.ONCHAIN`(`cli/utils.py::filter_analysts_for_asset_type`)。

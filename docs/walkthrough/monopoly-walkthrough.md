@@ -1,7 +1,7 @@
 # Monopoly Trading Agent 代码走读
 
-> **基准**：当前工作树（含 `dev` 分支已提交内容 + 未提交改动）  
-> **生成日期**：2026-06-24  
+> **基准**：`dev` 分支（PLAN.md T0–T4 已合并：加固提交 / position monitor / algo 撤单 / Reddit 修复 / OpenClaw CLI）  
+> **生成日期**：2026-06-24 · **更新**：2026-07-19（T1–T4 落地后同步，新增 §10.5–§10.6，修订 §12）  
 > **读者画像**：熟悉 Python，但**未读过 LangGraph 文档**
 
 ---
@@ -143,7 +143,9 @@ LangChain 提供 `BaseChatModel`、`@tool` 装饰器、`with_structured_output` 
 
 Monopoly 是 [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) 的 fork，把目标从美股改成 **Binance 永续合约**。整体哲学（spec §1.2）：
 
-> **LLM 只分析、不下单。每笔订单必须经过：（a）硬编码风控门 + （b）Telegram 人工确认。**
+> **LLM 只分析、不下单。每笔订单必须经过：（a）硬编码风控门 + （b）Discord 人工确认（OpenClaw bot）。**
+
+人工确认落在 OpenClaw 层（PLAN.md T5，未完成）——**T5 落地前 executor 保持 dryrun/testnet，不切 mainnet**。
 
 代码里的体现是 §10 的 futures tail——一段确定性的 Python 代码守在 LLM 决策和 Binance API 之间。
 
@@ -163,7 +165,7 @@ Monopoly 是 [TauricResearch/TradingAgents](https://github.com/TauricResearch/Tr
 | L1 | PM prompt 教学（`portfolio_manager.py:159-208`） | LLM 自律 | LLM 自己 |
 | L2 | Schema `Field(description=...)`（`schemas.py:371-381`） | LLM 自律 | 提示工程 |
 | L3 | `risk_gate.evaluate`（`risk_gate.py:149-296`） | **硬编码** | 仅代码改 |
-| L4 | 监控告警（TODO Week 5） | 运维侧 | — |
+| L4 | 持仓对账已落地（`position_monitor.py`，§10.5）；告警脚本 TODO（PLAN T6） | 运维侧 | — |
 
 **关键设计选择**：L2 的 Field constraint **不是 Pydantic 的 `le=0.01` 这种硬约束**，只是 description 里的自然语言。原因：Pydantic 硬约束会让 `structured_output` 调用抛 `ValidationError`，触发 free-text fallback，反而失去结构化重试。决策放在 L3。
 
@@ -187,7 +189,7 @@ Monopoly 是 [TauricResearch/TradingAgents](https://github.com/TauricResearch/Tr
 3. **创建缓存/结果目录**（line 78-79）。
 4. **构造两个 LLM**（line 88-99）——`deep_thinking_llm`（用于 Research Manager、Portfolio Manager）和 `quick_thinking_llm`（用于 analysts、debators、Trader）。provider 由 `config["llm_provider"]` 决定，工厂在 `llm_clients/factory.py`。
 5. **`TradingMemoryLog`**（line 104）—— 跨 run 反思记忆。
-6. **工具节点**（line 107，`_create_tool_nodes` line 161-197）—— 每个 analyst 对应一组 LangChain `@tool`，被包成 LangGraph `ToolNode`。`social` analyst 只有 `get_news`（Twitter 已 deferred，Reddit 当前 403）。
+6. **工具节点**（line 107，`_create_tool_nodes` line 161-197）—— 每个 analyst 对应一组 LangChain `@tool`，被包成 LangGraph `ToolNode`。`social` analyst 只有 `get_news`（Twitter 已 deferred；Reddit 侧完整降级链：OAuth（需凭证，T3b）→ www/old `.json` → `search.rss` → `new.rss`+客户端过滤 → `data_gap`。2026-07 实况：DC IP 的匿名 `.json` 被 Reddit 封锁，RSS 未封——数据经 RSS 恢复，但 RSS 无 score/评论数，engagement 字段为 0）。
 7. **`ConditionalLogic`**（line 110-113）—— debate 循环的路由器。
 8. **`GraphSetup.setup_graph(selected_analysts)`**（line 135）—— 构图（§5 详解）。
 9. **`workflow.compile()`**（line 136）—— 编译。
@@ -397,7 +399,7 @@ if self.config is not None:
 | Analyst | 工具 |
 |---|---|
 | market | `get_market_data`、`get_funding_rate`、`get_open_interest`、`get_indicators` |
-| social | `get_news`（Twitter deferred、Reddit 403） |
+| social | `get_news`（Twitter deferred；Reddit 数据经 RSS fallback 恢复，engagement 为 0，见 §3.2） |
 | news | `get_news`、`get_global_news`、`get_insider_transactions` |
 | fundamentals | `get_fundamentals`、`get_balance_sheet`、`get_cashflow`、`get_income_statement` |
 
@@ -501,7 +503,7 @@ def create_portfolio_manager(llm):
    - `trader_investment_plan`：Trader 的 proposal
    - `past_context`：memory log 历史经验
 4. **`structured_decision = None`**（line 62）——默认值。crypto path 的 try 会赋值，stock path 保持 None。
-5. **crypto 分支**（line 63-94，**未提交版本**）：
+5. **crypto 分支**（line 63-94，T0 已提交）：
 
 ```python
 if asset_type == "crypto":
@@ -522,7 +524,7 @@ if asset_type == "crypto":
             structured_decision = None
 ```
 
-**未提交改动的意图**（`portfolio_manager.py` diff）：之前 try/except 把"provider 不支持"和"调用失败"混在一起，都会触发"failed" warning，对前者不准确。现在分开：
+**这处改动的意图**（T0 提交，`portfolio_manager.py`）：之前 try/except 把"provider 不支持"和"调用失败"混在一起，都会触发"failed" warning，对前者不准确。现在分开：
 
 - `structured_futures is None`（bind 时就失败）→ 直接走 free text，不打 warning（`bind_structured` 已经在构造时告警过）
 - `structured_futures.invoke` 抛异常 → 打 "failed" warning，再 fallback
@@ -654,11 +656,11 @@ def evaluate(
 284-294  通过：构造 ExecutionIntent (uuid4 + 当前时间)
 ```
 
-**未提交版本新加的"规则 2.5"**：原本 gate 只校验上界，零或负值会"通过所有上界检查"再到 executor 爆。例如 `leverage=0` 会让 `compute_sizing` 里 `margin = notional / leverage` 抛 `ZeroDivisionError`，负 `risk_pct` 会让 qty 是负数。Gate 是 floor，应该当场拒绝。
+**T0 新加的"规则 2.5"**：原本 gate 只校验上界，零或负值会"通过所有上界检查"再到 executor 爆。例如 `leverage=0` 会让 `compute_sizing` 里 `margin = notional / leverage` 抛 `ZeroDivisionError`，负 `risk_pct` 会让 qty 是负数。Gate 是 floor，应该当场拒绝。
 
 **规则 4 的限制**：止损方向**只在 `entry_price` 已设时校验**。市场单（`entry_price=None`）gate 不知道实际成交价，无法校验。**但 executor 里的 `compute_sizing` 现在补了这条**（§10.3.1）。
 
-**规则 5、6、7 依赖 `snapshot`**：snapshot 由 `derive_state` 从 JSONL 事件派生（§10.4.2）。当前只有 `position_opened` 和 `trade_skipped` 会被写入，`position_closed` 没人写——所以**冷静期和回撤熔断永远不触发，并发仓位计数单调增长直到顶 ceiling**。这是 spec §8 标记的 highest-priority remaining work。
+**规则 5、6、7 依赖 `snapshot`**：snapshot 由 `derive_state` 从 JSONL 事件派生（§10.4.2）。`position_closed` 事件现在由 position monitor 对账写入（§10.5，T1 已落地，2026-07-18 testnet 实弹验证），并发仓位计数不再单调增长。**两个已知限制**：① 对账写入的 `position_closed` 带 `pnl_usd=0.0`——日回撤熔断（规则 5）看不到这些亏损；② outcome 由启发式推断，默认 `"stop"`——会触发冷静期（规则 6），方向上偏保守而非漏防，可接受但要知情。
 
 #### 10.1.3 `create_risk_gate_node(config)` —— line 304-353
 
@@ -729,7 +731,7 @@ qty × |entry − stop|  =  equity × risk_pct
 
 简单：算 sizing → 校验 margin ≤ equity → 拍一条 JSON 进 `orders_log_path` → 返回 success=True。**不 mutate cross-run state**。
 
-但 `executor_node`（line 502-635）会在 dryrun 成功后**也写 `position_opened`**——所以 dryrun 跑多了 `open_positions` 计数也会顶满 ceiling。**dryrun 测试时要清空 `~/.tradingagents/risk_gate_state.jsonl`**，否则后续 run 全被 `REASON_MAX_POSITIONS` 拒绝。
+但 `executor_node`（line 502-635）会在 dryrun 成功后**也写 `position_opened`**——所以 dryrun 跑多了 `open_positions` 计数也会顶满 ceiling。**dryrun 测试时要清空 `~/.tradingagents/risk_gate_state.jsonl`**（或跑一遍 dryrun 模式的 position monitor：`DryrunExchange` 返回空持仓，reconcile 会把 JSONL 里所有 open 仓位补写 `position_closed`，见 §10.5），否则后续 run 全被 `REASON_MAX_POSITIONS` 拒绝。
 
 #### 10.3.3 TestnetExecutor —— line 252-490（**重写**）
 
@@ -860,7 +862,7 @@ else:
     append_event(state_path, {"type": "trade_skipped", ...})
 ```
 
-**关键认识**：naked 时**必须写 `position_opened`**——否则 gate 永远以为这仓位不存在，会继续接受新仓，把账户拉爆。同时 `position_naked` 是给运维的告警事件，可以被外部脚本扫到后发 Telegram。
+**关键认识**：naked 时**必须写 `position_opened`**——否则 gate 永远以为这仓位不存在，会继续接受新仓，把账户拉爆。同时 `position_naked` 是给运维的告警事件，可以被外部脚本扫到后推 Discord（T6 告警落地后接通）。
 
 #### 10.3.5 `_extract_order_id` —— line 642-665
 
@@ -875,6 +877,8 @@ def _extract_order_id(response, label) -> str:
 ```
 
 接受 `orderId`（普通单）或 `algoId`（条件单/算法单）。**失败显式抛**——commit `204b6ad` 的 fail-loud 哲学。在此之前可能静默吞掉 → 仓位裸奔。
+
+**algo 单的程序化撤销已解决**（T2）：当前安装的 python-binance 原生暴露 `futures_get_open_algo_orders` / `futures_cancel_algo_order`（需 symbol + algoId）/ `futures_cancel_all_algo_open_orders`，封装在 position monitor 的 `TestnetExchange` adapter 里（§10.5），2026-07-18 testnet 实测一发清掉 4 张 algo 单。**注意**：executor 的 naked-position unwind 路径目前**没有**接 algo 撤单——只有对账路径会清孤儿 algo 单。
 
 ### 10.4 JSONL 事件日志
 
@@ -934,7 +938,28 @@ def derive_state(events, *, now) -> RiskGateSnapshot:
 - **`trade_skipped` 被忽略**——它只为审计存在。
 - **`position_naked` 也被忽略**——它和 `position_opened` 同时被写（§10.3.4），open_count 已经 +1，naked 事件本身只用于外部告警。
 
-**关键认识（重申）**：当下系统只产生 `position_opened`、`trade_skipped`、`position_naked`，**没有任何代码写 `position_closed`**。所以所有 cross-run 规则永远只看到单调增长的 open_positions、永远 0 的 daily_pnl、永远 None 的 last_stop_close_ts。spec §8 的"position monitor"是必须做的下一步。
+**关键认识（2026-07 更新）**：`position_closed` 现在由 position monitor 对账写入（§10.5，T1 已落地）。open_positions 计数在对账后正常回落，`last_stop_close_ts` 会被填上（outcome 启发式默认 `"stop"` → 冷静期生效）。**残留缺口**：对账事件的 `pnl_usd=0.0`，所以 daily_pnl 仍看不到交易所侧止损/止盈带来的真实盈亏——回撤熔断（规则 5）对这类平仓依旧失明。这是验证阶段知情接受的限制，精确 PnL 需查订单历史（未做）。
+
+### 10.5 Position Monitor（T1+T2 新增，2026-07-14 合并）
+
+文件：`tradingagents/futures/position_monitor.py`。补上 §10.4.2 曾标记的最高优先级缺口：stop/TP 在 Binance 触发后，交易所侧仓位已平，但本地 JSONL 没人写 `position_closed` → gate 按 `max_concurrent_positions` 误拒新仓 + 孤儿保护单累积（下次下单 `-4130` 错误）。
+
+**设计**：
+- **独立于 LangGraph**——可被 launchd 周期调用，也可作为每次 run 前的 pre-step。
+- 核心函数 `reconcile_positions(jsonl_path, exchange)`：从 JSONL 回放出 open 仓位集合（`position_opened` 减 `position_closed`）→ `futures_position_information` 拉交易所实况 → 对「本地 open、交易所已平」的仓位补写 `position_closed` 事件，并撤掉该 symbol 的孤儿单：Basic 单走 `futures_cancel_all_open_orders`，algo 单走 `futures_cancel_all_algo_open_orders`（先 `futures_get_open_algo_orders` 拿准确数量）。
+- **`ExchangeAdapter` protocol 双实现**：`TestnetExchange`（真实 python-binance client）/ `DryrunExchange`（返回空持仓，单测不联网）。工厂 `create_monitor(config)` 按 `MONITOR_MODE` env > `config["futures_monitor_mode"]` 选择，默认 dryrun。
+- **平仓来源推断** `_infer_close_outcome`：启发式——交易所已无仓位时默认 `"stop"`（保守：触发 gate 冷静期）；精确区分 stop / tp 需查订单历史，未做。
+
+**2026-07-18 testnet 实弹验证**：开仓（带 stop/TP）→ reduceOnly 平仓模拟交易所侧关闭 → reconcile 正确写入 `position_closed`、孤儿单清零、账户状态干净。已知限制（`pnl_usd=0.0`、outcome 启发式）见 §10.1.2 / §10.4.2 注记。
+
+### 10.6 OpenClaw 侧接口（T4 新增，2026-07-14 合并）
+
+Week 5 方案 A 的 Monopoly 侧已完成，OpenClaw 侧安装是手工步骤：
+
+- `python -m cli.main analyze_json`：**强制 dryrun** 跑完整分析，JSON 决策打到 stdout（日志全走 stderr），序列化在 `cli/json_output.py`。
+- `python -m cli.main trade_review --symbol --hours`：纯读 memory log + risk JSONL 的历史汇总（`tradingagents/futures/trade_review.py`：近期决策 / 持仓 / gate 拒绝原因统计），**无 LLM 调用**。
+- `openclaw/skills/trade_analyze`、`openclaw/skills/trade_review` 两份 SKILL.md，待拷到 Mac mini 的 OpenClaw skill 目录并配置 **Discord bot**（交互渠道已定为 Discord，非 Telegram）。
+- `trade_execute` + 人工审批闭环是 **T5，未做**——mainnet 的硬前置。
 
 ---
 
@@ -952,14 +977,14 @@ def derive_state(events, *, now) -> RiskGateSnapshot:
 
 | # | 原描述 | 当前状态 | 证据 |
 |---|---|---|---|
-| 1 | `position_closed` 没人写，3 条 cross-run 规则失效 | **未修** | `executor.py` 仍只产 opened/skipped/naked |
+| 1 | `position_closed` 没人写，3 条 cross-run 规则失效 | **已修**（T1，7-18 实弹验证） | `position_monitor.py` 对账写入；残留：`pnl_usd=0.0` → 回撤熔断仍看不到交易所侧平仓的真实亏损（§10.5） |
 | 2 | 开仓成功后保护单失败 → 仓位裸奔，无 rollback | **已修** | `executor.py:315-385` two-phase + `_try_unwind` + `position_naked` 事件 |
-| 3 | gate 频繁拒绝无告警（L4 缺位） | **未修** | 仍需 JSONL 日扫脚本 + Telegram |
+| 3 | gate 频繁拒绝无告警（L4 缺位） | **未修**（PLAN T6） | 仍需 JSONL 日扫脚本 + Discord 推送 |
 | 4 | mark_price 用 mainnet，executor 用 testnet | **未修** | `market_data.py:25` 仍是 `fapi.binance.com` |
 | 5 | `final_decision_structured` 在 LangGraph state 透传，checkpointer 序列化未验证 | **未验证** | 建议跑一遍 `checkpoint_enabled=True` 的 crypto path |
 | 6 | `_round_qty` 硬编码 step=0.001 | **未修但更稳健** | 改成 floor 而非 round（`executor.py:482-498`），BTC/ETH 可接受；扩 symbol 前必须改 |
 
-**未提交版本新加的两项防御**（来自上一版未列出的潜在风险）：
+**T0 提交的新增防御**（上一版未列出的潜在风险）：
 
 | 改动 | 文件 | 风险 |
 |---|---|---|
@@ -995,12 +1020,12 @@ def derive_state(events, *, now) -> RiskGateSnapshot:
 3. **§8.2** Portfolio Manager（LLM 最容易出错的节点）
 4. **§3.3** propagate（entry / asset_type 分流）
 5. **§5.5** Futures tail 拓扑（确认条件边没旁路）
-6. **§10.4** JSONL 事件（确认 `position_closed` 未写这件事的影响范围）
+6. **§10.4–10.5** JSONL 事件 + position monitor 对账（重点看 `pnl_usd=0.0` 的残留影响）
 7. 其余按需
 
 ## 附录 B：上线前必跑的 testnet 演练
 
-1. **正常路径**：crypto run 让 LLM 输出 Long → 看到 Binance testnet 真实开仓 + 止损 + 止盈三单挂出
+1. ~~**正常路径**：crypto run 让 LLM 输出 Long → 看到 Binance testnet 真实开仓 + 止损 + 止盈三单挂出~~ ✅ 已覆盖（06-02 完整 graph 实弹 + 07-18 开仓/平仓/对账验证）
 2. **gate 拒绝路径**：手动改 prompt 让 LLM 输出 `position_size_pct=0.5`，看到 gate 拒绝 + JSONL 写 `trade_skipped`
 3. **方向反路径**：手动改 prompt 让 LLM 输出 Long 但 stop > entry，看到 executor 在 `compute_sizing` 拒绝（而不是在 Binance API 上失败）
 4. **naked 模拟路径**：用 mock 让 stop 单的 `_extract_order_id` 抛 RuntimeError，验证 `_try_unwind` 真的发了反向 MARKET 单

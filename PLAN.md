@@ -120,6 +120,14 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 > www 和 old 两端点均 403(合规 UA 也一样)→ **代理出口 IP 被 Reddit 封禁,代码层无解**。
 > 数据恢复的两条路:换代理出口节点重测,或注册 Reddit script app 走 OAuth API(免费 tier,
 > oauth.reddit.com 对 DC IP 通常放行)——后者可开小任务 T3b。
+> **T3b OAuth 已实现(2026-07-19)**:`crypto_reddit.py` 支持 app-only client_credentials
+> 授权——设置 `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` 后优先走 `oauth.reddit.com`,
+> token 缓存 + 401 自动失效重取,无凭证或 token 失败时回落公开端点(www → old → data_gap),
+> 行为不变。测试 +5(共 16),模板见 `.env.example`。
+> **⚠️ 2026-07-19 实测受阻**:Reddit 已启用 Responsible Builder Policy,自助创建 app 被关闭,
+> 需先走工单审批(个人项目被拒率高)。**当前推荐路径改为:换代理出口节点**(公开端点对住宅
+> IP 正常放行,零代码改动);OAuth 代码保留,审批若批下来即可用。审批入口见
+> <https://support.reddithelp.com/hc/en-us/articles/14945211791892>。
 
 **优先级**: P2(独立,随时可并行)
 **触碰文件**: `tradingagents/dataflows/crypto_reddit.py` + 对应测试
@@ -242,8 +250,13 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 
 1. ~~Position monitor testnet 实测~~ ✅ 2026-07-18:开仓→平仓→对账→`position_closed` 写入、孤儿单清零、账户干净。
 2. ~~Algo 撤单 endpoint 实测~~ ✅ 2026-07-18:修正 endpoint 后一发清掉 4 张 algo 单(详见 T2 任务卡注记)。
-3. ~~Reddit 真实代理实测~~ ✅ 2026-07-18:降级路径正常;**代理出口 IP 被 Reddit 封禁**,数据恢复见 T3 注记
-   (换出口节点 / T3b OAuth)。
+3. ~~Reddit 真实代理实测~~ ✅ 2026-07-18:降级路径正常;**代理出口 IP 被 Reddit 封禁**。
+   T3b OAuth 代码已于 2026-07-19 实现,但 Reddit 新政策关闭了自助注册(需工单审批,见 T3 注记)。
+   **2026-07-19 定位修正**:不是 IP 全封——封的是「DC IP + 匿名 .json 端点」组合(HTML 200 /
+   .json 403,浏览器正常即此因);现有 3 节点 .json 全被封(US×2 = 403/tarpit,Tokyo = TLS 黑洞)。
+   **✅ RSS fallback 已实现并实弹验证**:`search.rss` → `new.rss`+客户端过滤,RSS 未被封,
+   r/Bitcoin 实测拿回 10 条真实帖子(`ok=True`)。限制:RSS 无 score/评论数(engagement 全 0)。
+   OAuth 审批仍建议提交(长期解);新增住宅节点可选(能恢复 .json 的 engagement 数据)。
 4. **OpenClaw 侧安装**(T4,需用户在 Mac mini 上操作):拷 `openclaw/skills/trade_analyze`、`trade_review`
    到 OpenClaw skill 目录,配置 **Discord bot**(交互渠道已定为 Discord,非 Telegram),
    手机 Discord 跑 `/trade_analyze` 和 `/trade_review`。

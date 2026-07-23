@@ -9,21 +9,32 @@ Two-layer pattern: ``_get_reddit`` returns ``Response[SocialPost]``
 for cache + tests, ``get_reddit`` returns prompt plaintext.
 
 HTTP retry strategy:
-- Primary: https://www.reddit.com (modern endpoint)
-- Fallback 1: https://old.reddit.com (legacy endpoint)
-- Fallback 2: Empty result with data_gap note (graceful degradation)
+- Primary: https://oauth.reddit.com (official OAuth API, only when
+  ``REDDIT_CLIENT_ID`` / ``REDDIT_CLIENT_SECRET`` are set — app-only
+  client_credentials grant, free tier; datacenter/proxy IPs that are
+  blocked on the public JSON endpoints are normally allowed here)
+- Fallback 1: https://www.reddit.com (public JSON endpoint)
+- Fallback 2: https://old.reddit.com (legacy endpoint)
+- Fallback 3: RSS/Atom feeds (``search.rss``, then ``new.rss`` with
+  client-side keyword filtering). Reddit's 2025 API lockdown blocks the
+  anonymous ``.json`` endpoints from datacenter IPs but still serves the
+  public syndication feeds. RSS entries carry no score/comment counts,
+  so engagement fields are zero for these posts.
+- Fallback 4: Empty result with data_gap note (graceful degradation)
 
 User-Agent follows Reddit's requirement: ``platform:app-id:version (by /u/username)``
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
 import os
 import time
 from datetime import datetime, timezone
+import xml.etree.ElementTree as ET
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -58,6 +69,105 @@ def _symbol_query(symbol: str) -> str:
     return _SYMBOL_QUERIES.get(symbol.upper(), symbol)
 
 
+# ---------------------------------------------------------------------------
+# OAuth (app-only client_credentials grant)
+# ---------------------------------------------------------------------------
+
+_OAUTH_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
+_token_cache: dict = {"token": None, "expires_at": 0.0}
+
+
+def _oauth_creds() -> tuple[str, str] | None:
+    cid = os.environ.get("REDDIT_CLIENT_ID")
+    secret = os.environ.get("REDDIT_CLIENT_SECRET")
+    if cid and secret:
+        return cid, secret
+    return None
+
+
+def _invalidate_oauth_token() -> None:
+    _token_cache["token"] = None
+    _token_cache["expires_at"] = 0.0
+
+
+def _get_oauth_token(timeout: float = 10.0) -> str | None:
+    """Fetch (and cache) an app-only OAuth bearer token.
+
+    Returns ``None`` when credentials are absent or the token request
+    fails — callers then skip the OAuth endpoint and fall back to the
+    public JSON endpoints.
+    """
+    if _oauth_creds() is None:
+        return None
+    if _token_cache["token"] and time.time() < _token_cache["expires_at"]:
+        return _token_cache["token"]
+
+    cid, secret = _oauth_creds()
+    basic = base64.b64encode(f"{cid}:{secret}".encode()).decode()
+    req = Request(
+        _OAUTH_TOKEN_URL,
+        data=urlencode({"grant_type": "client_credentials"}).encode(),
+        headers={"User-Agent": _UA, "Authorization": f"Basic {basic}"},
+    )
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read())
+        token = payload.get("access_token")
+        if not token:
+            logger.warning("reddit oauth: token response missing access_token")
+            return None
+        # 60s safety margin so a token never expires mid-request
+        _token_cache["token"] = token
+        _token_cache["expires_at"] = time.time() + float(payload.get("expires_in", 3600)) - 60
+        return token
+    except (HTTPError, URLError, json.JSONDecodeError, TimeoutError) as exc:
+        logger.warning(
+            "reddit oauth token fetch failed (%s); falling back to public endpoints",
+            type(exc).__name__,
+        )
+        return None
+
+
+_ATOM = "{http://www.w3.org/2005/Atom}"
+
+
+def _iso8601_to_epoch(value: str) -> float:
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _parse_rss(xml_bytes: bytes) -> list[dict]:
+    """Parse a Reddit Atom feed into post dicts shaped like the JSON API's."""
+    root = ET.fromstring(xml_bytes)
+    posts = []
+    for entry in root.iter(f"{_ATOM}entry"):
+        author_el = entry.find(f"{_ATOM}author")
+        author = (author_el.findtext(f"{_ATOM}name") or "" if author_el is not None else "")
+        link_el = entry.find(f"{_ATOM}link")
+        url = link_el.get("href", "") if link_el is not None else ""
+        published = entry.findtext(f"{_ATOM}published") or entry.findtext(f"{_ATOM}updated") or ""
+        posts.append({
+            "id": entry.findtext(f"{_ATOM}id") or url,
+            "title": (entry.findtext(f"{_ATOM}title") or "").strip(),
+            "selftext": "",
+            "score": 0,
+            "num_comments": 0,
+            "author": author.removeprefix("/u/"),
+            "created_utc": _iso8601_to_epoch(published),
+            "permalink": "",
+            "url": url,
+        })
+    return posts
+
+
+def _matches_query(title: str, query: str) -> bool:
+    terms = [t.strip().lower() for t in query.split(" OR ") if t.strip()]
+    lowered = title.lower()
+    return any(t in lowered for t in terms)
+
+
 def _fetch_subreddit_with_retry(
     query: str, sub: str, limit: int, timeout: float, max_retries: int = 2
 ) -> tuple[list[dict], bool]:
@@ -70,34 +180,58 @@ def _fetch_subreddit_with_retry(
         "q": query, "restrict_sr": "on", "sort": "new", "t": "week", "limit": limit,
     })
 
-    # Try endpoints in order: primary (reddit.com), fallback (old.reddit.com)
-    endpoints = [
-        f"https://www.reddit.com/r/{sub}/search.json?{qs}",
-        f"https://old.reddit.com/r/{sub}/search.json?{qs}",
+    # Try endpoints in order: OAuth API (when credentials are set), public
+    # reddit.com JSON, old.reddit.com JSON, then the RSS feeds — Reddit's
+    # API lockdown 403s anonymous .json from datacenter IPs but leaves the
+    # syndication feeds up. search.rss keeps the server-side query; new.rss
+    # is filtered client-side against the query terms.
+    endpoints: list[tuple[str, bool, str]] = []
+    if _oauth_creds() is not None:
+        endpoints.append((f"https://oauth.reddit.com/r/{sub}/search.json?{qs}", True, "json"))
+    endpoints += [
+        (f"https://www.reddit.com/r/{sub}/search.json?{qs}", False, "json"),
+        (f"https://old.reddit.com/r/{sub}/search.json?{qs}", False, "json"),
+        (f"https://www.reddit.com/r/{sub}/search.rss?{qs}", False, "rss"),
+        (f"https://www.reddit.com/r/{sub}/new.rss?limit={limit}", False, "rss-filter"),
     ]
 
-    for endpoint_idx, endpoint_url in enumerate(endpoints):
+    for endpoint_idx, (endpoint_url, use_oauth, kind) in enumerate(endpoints):
         for attempt in range(max_retries + 1):
             try:
-                req = Request(
-                    endpoint_url,
-                    headers={
-                        "User-Agent": _UA,
-                        "Accept": "application/json",
-                    }
-                )
+                headers = {
+                    "User-Agent": _UA,
+                    "Accept": "application/json" if kind == "json" else "application/atom+xml",
+                }
+                if use_oauth:
+                    token = _get_oauth_token(timeout)
+                    if token is None:
+                        break  # token unavailable — skip to public endpoints
+                    headers["Authorization"] = f"bearer {token}"
+                req = Request(endpoint_url, headers=headers)
                 with urlopen(req, timeout=timeout) as resp:
-                    payload = json.loads(resp.read())
+                    body = resp.read()
 
-                children = (payload.get("data") or {}).get("children") or []
-                posts = [c.get("data", {}) for c in children if isinstance(c, dict)]
+                if kind == "json":
+                    payload = json.loads(body)
+                    children = (payload.get("data") or {}).get("children") or []
+                    posts = [c.get("data", {}) for c in children if isinstance(c, dict)]
+                else:
+                    posts = _parse_rss(body)
+                    if kind == "rss-filter":
+                        posts = [p for p in posts if _matches_query(p["title"], query)]
+                    # A successful feed fetch is authoritative even when the
+                    # filter leaves nothing — don't fall through to data_gap.
+                    return posts, True
 
                 if posts or endpoint_idx == 0:  # success on any endpoint, or primary returned empty
                     return posts, True
 
             except HTTPError as e:
-                # 403 Forbidden, 429 Too Many Requests: exponential backoff + retry
-                if e.code in (403, 429):
+                if e.code == 401 and use_oauth:
+                    # Token expired or revoked — refetch on the next attempt.
+                    _invalidate_oauth_token()
+                # 401/403/429: exponential backoff + retry
+                if e.code in (401, 403, 429):
                     wait_time = min(2 ** attempt, 8)  # cap at 8 seconds
                     if attempt < max_retries:
                         logger.debug(
@@ -117,7 +251,7 @@ def _fetch_subreddit_with_retry(
                     logger.debug("reddit HTTP %d (r/%s): %s", e.code, sub, e.reason)
                     break  # try next endpoint
 
-            except (URLError, json.JSONDecodeError, TimeoutError) as exc:
+            except (URLError, json.JSONDecodeError, ET.ParseError, TimeoutError) as exc:
                 logger.debug("reddit fetch error (r/%s · %s, attempt %d/%d): %s",
                             sub, query, attempt + 1, max_retries + 1, type(exc).__name__)
                 if attempt < max_retries:

@@ -1,7 +1,7 @@
 # Monopoly Trading Agent 代码走读
 
-> **基准**：`dev` 分支（PLAN.md T0–T4 已合并：加固提交 / position monitor / algo 撤单 / Reddit 修复 / OpenClaw CLI）  
-> **生成日期**：2026-06-24 · **更新**：2026-07-19（T1–T4 落地后同步，新增 §10.5–§10.6，修订 §12）  
+> **基准**：`dev` 分支（PLAN.md T0–T7 已合并 + crypto-only 重构：stock 路径已整体移除）  
+> **生成日期**：2026-06-24 · **更新**：2026-07-19（T1–T4 同步）· **2026-07-23**（crypto-only 重构：`asset_type` 分流、Fundamentals analyst、stock schemas 全删；反思层改 Binance K线）  
 > **读者画像**：熟悉 Python，但**未读过 LangGraph 文档**
 
 ---
@@ -153,8 +153,8 @@ Monopoly 是 [TauricResearch/TradingAgents](https://github.com/TauricResearch/Tr
 
 整体 LangGraph 图分两段：
 
-- **共用主链**（stock + crypto 都跑）：4 个 analyst → Bull/Bear 辩论 → Research Manager → Trader → 三方风险辩论 → Portfolio Manager。
-- **Futures tail**（仅 crypto）：Risk Gate → Mark Price → Executor。stock 模式从 PM 直接到 END。
+- **主链**（crypto-only，2026-07-23 起唯一模式）：3 个 analyst（market / social / news）→ Bull/Bear 辩论 → Research Manager → Trader → 三方风险辩论 → Portfolio Manager。
+- **Futures tail**：Risk Gate → Mark Price → Executor。PM 无条件接入（不再有 asset_type 分流；`config=None` 的测试图除外）。
 
 ![整体决策流程](diagrams/full-graph.svg)
 
@@ -177,8 +177,8 @@ Monopoly 是 [TauricResearch/TradingAgents](https://github.com/TauricResearch/Tr
 
 两个入口：
 
-- `main.py:1-16` —— 程序化入口。**默认 `asset_type="stock"`，不会走 futures tail**。
-- `cli/main.py` —— CLI 入口，根据 ticker 自动选 `asset_type`。
+- `main.py` —— 程序化入口，示例 ticker `BTC-USD`。
+- `cli/main.py` —— CLI 入口。ticker 用 `to_binance_symbol` 校验，只接受 crypto perp 形式（`BTC-USD` / `BTCUSDT`），非 crypto 输入直接拒绝。
 
 ### 3.2 `TradingAgentsGraph.__init__` —— `tradingagents/graph/trading_graph.py:55-137`
 
@@ -197,14 +197,14 @@ Monopoly 是 [TauricResearch/TradingAgents](https://github.com/TauricResearch/Tr
 ### 3.3 `propagate` —— `trading_graph.py:300-339`
 
 ```python
-def propagate(self, company_name, trade_date, asset_type="stock"):
+def propagate(self, company_name, trade_date):
 ```
 
-签名注意：**`asset_type` 默认 "stock"**。必须显式传 `"crypto"` 才会触发 futures tail。
+（2026-07-23 起 `asset_type` 参数已删除——所有 run 都是 crypto，futures tail 恒触发。）
 
 执行序：
 
-1. **`_resolve_pending_entries`**（line 313）—— 把上一次同 ticker 的 pending decision（还没"知道结果"的）拉出来，用 yfinance 查持仓后 N 天的 raw/alpha return，扔给 reflector 生成反思，回写 memory log。crypto 路径目前会走这条但 yfinance 不一定能给 crypto 数据，行为待 Week 6 改造。
+1. **`_resolve_pending_entries`**（line 313）—— 把上一次同 ticker 的 pending decision（还没"知道结果"的）拉出来，用 **Binance 日线**（`crypto_binance.get_ohlcv_bars`，经 `to_binance_symbol` 转换）查持仓后 N 天的 raw/alpha return，扔给 reflector 生成反思，回写 memory log。alpha 基准是 `config["benchmark_ticker"]`（默认 `BTC-USD`，spec §2.1）；crypto 全年连续交易，holding days 与自然日 1:1。
 2. **checkpointer 可选启用**（line 316-321）—— 如果 `config["checkpoint_enabled"]`，用 `SqliteSaver` 持久化中间态。
 3. **`_run_graph`**（line 334）—— 真正跑图。
 4. **`finally`**（line 335-339）—— 退出 checkpointer 上下文，**重新编译一份无 checkpointer 的 graph**，避免下次调用复用脏状态。
@@ -213,7 +213,7 @@ def propagate(self, company_name, trade_date, asset_type="stock"):
 
 ```python
 init_agent_state = self.propagator.create_initial_state(
-    company_name, trade_date, asset_type=asset_type, past_context=past_context
+    company_name, trade_date, past_context=past_context
 )
 ```
 
@@ -227,7 +227,7 @@ init_agent_state = self.propagator.create_initial_state(
 后续：
 - `debug=True` 用 `graph.stream`（line 357），每节点一个 chunk，便于看中间态。
 - 非 debug 用 `graph.invoke`（line 369），一把跑到底。
-- `_log_state`（line 392-432）—— 把 final_state 落 `results_dir/{ticker}/TradingAgentsStrategy_logs/full_states_log_{date}.json`，**但只 dump stock 字段**，没有 dump `execution_result` / `execution_intent` / `risk_gate_rejection_reason`。**crypto run 的执行明细只在 JSONL event log 里**，复盘时要同时查 JSON（决策）+ JSONL（执行）。
+- `_log_state`（line 392-432）—— 把 final_state 落 `results_dir/{ticker}/TradingAgentsStrategy_logs/full_states_log_{date}.json`，**但只 dump 决策链字段**，没有 dump `execution_result` / `execution_intent` / `risk_gate_rejection_reason`。**执行明细只在 JSONL event log 里**，复盘时要同时查 JSON（决策）+ JSONL（执行）。
 
 ### 3.5 checkpointer 的 thread_id 规则
 
@@ -250,8 +250,7 @@ args["config"]["configurable"]["thread_id"] = tid
 
 ```python
 class AgentState(MessagesState):
-    company_of_interest: Annotated[str, "..."]
-    asset_type: Annotated[str, "..."]
+    company_of_interest: Annotated[str, "..."]  # perp-futures pair, e.g. BTC-USD
     # ...
 ```
 
@@ -261,23 +260,22 @@ class AgentState(MessagesState):
 
 ### 4.2 字段清单
 
-**Stock 主链**（line 47-74）：
+**决策主链**（line 46-74）：
 
 | 字段 | 写入者 | 用途 |
 |---|---|---|
-| `company_of_interest` | initial | ticker |
-| `asset_type` | initial | "stock" 或 "crypto" |
+| `company_of_interest` | initial | ticker（perp pair，如 BTC-USD） |
 | `trade_date` | initial | 决策日 |
 | `sender` | Trader/analysts | "谁说了上一句" |
-| `market_report` / `sentiment_report` / `news_report` / `fundamentals_report` | 4 个 analyst | 各自分析报告 |
+| `market_report` / `sentiment_report` / `news_report` | 3 个 analyst | 各自分析报告 |
 | `investment_debate_state` | Bull/Bear/Research Manager | 嵌套字典：bull_history / bear_history / count 等 |
 | `investment_plan` | Research Manager | 5-tier rating + thesis |
-| `trader_investment_plan` | Trader | TraderProposal 或 FuturesProposal 渲染后的 markdown |
+| `trader_investment_plan` | Trader | FuturesProposal 渲染后的 markdown |
 | `risk_debate_state` | 3 个 debator + PM | 嵌套字典 |
 | `final_trade_decision` | PM | markdown 决策 |
 | `past_context` | initial | memory log 注入 |
 
-**Futures 扩展**（line 81-92，仅 crypto path 写）：
+**Futures 扩展**（line 76-92）：
 
 | 字段 | 写入者 | 类型 |
 |---|---|---|
@@ -306,7 +304,7 @@ class AgentState(MessagesState):
 1. **Analyst plan**（line 55-58 + `build_analyst_execution_plan`）：根据 `selected_analysts` 列表，给每个 analyst 生成 `(agent_node, tool_node, clear_node)` 三件套。
 2. **节点注册**（line 82-96）：所有 analyst、Bull/Bear、Research Manager、Trader、3 个 risk debator、Portfolio Manager。
 3. **边连接**（line 99-164）：见下面 4 个子拓扑图。
-4. **Futures tail 条件连接**（line 166-186）：根据 `self.config` 是否 None 决定是否注册 Risk Gate / Mark Price / Executor 节点。**`config=None` 时，stock 模式 PM 直接到 END**（用于 stock-only 测试图）。
+4. **Futures tail 连接**（line 166-186）：根据 `self.config` 是否 None 决定是否注册 Risk Gate / Mark Price / Executor 节点。`config` 有值时 PM 无条件接 Risk Gate；**`config=None` 时 PM 直接到 END**（用于只跑分析、不带 futures tail 的测试图）。
 
 ### 5.2 Analyst 自循环
 
@@ -369,14 +367,15 @@ if self.config is not None:
     workflow.add_node("Mark Price", create_mark_price_node())
     workflow.add_node("Executor", create_executor_node(self.config))
 
-    def _branch_after_pm(state):
-        return "Risk Gate" if state.get("asset_type") == "crypto" else END
-
-    workflow.add_conditional_edges("Portfolio Manager", _branch_after_pm, ...)
+    workflow.add_edge("Portfolio Manager", "Risk Gate")   # 无条件
     workflow.add_edge("Risk Gate", "Mark Price")
     workflow.add_edge("Mark Price", "Executor")
     workflow.add_edge("Executor", END)
+else:
+    workflow.add_edge("Portfolio Manager", END)            # 分析-only 测试图
 ```
+
+（2026-07-23 前这里是 `_branch_after_pm` 按 `asset_type` 条件分流；crypto-only 化后 PM → Risk Gate 变成无条件边。）
 
 ![Futures Tail](diagrams/futures-tail.svg)
 
@@ -384,7 +383,7 @@ if self.config is not None:
 
 ## 6. Analyst 层
 
-四个 analyst（market / social / news / fundamentals）行为同构：
+三个 analyst（market / social / news）行为同构：
 
 1. 节点函数 = LangChain chain（prompt + `quick_thinking_llm.bind_tools(tools)`）
 2. 输出 `AIMessage`，可能带 `tool_calls`
@@ -392,7 +391,7 @@ if self.config is not None:
 4. 无 tool_calls → 写自己的 `*_report` 字段 → 转到 `Msg Clear *` 节点
 5. `Msg Clear *`（`create_msg_delete()`）清空消息历史 → 转到下一个 analyst
 
-**为什么清消息**：四个 analyst 串行执行，共享 `messages` 列表。不清空，下一个 analyst 会看到上一个的 tool call 记录，污染 prompt。
+**为什么清消息**：三个 analyst 串行执行，共享 `messages` 列表。不清空，下一个 analyst 会看到上一个的 tool call 记录，污染 prompt。
 
 **工具清单**（`trading_graph.py:161-197`）：
 
@@ -400,10 +399,9 @@ if self.config is not None:
 |---|---|
 | market | `get_market_data`、`get_funding_rate`、`get_open_interest`、`get_indicators` |
 | social | `get_news`（Twitter deferred；Reddit 数据经 RSS fallback 恢复，engagement 为 0，见 §3.2） |
-| news | `get_news`、`get_global_news`、`get_insider_transactions` |
-| fundamentals | `get_fundamentals`、`get_balance_sheet`、`get_cashflow`、`get_income_statement` |
+| news | `get_news`、`get_global_news` |
 
-`get_market_data` / `get_funding_rate` / `get_open_interest` 是 crypto-specific，stock 模式 fallback 到 yfinance 兼容包装。
+所有工具都是 crypto-native（Binance / RSS 数据源）。2026-07-23 crypto-only 化后，Fundamentals analyst 及其 `get_fundamentals` / `get_balance_sheet` / `get_cashflow` / `get_income_statement` / `get_insider_transactions` 工具已整体删除——这些工具的 vendor 实现在 fork 时就没搬过来，真调用会直接报错，crypto 模式本就把该 analyst 过滤掉了。crypto 的"基本面"（资金费率、持仓量、清算）由 Market Analyst 覆盖。
 
 ---
 
@@ -436,12 +434,9 @@ investment_plan = invoke_structured_or_freetext(
 - `investment_plan`（markdown）
 - `investment_debate_state["judge_decision"]`
 
-### 7.3 Trader —— `agents/trader/trader.py:1-150`
+### 7.3 Trader —— `agents/trader/trader.py`
 
-根据 `asset_type` 分流：
-
-- **stock**：bind `TraderProposal`（Buy/Hold/Sell + entry/stop/sizing 文本）
-- **crypto**：bind `FuturesProposal`（`schemas.py:259-317`）
+只 bind `FuturesProposal`（`schemas.py`）——2026-07-23 crypto-only 化后 stock 分支（`TraderProposal`）已删除。
 
 `FuturesProposal` 字段：`side`（Long/Short/Flat）、`reasoning`、`entry_price?`、`stop_loss?`、`take_profit?`、`leverage?`、`position_size_pct?`。
 
@@ -481,59 +476,55 @@ investment_plan = invoke_structured_or_freetext(
 
 **关注点**：三个 debator 共用 quick_thinking_llm，**每轮调一次**，所以 `max_risk_discuss_rounds=1` 时总共 3 次 LLM 调用。
 
-### 8.2 Portfolio Manager —— `agents/managers/portfolio_manager.py:42-123`
+### 8.2 Portfolio Manager —— `agents/managers/portfolio_manager.py`
 
-**这是 stock/crypto 分叉点**。
+**LLM 最容易出错、离钱最近的节点**。2026-07-23 crypto-only 化后只保留 Futures 路径（stock 的 `PortfolioDecision` 分支已删）。
 
 ```python
 def create_portfolio_manager(llm):
-    structured_stock = bind_structured(llm, PortfolioDecision, "Portfolio Manager")
     structured_futures = bind_structured(llm, FuturesDecision, "Portfolio Manager")
 ```
 
-工厂在 closure 外层 bind 两份 structured LLM。返回 `portfolio_manager_node(state)`。
+工厂在 closure 外层 bind 一份 structured LLM。返回 `portfolio_manager_node(state)`。
 
-节点函数体（line 46-121）：
+节点函数体：
 
-1. **读 asset_type 分流**（line 47）。默认 "stock"。
-2. **`build_instrument_context`**：渲染 ticker + asset_type 的 prompt 头部。
-3. **拼 prompt 上下文**（line 50-60）：
+1. **`build_instrument_context`**：渲染 ticker 的 prompt 头部（crypto 措辞固定）。
+2. **拼 prompt 上下文**：
    - `risk_debate_state["history"]`：三方辩论
    - `investment_plan`：Research Manager 的 plan
    - `trader_investment_plan`：Trader 的 proposal
    - `past_context`：memory log 历史经验
-4. **`structured_decision = None`**（line 62）——默认值。crypto path 的 try 会赋值，stock path 保持 None。
-5. **crypto 分支**（line 63-94，T0 已提交）：
+3. **`structured_decision = None`**——默认值，try 成功后赋值。
+4. **structured-then-fallback**：
 
 ```python
-if asset_type == "crypto":
-    prompt = _build_crypto_prompt(...)
-    if structured_futures is None:
-        # provider 不支持 structured output（如老 Ollama 模型）→ 直接 free text
+prompt = _build_crypto_prompt(...)
+if structured_futures is None:
+    # provider 不支持 structured output（如老 Ollama 模型）→ 直接 free text
+    response = llm.invoke(prompt)
+    final_trade_decision = response.content
+    structured_decision = None
+else:
+    try:
+        structured_decision = structured_futures.invoke(prompt)
+        final_trade_decision = render_futures_decision(structured_decision)
+    except Exception as exc:
+        logger.warning("...")
         response = llm.invoke(prompt)
         final_trade_decision = response.content
         structured_decision = None
-    else:
-        try:
-            structured_decision = structured_futures.invoke(prompt)
-            final_trade_decision = render_futures_decision(structured_decision)
-        except Exception as exc:
-            logger.warning("...")
-            response = llm.invoke(prompt)
-            final_trade_decision = response.content
-            structured_decision = None
 ```
 
-**这处改动的意图**（T0 提交，`portfolio_manager.py`）：之前 try/except 把"provider 不支持"和"调用失败"混在一起，都会触发"failed" warning，对前者不准确。现在分开：
+**意图**：把"provider 不支持"和"调用失败"分开，避免前者也打不准确的 "failed" warning：
 
 - `structured_futures is None`（bind 时就失败）→ 直接走 free text，不打 warning（`bind_structured` 已经在构造时告警过）
 - `structured_futures.invoke` 抛异常 → 打 "failed" warning，再 fallback
 
 **为什么 PM 不直接用 `invoke_structured_or_freetext` helper**：helper 只 return string，但 risk gate 需要**结构化对象本身**（`FuturesDecision`）才能读 `leverage` / `position_size_pct`。PM 手动 catch 保留对象引用，写到 `state["final_decision_structured"]`。
 
-6. **stock 分支**（line 95-108）：用通用 helper。
-7. **回填 risk_debate_state**（line 110-121）。
-8. **return**：写三个状态字段（line 123-127）。
+5. **回填 risk_debate_state**。
+6. **return**：写 `final_trade_decision` / `final_decision_structured` / `risk_debate_state`。
 
 ### 8.3 `_build_crypto_prompt` —— `portfolio_manager.py:159-208`
 
@@ -666,10 +657,11 @@ def evaluate(
 
 LangGraph 节点工厂。读 state：
 
-- `state["asset_type"]`（非 crypto 直接 no-op）
 - `state["final_decision_structured"]`（None → 跳过并写 trade_skipped）
 - `state["company_of_interest"]` → symbol
 - `state.get("equity_usd", starting_equity)` → 兜底 1000
+
+（2026-07-23 前这里有一条 `asset_type != "crypto"` 早退守卫；crypto-only 化后该节点只在唯一的 crypto 图里存在，守卫已删。）
 
 调用 `evaluate`，写 state：
 - `execution_intent`: `asdict(intent)` 或 None
@@ -1018,8 +1010,8 @@ Week 5 方案 A 的 Monopoly 侧已完成，OpenClaw 侧安装是手工步骤：
 1. **§10.3** Executor（最近改动最大、money 最近）
 2. **§10.1** Risk Gate（last line of defense）
 3. **§8.2** Portfolio Manager（LLM 最容易出错的节点）
-4. **§3.3** propagate（entry / asset_type 分流）
-5. **§5.5** Futures tail 拓扑（确认条件边没旁路）
+4. **§3.3** propagate（入口 + 反思层 Binance 取数）
+5. **§5.5** Futures tail 拓扑（PM → Risk Gate 无条件边）
 6. **§10.4–10.5** JSONL 事件 + position monitor 对账（重点看 `pnl_usd=0.0` 的残留影响）
 7. 其余按需
 

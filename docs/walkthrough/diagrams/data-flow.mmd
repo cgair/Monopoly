@@ -3,7 +3,7 @@ sequenceDiagram
     participant U as User / CLI
     participant TG as TradingAgentsGraph
     participant LG as LangGraph runtime
-    participant AN as Analysts (×4)
+    participant AN as Analysts (×3)
     participant DB as Bull/Bear + RM
     participant TR as Trader
     participant RD as Risk Debators (×3)
@@ -14,9 +14,9 @@ sequenceDiagram
     participant BN as Binance Testnet
     participant FS as JSONL Log
 
-    U->>TG: propagate(ticker, date, asset_type=crypto)
+    U->>TG: propagate(ticker, date)
     TG->>LG: graph.invoke(initial_state)
-    LG->>AN: market / sentiment / news / fundamentals
+    LG->>AN: market / sentiment / news
     AN-->>LG: *_report 字段
     LG->>DB: Bull / Bear loop
     DB-->>LG: investment_plan

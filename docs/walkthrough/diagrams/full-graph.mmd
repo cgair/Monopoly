@@ -11,11 +11,7 @@ graph TD
     A3 -.tool_calls.-> T3[tools_news]
     T3 --> A3
     A3 --> C3[Msg Clear News]
-    C3 --> A4[Fundamentals Analyst]
-    A4 -.tool_calls.-> T4[tools_fundamentals]
-    T4 --> A4
-    A4 --> C4[Msg Clear Fundamentals]
-    C4 --> BR[Bull Researcher]
+    C3 --> BR[Bull Researcher]
     BR -.count under cap.-> BE[Bear Researcher]
     BE -.count under cap.-> BR
     BR -.count over cap.-> RM[Research Manager]
@@ -28,8 +24,7 @@ graph TD
     AG -.count over cap.-> PM[Portfolio Manager]
     CO -.count over cap.-> PM
     NE -.count over cap.-> PM
-    PM -.stock.-> END1([END])
-    PM -.crypto.-> RG[Risk Gate]
+    PM --> RG[Risk Gate]
     RG --> MP[Mark Price]
     MP --> EX[Executor]
     EX --> END2([END])
@@ -42,10 +37,10 @@ graph TD
     classDef futures fill:#fff9c4,stroke:#f9a825,stroke-width:2px
     classDef endpoint fill:#fff,stroke:#000,stroke-width:2px
 
-    class A1,A2,A3,A4 analyst
-    class T1,T2,T3,T4 tool
-    class C1,C2,C3,C4 clear
+    class A1,A2,A3 analyst
+    class T1,T2,T3 tool
+    class C1,C2,C3 clear
     class BR,BE,AG,CO,NE debate
     class RM,TR,PM manager
     class RG,MP,EX futures
-    class START,END1,END2 endpoint
+    class START,END2 endpoint

@@ -1,18 +1,13 @@
 """Portfolio Manager: synthesises the risk-analyst debate into the final decision.
 
-Routes by ``asset_type``:
+Emits a :class:`FuturesDecision` with the final side / leverage / sizing /
+stop / take-profit that the downstream risk gate validates before any
+order is placed. The structured object is also surfaced as
+``final_decision_structured`` so the risk-gate node consumes it directly
+without re-parsing the rendered markdown.
 
-- ``stock`` (default): emits a :class:`PortfolioDecision` (5-tier rating
-  with executive summary + thesis).
-- ``crypto`` (Monopoly fork, perp futures): emits a :class:`FuturesDecision`
-  with the final side / leverage / sizing / stop / take-profit that the
-  downstream risk gate validates before any order is placed. The
-  crypto path also surfaces the structured object as
-  ``final_decision_structured`` so the risk-gate node consumes it
-  directly without re-parsing the rendered markdown.
-
-Both paths use LangChain's ``with_structured_output`` so the LLM produces
-the typed object directly. The render helpers convert back to markdown so
+Uses LangChain's ``with_structured_output`` so the LLM produces the typed
+object directly. The render helper converts back to markdown so
 ``final_trade_decision`` keeps the same shape for memory log, CLI display,
 and saved reports.
 """
@@ -23,29 +18,22 @@ import logging
 
 from tradingagents.agents.schemas import (
     FuturesDecision,
-    PortfolioDecision,
     render_futures_decision,
-    render_pm_decision,
 )
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_language_instruction,
 )
-from tradingagents.agents.utils.structured import (
-    bind_structured,
-    invoke_structured_or_freetext,
-)
+from tradingagents.agents.utils.structured import bind_structured
 
 logger = logging.getLogger(__name__)
 
 
 def create_portfolio_manager(llm):
-    structured_stock = bind_structured(llm, PortfolioDecision, "Portfolio Manager")
     structured_futures = bind_structured(llm, FuturesDecision, "Portfolio Manager")
 
     def portfolio_manager_node(state) -> dict:
-        asset_type = state.get("asset_type", "stock")
-        instrument_context = build_instrument_context(state["company_of_interest"], asset_type)
+        instrument_context = build_instrument_context(state["company_of_interest"])
 
         risk_debate_state = state["risk_debate_state"]
         history = risk_debate_state["history"]
@@ -60,54 +48,38 @@ def create_portfolio_manager(llm):
         )
 
         structured_decision = None
-        if asset_type == "crypto":
-            prompt = _build_crypto_prompt(
-                instrument_context=instrument_context,
-                research_plan=research_plan,
-                trader_plan=trader_plan,
-                history=history,
-                lessons_line=lessons_line,
-            )
-            # Inline the structured-then-fallback flow so we can capture
-            # the typed FuturesDecision object for the downstream risk
-            # gate. ``invoke_structured_or_freetext`` only returns the
-            # rendered markdown, which the gate would have to re-parse.
-            if structured_futures is None:
-                # Provider doesn't support structured output — go straight to
-                # free text (no alarming "failed" warning; bind_structured
-                # already logged the capability gap at construction time).
+        prompt = _build_crypto_prompt(
+            instrument_context=instrument_context,
+            research_plan=research_plan,
+            trader_plan=trader_plan,
+            history=history,
+            lessons_line=lessons_line,
+        )
+        # Inline the structured-then-fallback flow so we can capture
+        # the typed FuturesDecision object for the downstream risk
+        # gate. ``invoke_structured_or_freetext`` only returns the
+        # rendered markdown, which the gate would have to re-parse.
+        if structured_futures is None:
+            # Provider doesn't support structured output — go straight to
+            # free text (no alarming "failed" warning; bind_structured
+            # already logged the capability gap at construction time).
+            response = llm.invoke(prompt)
+            final_trade_decision = response.content
+            structured_decision = None
+        else:
+            try:
+                structured_decision = structured_futures.invoke(prompt)
+                final_trade_decision = render_futures_decision(structured_decision)
+            except Exception as exc:
+                logger.warning(
+                    "Portfolio Manager: structured FuturesDecision failed (%s); "
+                    "falling back to free text — risk gate will reject for missing "
+                    "structured decision",
+                    exc,
+                )
                 response = llm.invoke(prompt)
                 final_trade_decision = response.content
                 structured_decision = None
-            else:
-                try:
-                    structured_decision = structured_futures.invoke(prompt)
-                    final_trade_decision = render_futures_decision(structured_decision)
-                except Exception as exc:
-                    logger.warning(
-                        "Portfolio Manager: structured FuturesDecision failed (%s); "
-                        "falling back to free text — risk gate will reject for missing "
-                        "structured decision",
-                        exc,
-                    )
-                    response = llm.invoke(prompt)
-                    final_trade_decision = response.content
-                    structured_decision = None
-        else:
-            prompt = _build_stock_prompt(
-                instrument_context=instrument_context,
-                research_plan=research_plan,
-                trader_plan=trader_plan,
-                history=history,
-                lessons_line=lessons_line,
-            )
-            final_trade_decision = invoke_structured_or_freetext(
-                structured_stock,
-                llm,
-                prompt,
-                render_pm_decision,
-                "Portfolio Manager",
-            )
 
         new_risk_debate_state = {
             "judge_decision": final_trade_decision,
@@ -129,39 +101,6 @@ def create_portfolio_manager(llm):
         }
 
     return portfolio_manager_node
-
-
-def _build_stock_prompt(
-    *,
-    instrument_context: str,
-    research_plan: str,
-    trader_plan: str,
-    history: str,
-    lessons_line: str,
-) -> str:
-    return f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
-
-{instrument_context}
-
----
-
-**Rating Scale** (use exactly one):
-- **Buy**: Strong conviction to enter or add to position
-- **Overweight**: Favorable outlook, gradually increase exposure
-- **Hold**: Maintain current position, no action needed
-- **Underweight**: Reduce exposure, take partial profits
-- **Sell**: Exit position or avoid entry
-
-**Context:**
-- Research Manager's investment plan: **{research_plan}**
-- Trader's transaction proposal: **{trader_plan}**
-{lessons_line}
-**Risk Analysts Debate History:**
-{history}
-
----
-
-Be decisive and ground every conclusion in specific evidence from the analysts.{get_language_instruction()}"""
 
 
 def _build_crypto_prompt(

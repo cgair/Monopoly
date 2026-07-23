@@ -113,10 +113,12 @@ def _get_ohlcv(symbol: str, interval: str, *, limit: int = 200) -> Response[Bar]
     window_ms = limit * _INTERVAL_MS.get(interval, 3_600_000)
     start_ms = now - window_ms - _INTERVAL_MS.get(interval, 3_600_000)  # 1 bar safety
 
-    # Fast path: cache fresh.
+    # Fast path: cache fresh. Only serve the cache when it covers the
+    # requested depth — a smaller earlier request (e.g. reflection pulling
+    # 20 daily bars after an analyst pulled 5) must not truncate this one.
     if cache.is_fresh(scope, ttl):
         bars = cache.read_bars(symbol, interval, start_ms=start_ms, end_ms=now)
-        if bars:
+        if len(bars) >= limit:
             return Response(
                 data=bars[-limit:],
                 meta=Meta(fetched_at=cache.get_meta(scope) or now, vendor="binance", ok=True),
@@ -148,6 +150,15 @@ def _get_ohlcv(symbol: str, interval: str, *, limit: int = 200) -> Response[Bar]
                       ok=True, is_stale=True, note=note),
         )
     return Response(data=[], meta=Meta(fetched_at=now, vendor="binance", ok=False, note=note))
+
+
+def get_ohlcv_bars(symbol: str, interval: str, limit: int = 200) -> Response[Bar]:
+    """Typed OHLCV bars for programmatic consumers (e.g. the reflection layer).
+
+    Same cache-first / stale-fallback semantics as :func:`get_ohlcv`,
+    without the prompt formatting.
+    """
+    return _get_ohlcv(symbol, interval, limit=limit)
 
 
 def get_ohlcv(symbol: str, interval: str, limit: int = 200) -> str:

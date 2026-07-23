@@ -44,8 +44,7 @@ class RiskDebateState(TypedDict):
 
 
 class AgentState(MessagesState):
-    company_of_interest: Annotated[str, "Company that we are interested in trading"]
-    asset_type: Annotated[str, "Asset type under analysis such as stock or crypto"]
+    company_of_interest: Annotated[str, "Perp-futures pair that we are interested in trading (e.g. BTC-USD)"]
     trade_date: Annotated[str, "What date we are trading at"]
 
     sender: Annotated[str, "Agent that sent this message"]
@@ -56,7 +55,6 @@ class AgentState(MessagesState):
     news_report: Annotated[
         str, "Report from the News Researcher of current world affairs"
     ]
-    fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
 
     # researcher team discussion step
     investment_debate_state: Annotated[
@@ -76,10 +74,9 @@ class AgentState(MessagesState):
     # ------------------------------------------------------------------
     # Futures (crypto perp) — Monopoly fork
     # ------------------------------------------------------------------
-    # Populated only on the crypto path (asset_type == "crypto"); stock
-    # runs leave these unset.
+    # Populated by the futures tail (Risk Gate → Mark Price → Executor).
     final_decision_structured: Annotated[
-        Any, "Structured PortfolioDecision / FuturesDecision object (crypto path uses FuturesDecision so risk gate can read leverage / stop_loss directly)"
+        Any, "Structured FuturesDecision object so the risk gate can read leverage / stop_loss directly"
     ]
     mark_price: Annotated[float, "Current mark price for the symbol; needed by the executor when entry is market"]
     equity_usd: Annotated[float, "Current account equity in USD; consumed by risk gate (drawdown) and executor (sizing)"]

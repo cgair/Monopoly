@@ -325,10 +325,6 @@ def create_risk_gate_node(config: dict):
     starting_equity = float(config.get("futures_starting_equity_usd", 1000.0))
 
     def risk_gate_node(state) -> dict:
-        if state.get("asset_type", "stock") != "crypto":
-            # Stock-mode runs do not pass through the futures gate.
-            return {"execution_intent": None, "risk_gate_rejection_reason": None}
-
         structured: Optional[FuturesDecision] = state.get("final_decision_structured")
         if structured is None:
             reason = "no structured FuturesDecision in state"

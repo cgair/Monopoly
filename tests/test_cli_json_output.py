@@ -4,7 +4,7 @@ import json
 import pytest
 from io import StringIO
 
-from tradingagents.agents.schemas import FuturesDecision, FuturesSide, PortfolioDecision
+from tradingagents.agents.schemas import FuturesDecision, FuturesSide
 from cli.json_output import (
     serialize_decision,
     serialize_risk_snapshot,
@@ -168,7 +168,6 @@ class TestBuildAnalysisResult:
             final_state,
             selections,
             decision,
-            "crypto",
         )
 
         assert result["status"] == "success"
@@ -184,7 +183,6 @@ class TestBuildAnalysisResult:
             {},
             {"ticker": "BTCUSDT", "analysis_date": "2026-07-14"},
             None,
-            "crypto",
             error="LLM API failed",
         )
 
@@ -202,7 +200,6 @@ class TestBuildAnalysisResult:
             {"final_trade_decision": "No trade"},
             {"ticker": "BTC-USD", "analysis_date": "2026-07-14"},
             decision,
-            "crypto",
         )
 
         # Should not raise

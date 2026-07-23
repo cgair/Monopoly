@@ -116,9 +116,3 @@ def test_get_global_news_default_hours(tmp_root):
         out = ndt.get_global_news.invoke({})
     # default hours=48 should be reflected in header
     assert "last 48h" in out
-
-
-@pytest.mark.unit
-def test_get_insider_transactions_stub_returns_placeholder():
-    out = ndt.get_insider_transactions.invoke({"ticker": "BTC-USD"})
-    assert "not applicable to crypto" in out

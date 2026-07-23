@@ -4,10 +4,8 @@ import logging
 import os
 from pathlib import Path
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Tuple, List, Optional
-
-import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +30,11 @@ from tradingagents.agents.utils.agent_utils import (
     get_funding_rate,
     get_open_interest,
     get_indicators,
-    get_fundamentals,
-    get_balance_sheet,
-    get_cashflow,
-    get_income_statement,
     get_news,
-    get_insider_transactions,
     get_global_news
 )
+from tradingagents.agents.utils.symbol_utils import to_binance_symbol
+from tradingagents.dataflows.crypto_binance import get_ohlcv_bars
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
@@ -54,7 +49,7 @@ class TradingAgentsGraph:
 
     def __init__(
         self,
-        selected_analysts=["market", "social", "news", "fundamentals"],
+        selected_analysts=["market", "social", "news"],
         debug=False,
         config: Dict[str, Any] = None,
         callbacks: Optional[List] = None,
@@ -179,19 +174,9 @@ class TradingAgentsGraph:
             ),
             "news": ToolNode(
                 [
-                    # News and insider information
+                    # Symbol-filtered and industry-wide crypto news
                     get_news,
                     get_global_news,
-                    get_insider_transactions,
-                ]
-            ),
-            "fundamentals": ToolNode(
-                [
-                    # Fundamental analysis tools
-                    get_fundamentals,
-                    get_balance_sheet,
-                    get_cashflow,
-                    get_income_statement,
                 ]
             ),
         }
@@ -199,55 +184,47 @@ class TradingAgentsGraph:
     def _resolve_benchmark(self, ticker: str) -> str:
         """Pick the benchmark ticker for alpha calculation against ``ticker``.
 
-        ``config["benchmark_ticker"]`` overrides everything when set; otherwise
-        the suffix map matches the ticker's exchange suffix (e.g. ``.T`` for
-        Tokyo). US-listed tickers without a dotted suffix fall through to the
-        empty-suffix entry (SPY by default). Unrecognised suffixes (including
-        US tickers with dots like ``BRK.B``) also fall back to the empty-suffix
-        entry, which is the right default because the alpha calculation works
-        in USD.
+        ``config["benchmark_ticker"]`` (default ``BTC-USD``, spec §2.1) is
+        the alpha baseline for every symbol. When the analysed ticker IS
+        the benchmark, alpha degenerates to 0 — expected and harmless.
         """
-        explicit = self.config.get("benchmark_ticker")
-        if explicit:
-            return explicit
-        benchmark_map = self.config.get("benchmark_map", {})
-        ticker_upper = ticker.upper()
-        for suffix, benchmark in benchmark_map.items():
-            if suffix and ticker_upper.endswith(suffix.upper()):
-                return benchmark
-        return benchmark_map.get("", "SPY")
+        return self.config.get("benchmark_ticker") or "BTC-USD"
+
+    def _daily_closes(self, ticker: str, start_ms: int, limit: int) -> List[float]:
+        """Daily closes for ``ticker`` from Binance, bars opening at/after ``start_ms``."""
+        resp = get_ohlcv_bars(to_binance_symbol(ticker), "1d", limit=limit)
+        return [b.close for b in resp.data if b.open_time >= start_ms]
 
     def _fetch_returns(
         self, ticker: str, trade_date: str, holding_days: int = 5,
-        benchmark: str = "SPY",
+        benchmark: str = "BTC-USD",
     ) -> Tuple[Optional[float], Optional[float], Optional[int]]:
         """Fetch raw and alpha return for ticker over holding_days from trade_date.
 
-        ``benchmark`` is the index used as the alpha baseline (resolved by the
-        caller via ``_resolve_benchmark``). Returns ``(raw_return, alpha_return,
+        ``benchmark`` is the baseline for alpha (resolved by the caller via
+        ``_resolve_benchmark``). Prices come from Binance Futures daily
+        klines — crypto trades continuously, so holding days map 1:1 to
+        calendar days. Returns ``(raw_return, alpha_return,
         actual_holding_days)`` or ``(None, None, None)`` if price data is
-        unavailable (too recent, delisted, or network error).
+        unavailable (too recent, unknown symbol, or network error).
         """
         try:
-            start = datetime.strptime(trade_date, "%Y-%m-%d")
-            end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
-            end_str = end.strftime("%Y-%m-%d")
+            start = datetime.strptime(trade_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            start_ms = int(start.timestamp() * 1000)
+            # The kline endpoint only serves the latest N bars, so size the
+            # request to reach back past trade_date (Binance caps at 1500).
+            days_since = (datetime.now(timezone.utc) - start).days
+            limit = min(max(days_since, 0) + holding_days + 2, 1500)
 
-            stock = yf.Ticker(ticker).history(start=trade_date, end=end_str)
-            bench = yf.Ticker(benchmark).history(start=trade_date, end=end_str)
+            closes = self._daily_closes(ticker, start_ms, limit)
+            bench = self._daily_closes(benchmark, start_ms, limit)
 
-            if len(stock) < 2 or len(bench) < 2:
+            if len(closes) < 2 or len(bench) < 2:
                 return None, None, None
 
-            actual_days = min(holding_days, len(stock) - 1, len(bench) - 1)
-            raw = float(
-                (stock["Close"].iloc[actual_days] - stock["Close"].iloc[0])
-                / stock["Close"].iloc[0]
-            )
-            bench_ret = float(
-                (bench["Close"].iloc[actual_days] - bench["Close"].iloc[0])
-                / bench["Close"].iloc[0]
-            )
+            actual_days = min(holding_days, len(closes) - 1, len(bench) - 1)
+            raw = (closes[actual_days] - closes[0]) / closes[0]
+            bench_ret = (bench[actual_days] - bench[0]) / bench[0]
             alpha = raw - bench_ret
             return raw, alpha, actual_days
         except Exception as e:
@@ -297,15 +274,13 @@ class TradingAgentsGraph:
         if updates:
             self.memory_log.batch_update_with_outcomes(updates)
 
-    def propagate(self, company_name, trade_date, asset_type: str = "stock"):
-        """Run the trading agents graph for a company on a specific date.
+    def propagate(self, company_name, trade_date):
+        """Run the trading agents graph for a symbol on a specific date.
 
-        ``asset_type`` selects between the stock pipeline (default) and the
-        crypto pipeline (``"crypto"``) shipped in #567 — the CLI auto-detects
-        from the ticker; programmatic callers pass it explicitly. When
-        ``checkpoint_enabled`` is set in config, the graph is recompiled with
-        a per-ticker SqliteSaver so a crashed run can resume from the last
-        successful node on a subsequent invocation with the same ticker+date.
+        When ``checkpoint_enabled`` is set in config, the graph is recompiled
+        with a per-ticker SqliteSaver so a crashed run can resume from the
+        last successful node on a subsequent invocation with the same
+        ticker+date.
         """
         self.ticker = company_name
 
@@ -331,19 +306,19 @@ class TradingAgentsGraph:
                 logger.info("Starting fresh for %s on %s", company_name, trade_date)
 
         try:
-            return self._run_graph(company_name, trade_date, asset_type=asset_type)
+            return self._run_graph(company_name, trade_date)
         finally:
             if self._checkpointer_ctx is not None:
                 self._checkpointer_ctx.__exit__(None, None, None)
                 self._checkpointer_ctx = None
                 self.graph = self.workflow.compile()
 
-    def _run_graph(self, company_name, trade_date, asset_type: str = "stock"):
+    def _run_graph(self, company_name, trade_date):
         """Execute the graph and write the resulting state to disk and memory log."""
         # Initialize state — inject memory log context for PM.
         past_context = self.memory_log.get_past_context(company_name)
         init_agent_state = self.propagator.create_initial_state(
-            company_name, trade_date, asset_type=asset_type, past_context=past_context
+            company_name, trade_date, past_context=past_context
         )
         args = self.propagator.get_graph_args()
 
@@ -397,7 +372,6 @@ class TradingAgentsGraph:
             "market_report": final_state["market_report"],
             "sentiment_report": final_state["sentiment_report"],
             "news_report": final_state["news_report"],
-            "fundamentals_report": final_state["fundamentals_report"],
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],
                 "bear_history": final_state["investment_debate_state"]["bear_history"],

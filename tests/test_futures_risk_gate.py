@@ -332,22 +332,13 @@ class TestEvaluateRejections:
 
 @pytest.mark.unit
 class TestRiskGateNode:
-    def test_stock_mode_no_op(self, tmp_path):
-        node = create_risk_gate_node({
-            "futures_risk_state_path": str(tmp_path / "state.jsonl"),
-            "futures_starting_equity_usd": 1000.0,
-        })
-        out = node({"asset_type": "stock", "company_of_interest": "NVDA"})
-        assert out["execution_intent"] is None
-        assert out["risk_gate_rejection_reason"] is None
-
     def test_missing_structured_decision_logs_skip(self, tmp_path):
         state_path = tmp_path / "state.jsonl"
         node = create_risk_gate_node({
             "futures_risk_state_path": str(state_path),
             "futures_starting_equity_usd": 1000.0,
         })
-        out = node({"asset_type": "crypto", "company_of_interest": "BTC-USD"})
+        out = node({"company_of_interest": "BTC-USD"})
         assert out["execution_intent"] is None
         assert "no structured" in out["risk_gate_rejection_reason"]
         # trade_skipped event was logged
@@ -364,7 +355,6 @@ class TestRiskGateNode:
             "futures_starting_equity_usd": 1000.0,
         })
         out = node({
-            "asset_type": "crypto",
             "company_of_interest": "BTC-USD",
             "final_decision_structured": _ok_long(),
             "equity_usd": 1000.0,
@@ -385,7 +375,6 @@ class TestRiskGateNode:
             "futures_starting_equity_usd": 1000.0,
         })
         out = node({
-            "asset_type": "crypto",
             "company_of_interest": "BTC-USD",
             "final_decision_structured": _ok_long(leverage=2.0),
             "equity_usd": 1000.0,

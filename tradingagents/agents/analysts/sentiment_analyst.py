@@ -42,8 +42,7 @@ def create_sentiment_analyst(llm):
         ticker = state["company_of_interest"]
         end_date = state["trade_date"]
         start_date = _seven_days_back(end_date)
-        asset_type = state.get("asset_type", "crypto")
-        instrument_context = build_instrument_context(ticker, asset_type)
+        instrument_context = build_instrument_context(ticker)
 
         # Base-asset code (e.g. BTC-USD → BTC) for symbol-keyword filters.
         base = to_base_symbol(ticker)

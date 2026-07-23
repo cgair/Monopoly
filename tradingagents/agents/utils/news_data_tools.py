@@ -3,11 +3,7 @@
 Monopoly fork: the original (ticker, start_date, end_date) adapter has
 been retired in favour of crypto-native signatures that mirror the
 underlying ``dataflows.crypto_news`` surface (sources + hours + optional
-symbol filter). News-analyst and any other crypto consumer call these
-tools directly; the only legacy holdover is
-``get_insider_transactions``, which remains a stock-mode placeholder so
-``fundamentals_analyst`` (filtered out at runtime in crypto mode) keeps
-importing cleanly.
+symbol filter).
 """
 
 from typing import Annotated, Optional
@@ -66,20 +62,3 @@ def get_global_news(
     """
     src = _normalize_sources(sources)
     return route_to_vendor("get_news", src, hours, None)
-
-
-@tool
-def get_insider_transactions(
-    ticker: Annotated[str, "Ticker symbol"],
-) -> str:
-    """Insider transactions.
-
-    Monopoly fork: not meaningful for crypto perpetual futures (there is
-    no public insider-transaction registry equivalent to SEC filings).
-    Returned only so the upstream ``fundamentals_analyst`` import chain
-    stays clean — that analyst is filtered out at runtime in crypto mode.
-    """
-    return (
-        f"# Insider transactions for {ticker} — not applicable to crypto\n"
-        "<insider transaction data not available for crypto assets>"
-    )

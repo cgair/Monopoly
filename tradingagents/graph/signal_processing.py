@@ -1,10 +1,10 @@
 """Extract the 5-tier portfolio rating from the Portfolio Manager's decision.
 
-The Portfolio Manager produces a typed ``PortfolioDecision`` via structured
-output and renders it to markdown that always carries a ``**Rating**: X``
-header (see :func:`tradingagents.agents.schemas.render_pm_decision`).  The
-deterministic heuristic in :mod:`tradingagents.agents.utils.rating` is more
-than sufficient to extract that rating; no extra LLM call is needed.
+The Portfolio Manager produces a typed ``FuturesDecision`` via structured
+output and renders it to markdown that carries a ``**Side**: X`` header
+(see :func:`tradingagents.agents.schemas.render_futures_decision`), which
+:mod:`tradingagents.agents.utils.rating` maps onto the shared 5-tier scale
+(Long → Buy, Short → Sell, Flat → Hold); no extra LLM call is needed.
 
 This module exists for backwards compatibility with callers that expect a
 ``SignalProcessor.process_signal(text)`` interface.

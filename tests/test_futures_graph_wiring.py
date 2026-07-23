@@ -89,17 +89,11 @@ class TestGraphSetupFuturesTail:
         assert "Risk Gate" not in node_names
         assert "Executor" not in node_names
 
-    def test_pm_has_conditional_branch_when_futures_tail_enabled(self, tmp_path):
-        """The conditional edge from PM exists when the futures tail is wired.
-
-        Behavioural routing (crypto → Risk Gate, stock → END) is covered
-        indirectly: the futures-tail nodes are registered and the
-        deterministic edges between them are unconditional.
-        """
+    def test_pm_connects_directly_to_risk_gate_when_futures_tail_enabled(self, tmp_path):
+        """Crypto-only mode: PM feeds the Risk Gate unconditionally."""
         setup = self._build_setup(config={
             "futures_risk_state_path": str(tmp_path / "state.jsonl"),
             "futures_orders_log_path": str(tmp_path / "orders.jsonl"),
         })
         graph = setup.setup_graph(selected_analysts=["market"])
-        branches = graph.branches.get("Portfolio Manager", {})
-        assert branches, "expected a conditional branch off Portfolio Manager"
+        assert ("Portfolio Manager", "Risk Gate") in graph.edges

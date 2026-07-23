@@ -1,13 +1,9 @@
 """Trader: turns the Research Manager's investment plan into a concrete transaction proposal.
 
-Routes by ``asset_type``:
-
-- ``stock`` (default, upstream behaviour): emits a :class:`TraderProposal`
-  (Buy / Hold / Sell with optional entry / stop / sizing prose).
-- ``crypto`` (Monopoly fork, perp futures): emits a :class:`FuturesProposal`
-  (Long / Short / Flat with leverage, stop-loss, take-profit, and a
-  fractional ``position_size_pct``). The downstream risk gate validates
-  the execution params against the configured ceilings.
+Emits a :class:`FuturesProposal` (Long / Short / Flat with leverage,
+stop-loss, take-profit, and a fractional ``position_size_pct``). The
+downstream risk gate validates the execution params against the
+configured ceilings.
 """
 
 from __future__ import annotations
@@ -18,9 +14,7 @@ from langchain_core.messages import AIMessage
 
 from tradingagents.agents.schemas import (
     FuturesProposal,
-    TraderProposal,
     render_futures_proposal,
-    render_trader_proposal,
 )
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
@@ -33,41 +27,25 @@ from tradingagents.agents.utils.structured import (
 
 
 def create_trader(llm):
-    structured_stock = bind_structured(llm, TraderProposal, "Trader")
     structured_futures = bind_structured(llm, FuturesProposal, "Trader")
 
     def trader_node(state, name):
         company_name = state["company_of_interest"]
-        asset_type = state.get("asset_type", "stock")
-        instrument_context = build_instrument_context(company_name, asset_type)
+        instrument_context = build_instrument_context(company_name)
         investment_plan = state["investment_plan"]
 
-        if asset_type == "crypto":
-            messages = _build_crypto_messages(
-                company_name=company_name,
-                instrument_context=instrument_context,
-                investment_plan=investment_plan,
-            )
-            trader_plan = invoke_structured_or_freetext(
-                structured_futures,
-                llm,
-                messages,
-                render_futures_proposal,
-                "Trader",
-            )
-        else:
-            messages = _build_stock_messages(
-                company_name=company_name,
-                instrument_context=instrument_context,
-                investment_plan=investment_plan,
-            )
-            trader_plan = invoke_structured_or_freetext(
-                structured_stock,
-                llm,
-                messages,
-                render_trader_proposal,
-                "Trader",
-            )
+        messages = _build_crypto_messages(
+            company_name=company_name,
+            instrument_context=instrument_context,
+            investment_plan=investment_plan,
+        )
+        trader_plan = invoke_structured_or_freetext(
+            structured_futures,
+            llm,
+            messages,
+            render_futures_proposal,
+            "Trader",
+        )
 
         return {
             "messages": [AIMessage(content=trader_plan)],
@@ -76,31 +54,6 @@ def create_trader(llm):
         }
 
     return functools.partial(trader_node, name="Trader")
-
-
-def _build_stock_messages(*, company_name: str, instrument_context: str, investment_plan: str):
-    return [
-        {
-            "role": "system",
-            "content": (
-                "You are a trading agent analyzing market data to make investment decisions. "
-                "Based on your analysis, provide a specific recommendation to buy, sell, or hold. "
-                "Anchor your reasoning in the analysts' reports and the research plan."
-                + get_language_instruction()
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Based on a comprehensive analysis by a team of analysts, here is an investment "
-                f"plan tailored for {company_name}. {instrument_context} This plan incorporates "
-                f"insights from current technical market trends, macroeconomic indicators, and "
-                f"social media sentiment. Use this plan as a foundation for evaluating your next "
-                f"trading decision.\n\nProposed Investment Plan: {investment_plan}\n\n"
-                f"Leverage these insights to make an informed and strategic decision."
-            ),
-        },
-    ]
 
 
 def _build_crypto_messages(*, company_name: str, instrument_context: str, investment_plan: str):

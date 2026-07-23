@@ -28,10 +28,10 @@ class GraphSetup:
     ):
         """Initialize with required components.
 
-        ``config`` is the Monopoly config dict; only the crypto-mode
-        futures-tail nodes consume it (risk gate, mark-price fetcher,
-        executor). Pass ``None`` to disable the futures tail entirely —
-        useful when wiring stock-only test graphs.
+        ``config`` is the Monopoly config dict; only the futures-tail
+        nodes consume it (risk gate, mark-price fetcher, executor).
+        Pass ``None`` to disable the futures tail entirely — useful
+        when wiring analysis-only test graphs.
         """
         self.quick_thinking_llm = quick_thinking_llm
         self.deep_thinking_llm = deep_thinking_llm
@@ -41,7 +41,7 @@ class GraphSetup:
         self.config = config
 
     def setup_graph(
-        self, selected_analysts=["market", "social", "news", "fundamentals"]
+        self, selected_analysts=["market", "social", "news"]
     ):
         """Set up and compile the agent workflow graph.
 
@@ -50,7 +50,6 @@ class GraphSetup:
                 - "market": Market analyst
                 - "social": Social media analyst
                 - "news": News analyst
-                - "fundamentals": Fundamentals analyst
         """
         plan = build_analyst_execution_plan(
             selected_analysts,
@@ -61,7 +60,6 @@ class GraphSetup:
             "market": lambda: create_market_analyst(self.quick_thinking_llm),
             "social": lambda: create_sentiment_analyst(self.quick_thinking_llm),
             "news": lambda: create_news_analyst(self.quick_thinking_llm),
-            "fundamentals": lambda: create_fundamentals_analyst(self.quick_thinking_llm),
         }
 
         # Create researcher and manager nodes
@@ -163,22 +161,13 @@ class GraphSetup:
             },
         )
 
-        # Futures tail (crypto-mode only). Stock runs branch directly
-        # to END from the Portfolio Manager.
+        # Futures tail: Portfolio Manager → Risk Gate → Mark Price → Executor.
         if self.config is not None:
             workflow.add_node("Risk Gate", create_risk_gate_node(self.config))
             workflow.add_node("Mark Price", create_mark_price_node())
             workflow.add_node("Executor", create_executor_node(self.config))
 
-            def _branch_after_pm(state):
-                # asset_type set by propagation.create_initial_state
-                return "Risk Gate" if state.get("asset_type") == "crypto" else END
-
-            workflow.add_conditional_edges(
-                "Portfolio Manager",
-                _branch_after_pm,
-                {"Risk Gate": "Risk Gate", END: END},
-            )
+            workflow.add_edge("Portfolio Manager", "Risk Gate")
             workflow.add_edge("Risk Gate", "Mark Price")
             workflow.add_edge("Mark Price", "Executor")
             workflow.add_edge("Executor", END)

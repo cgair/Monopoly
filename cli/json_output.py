@@ -6,15 +6,15 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Optional
 
-from tradingagents.agents.schemas import FuturesDecision, FuturesSide, PortfolioDecision
+from tradingagents.agents.schemas import FuturesDecision, FuturesSide
 from tradingagents.futures.risk_state import RiskGateSnapshot
 
 
 def serialize_decision(decision: Any) -> dict:
-    """Convert a decision object (FuturesDecision or PortfolioDecision) to JSON-serializable dict."""
+    """Convert a FuturesDecision (or dataclass fallback) to JSON-serializable dict."""
     if decision is None:
         return {}
-    
+
     if isinstance(decision, FuturesDecision):
         return {
             "type": "FuturesDecision",
@@ -27,13 +27,6 @@ def serialize_decision(decision: Any) -> dict:
             "executive_summary": decision.executive_summary,
             "investment_thesis": decision.investment_thesis,
             "time_horizon": decision.time_horizon,
-        }
-    elif isinstance(decision, PortfolioDecision):
-        return {
-            "type": "PortfolioDecision",
-            "decision_type": decision.decision_type.value if hasattr(decision.decision_type, 'value') else str(decision.decision_type),
-            "size": decision.size,
-            "reasoning": decision.reasoning,
         }
     else:
         # Try to convert using asdict if it's a dataclass
@@ -75,18 +68,16 @@ def build_analysis_result(
     final_state: dict,
     selections: dict,
     decision: Any,
-    asset_type: str,
     error: Optional[str] = None,
 ) -> dict:
     """Build a complete analysis result dict suitable for JSON output.
-    
+
     Args:
         final_state: Final state from graph execution
         selections: User selections (ticker, analysis_date, etc.)
         decision: Processed decision object
-        asset_type: Asset type (stock or crypto)
         error: Optional error message if analysis failed
-    
+
     Returns:
         Dict ready for JSON serialization.
     """
@@ -96,7 +87,8 @@ def build_analysis_result(
         "error": error,
         "analysis": {
             "ticker": selections.get("ticker"),
-            "asset_type": asset_type,
+            # Fixed literal kept for OpenClaw consumers' schema compatibility.
+            "asset_type": "crypto",
             "analysis_date": selections.get("analysis_date"),
             "selected_analysts": selections.get("analysts", []),
         },

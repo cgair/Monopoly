@@ -9,15 +9,8 @@ from tradingagents.agents.utils.core_market_tools import (
 from tradingagents.agents.utils.technical_indicators_tools import (
     get_indicators
 )
-from tradingagents.agents.utils.fundamental_data_tools import (
-    get_fundamentals,
-    get_balance_sheet,
-    get_cashflow,
-    get_income_statement
-)
 from tradingagents.agents.utils.news_data_tools import (
     get_news,
-    get_insider_transactions,
     get_global_news
 )
 
@@ -38,19 +31,14 @@ def get_language_instruction() -> str:
     return f" Write your entire response in {lang}."
 
 
-def build_instrument_context(ticker: str, asset_type: str = "stock") -> str:
-    """Describe the exact instrument so agents preserve exchange-qualified tickers."""
-    instrument_label = "asset" if asset_type == "crypto" else "instrument"
-    extra_hint = (
-        " Treat it as a crypto asset rather than a company, and do not assume company fundamentals are available."
-        if asset_type == "crypto"
-        else ""
-    )
+def build_instrument_context(ticker: str) -> str:
+    """Describe the exact asset so agents preserve the quoted ticker form."""
     return (
-        f"The {instrument_label} to analyze is `{ticker}`. "
+        f"The asset to analyze is `{ticker}`. "
         "Use this exact ticker in every tool call, report, and recommendation, "
-        "preserving any exchange suffix (e.g. `.TO`, `.L`, `.HK`, `.T`, `-USD`)."
-        + extra_hint
+        "preserving the quote suffix (e.g. `-USD`). "
+        "Treat it as a crypto asset rather than a company, and do not assume "
+        "company fundamentals are available."
     )
 
 def create_msg_delete():

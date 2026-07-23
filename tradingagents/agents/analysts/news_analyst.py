@@ -13,8 +13,7 @@ def create_news_analyst(llm):
     def news_analyst_node(state):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
-        asset_type = state.get("asset_type", "crypto")
-        instrument_context = build_instrument_context(ticker, asset_type)
+        instrument_context = build_instrument_context(ticker)
 
         # Base symbol (e.g. BTC-USD → BTC) for the LLM to use as the
         # default symbol argument; the model may still adjust on its own

@@ -29,7 +29,6 @@ dependencies = [
     "stockstats>=0.6.5",
     "tqdm>=4.67.1",
     "typing-extensions>=4.14.0",
-    "yfinance>=0.2.63",
     "pyarrow>=24.0.0",
     "feedparser>=6.0.12",
     "python-binance>=1.0",

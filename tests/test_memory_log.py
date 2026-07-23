@@ -1,11 +1,10 @@
 """Tests for TradingMemoryLog — storage, deferred reflection, PM injection, legacy removal."""
 
 import pytest
-import pandas as pd
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from tradingagents.agents.utils.memory import TradingMemoryLog
-from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating
+from tradingagents.agents.schemas import FuturesDecision, FuturesSide
 from tradingagents.graph.reflection import Reflector
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.graph.propagation import Propagator
@@ -53,15 +52,10 @@ def _resolve_entry(log, ticker, date, decision, reflection="Good call."):
     log.update_with_outcome(ticker, date, 0.05, 0.02, 5, reflection)
 
 
-def _price_df(prices):
-    """Minimal DataFrame matching yfinance .history() output shape."""
-    return pd.DataFrame({"Close": prices})
-
-
 def _make_pm_state(past_context=""):
     """Minimal AgentState dict for portfolio_manager_node."""
     return {
-        "company_of_interest": "NVDA",
+        "company_of_interest": "BTC-USD",
         "past_context": past_context,
         "risk_debate_state": {
             "history": "Risk debate history.",
@@ -77,20 +71,19 @@ def _make_pm_state(past_context=""):
         "market_report": "Market report.",
         "sentiment_report": "Sentiment report.",
         "news_report": "News report.",
-        "fundamentals_report": "Fundamentals report.",
         "investment_plan": "Research plan.",
         "trader_investment_plan": "Trader plan.",
     }
 
 
-def _structured_pm_llm(captured: dict, decision: PortfolioDecision | None = None):
+def _structured_pm_llm(captured: dict, decision: FuturesDecision | None = None):
     """Build a MagicMock LLM whose with_structured_output binding captures the
-    prompt and returns a real PortfolioDecision (so render_pm_decision works).
+    prompt and returns a real FuturesDecision (so render_futures_decision works).
     """
     if decision is None:
-        decision = PortfolioDecision(
-            rating=PortfolioRating.HOLD,
-            executive_summary="Hold the position; await catalyst.",
+        decision = FuturesDecision(
+            side=FuturesSide.FLAT,
+            executive_summary="Stay flat; await catalyst.",
             investment_thesis="Balanced view; neither side carried the debate.",
         )
     structured = MagicMock()
@@ -483,114 +476,90 @@ class TestDeferredReflection:
         assert "-5.0%" in human_content
         assert "Exit position immediately." in human_content
 
-    # TradingAgentsGraph._fetch_returns
+    # TradingAgentsGraph._fetch_returns — Binance daily closes
+
+    @staticmethod
+    def _graph_with_closes(closes_by_ticker: dict):
+        """MagicMock graph whose _daily_closes serves canned close lists."""
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        mock_graph._daily_closes = MagicMock(
+            side_effect=lambda ticker, start_ms, limit: closes_by_ticker.get(ticker, [])
+        )
+        return mock_graph
 
     def test_fetch_returns_valid_ticker(self):
-        stock_prices = [100.0, 102.0, 104.0, 103.0, 105.0, 106.0]
-        spy_prices   = [400.0, 402.0, 404.0, 403.0, 405.0, 406.0]
-        mock_graph = MagicMock(spec=TradingAgentsGraph)
-        with patch("yfinance.Ticker") as mock_ticker_cls:
-            def _make_ticker(sym):
-                m = MagicMock()
-                m.history.return_value = _price_df(spy_prices if sym == "SPY" else stock_prices)
-                return m
-            mock_ticker_cls.side_effect = _make_ticker
-            raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "NVDA", "2026-01-05")
+        eth_closes = [100.0, 102.0, 104.0, 103.0, 105.0, 106.0]
+        btc_closes = [400.0, 402.0, 404.0, 403.0, 405.0, 406.0]
+        mock_graph = self._graph_with_closes({"ETH-USD": eth_closes, "BTC-USD": btc_closes})
+        raw, alpha, days = TradingAgentsGraph._fetch_returns(
+            mock_graph, "ETH-USD", "2026-01-05", benchmark="BTC-USD"
+        )
         assert raw is not None and alpha is not None and days is not None
         assert isinstance(raw, float) and isinstance(alpha, float) and isinstance(days, int)
         assert days == 5
 
     def test_fetch_returns_too_recent(self):
-        """Only 1 data point available → returns (None, None, None), no crash."""
-        mock_graph = MagicMock(spec=TradingAgentsGraph)
-        with patch("yfinance.Ticker") as mock_ticker_cls:
-            m = MagicMock()
-            m.history.return_value = _price_df([100.0])
-            mock_ticker_cls.return_value = m
-            raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "NVDA", "2026-04-19")
+        """Only 1 close available → returns (None, None, None), no crash."""
+        mock_graph = self._graph_with_closes({"ETH-USD": [100.0], "BTC-USD": [400.0]})
+        raw, alpha, days = TradingAgentsGraph._fetch_returns(
+            mock_graph, "ETH-USD", "2026-04-19", benchmark="BTC-USD"
+        )
         assert raw is None and alpha is None and days is None
 
-    def test_fetch_returns_delisted(self):
-        """Empty DataFrame → returns (None, None, None), no crash."""
-        mock_graph = MagicMock(spec=TradingAgentsGraph)
-        with patch("yfinance.Ticker") as mock_ticker_cls:
-            m = MagicMock()
-            m.history.return_value = pd.DataFrame({"Close": []})
-            mock_ticker_cls.return_value = m
-            raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "XXXXXFAKE", "2026-01-10")
+    def test_fetch_returns_no_data(self):
+        """Empty close list (unknown symbol) → returns (None, None, None), no crash."""
+        mock_graph = self._graph_with_closes({"BTC-USD": [400.0, 402.0]})
+        raw, alpha, days = TradingAgentsGraph._fetch_returns(
+            mock_graph, "FAKE-USD", "2026-01-10", benchmark="BTC-USD"
+        )
         assert raw is None and alpha is None and days is None
 
-    def test_fetch_returns_spy_shorter_than_stock(self):
-        """SPY having fewer rows than the stock must not raise IndexError."""
-        stock_prices = [100.0, 102.0, 104.0, 103.0, 105.0, 106.0]
-        spy_prices   = [400.0, 402.0, 403.0]
-        mock_graph = MagicMock(spec=TradingAgentsGraph)
-        with patch("yfinance.Ticker") as mock_ticker_cls:
-            def _make_ticker(sym):
-                m = MagicMock()
-                m.history.return_value = _price_df(spy_prices if sym == "SPY" else stock_prices)
-                return m
-            mock_ticker_cls.side_effect = _make_ticker
-            raw, alpha, days = TradingAgentsGraph._fetch_returns(mock_graph, "NVDA", "2026-01-05")
+    def test_fetch_returns_benchmark_shorter_than_asset(self):
+        """Benchmark having fewer closes than the asset must not raise IndexError."""
+        eth_closes = [100.0, 102.0, 104.0, 103.0, 105.0, 106.0]
+        btc_closes = [400.0, 402.0, 403.0]
+        mock_graph = self._graph_with_closes({"ETH-USD": eth_closes, "BTC-USD": btc_closes})
+        raw, alpha, days = TradingAgentsGraph._fetch_returns(
+            mock_graph, "ETH-USD", "2026-01-05", benchmark="BTC-USD"
+        )
         assert raw is not None and alpha is not None and days is not None
         assert days == 2
 
-    # TradingAgentsGraph._resolve_benchmark — picks index for alpha calc
+    # TradingAgentsGraph._daily_closes — symbol conversion + start filter
+
+    def test_daily_closes_converts_symbol_and_filters_by_start(self):
+        from unittest.mock import patch
+
+        bars = [
+            MagicMock(open_time=1_000, close=100.0),
+            MagicMock(open_time=2_000, close=101.0),
+            MagicMock(open_time=3_000, close=102.0),
+        ]
+        resp = MagicMock(data=bars)
+        mock_graph = MagicMock(spec=TradingAgentsGraph)
+        with patch(
+            "tradingagents.graph.trading_graph.get_ohlcv_bars", return_value=resp
+        ) as mock_fetch:
+            closes = TradingAgentsGraph._daily_closes(mock_graph, "BTC-USD", 2_000, 10)
+        mock_fetch.assert_called_once_with("BTCUSDT", "1d", limit=10)
+        assert closes == [101.0, 102.0]
+
+    # TradingAgentsGraph._resolve_benchmark — alpha baseline
 
     def test_resolve_benchmark_explicit_override(self):
         """config['benchmark_ticker'] wins for every ticker."""
         mock_graph = MagicMock(spec=TradingAgentsGraph)
-        mock_graph.config = {
-            "benchmark_ticker": "QQQ",
-            "benchmark_map": {"": "SPY", ".T": "^N225"},
-        }
-        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "7203.T") == "QQQ"
-        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "NVDA") == "QQQ"
+        mock_graph.config = {"benchmark_ticker": "ETH-USD"}
+        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "BTC-USD") == "ETH-USD"
+        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "SOL-USD") == "ETH-USD"
 
-    def test_resolve_benchmark_suffix_map(self):
-        """Known suffixes route to their regional index."""
+    def test_resolve_benchmark_defaults_to_btc(self):
+        """Missing/None benchmark_ticker falls back to BTC-USD (spec §2.1)."""
         mock_graph = MagicMock(spec=TradingAgentsGraph)
-        mock_graph.config = {
-            "benchmark_ticker": None,
-            "benchmark_map": {
-                ".T": "^N225", ".HK": "^HSI", ".NS": "^NSEI",
-                ".L": "^FTSE", ".TO": "^GSPTSE", ".AX": "^AXJO",
-                ".BO": "^BSESN", "": "SPY",
-            },
-        }
-        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "7203.T") == "^N225"
-        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "0700.HK") == "^HSI"
-        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "RELIANCE.NS") == "^NSEI"
-        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "AZN.L") == "^FTSE"
-
-    def test_resolve_benchmark_us_ticker_defaults_to_spy(self):
-        """US tickers (no dotted suffix) take the empty-suffix entry."""
-        mock_graph = MagicMock(spec=TradingAgentsGraph)
-        mock_graph.config = {
-            "benchmark_ticker": None,
-            "benchmark_map": {"": "SPY", ".T": "^N225"},
-        }
-        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "NVDA") == "SPY"
-        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "AAPL") == "SPY"
-
-    def test_resolve_benchmark_unknown_suffix_falls_back(self):
-        """Unrecognised suffix (BRK.B, FAKE.XX) falls back to SPY."""
-        mock_graph = MagicMock(spec=TradingAgentsGraph)
-        mock_graph.config = {
-            "benchmark_ticker": None,
-            "benchmark_map": {"": "SPY", ".T": "^N225"},
-        }
-        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "FAKE.XX") == "SPY"
-        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "BRK.B") == "SPY"
-
-    def test_resolve_benchmark_case_insensitive(self):
-        """Suffix matching is case-insensitive so 7203.t resolves like 7203.T."""
-        mock_graph = MagicMock(spec=TradingAgentsGraph)
-        mock_graph.config = {
-            "benchmark_ticker": None,
-            "benchmark_map": {".T": "^N225", "": "SPY"},
-        }
-        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "7203.t") == "^N225"
+        mock_graph.config = {"benchmark_ticker": None}
+        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "ETH-USD") == "BTC-USD"
+        mock_graph.config = {}
+        assert TradingAgentsGraph._resolve_benchmark(mock_graph, "ETH-USD") == "BTC-USD"
 
     def test_reflector_includes_benchmark_in_label(self):
         """benchmark_name appears in the prompt label, not 'SPY' hardcoded."""
@@ -694,33 +663,35 @@ class TestPortfolioManagerInjection:
         pm_node(state)
         assert "Lessons from prior decisions" not in captured["prompt"]
 
-    def test_pm_returns_rendered_markdown_with_rating(self):
-        """The structured PortfolioDecision is rendered to markdown that
+    def test_pm_returns_rendered_markdown_with_side(self):
+        """The structured FuturesDecision is rendered to markdown that
         downstream consumers (memory log, signal processor, CLI display)
         can parse without any extra LLM call."""
         captured = {}
-        decision = PortfolioDecision(
-            rating=PortfolioRating.OVERWEIGHT,
-            executive_summary="Build position gradually over the next two weeks.",
-            investment_thesis="AI capex cycle remains intact; institutional flows constructive.",
-            price_target=215.0,
-            time_horizon="3-6 months",
+        decision = FuturesDecision(
+            side=FuturesSide.LONG,
+            leverage=2.0,
+            position_size_pct=0.005,
+            stop_loss=62800.0,
+            executive_summary="Build the long gradually over the next two days.",
+            investment_thesis="Funding reset and OI expansion support continuation.",
+            time_horizon="2-5 days",
         )
         llm = _structured_pm_llm(captured, decision)
         pm_node = create_portfolio_manager(llm)
         result = pm_node(_make_pm_state())
         md = result["final_trade_decision"]
-        assert "**Rating**: Overweight" in md
-        assert "**Executive Summary**: Build position gradually" in md
-        assert "**Investment Thesis**: AI capex cycle" in md
-        assert "**Price Target**: 215.0" in md
-        assert "**Time Horizon**: 3-6 months" in md
+        assert "**Side**: Long" in md
+        assert "**Executive Summary**: Build the long gradually" in md
+        assert "**Investment Thesis**: Funding reset" in md
+        assert "**Leverage**: 2.0x" in md
+        assert "**Time Horizon**: 2-5 days" in md
 
     def test_pm_falls_back_to_freetext_when_structured_unavailable(self):
         """If a provider does not support with_structured_output, the agent
         falls back to a plain invoke and returns whatever prose the model
         produced, so the pipeline never blocks."""
-        plain_response = "**Rating**: Sell\n\nExit ahead of guidance."
+        plain_response = "**Side**: Short\n\nExit ahead of the funding flip."
         llm = MagicMock()
         llm.with_structured_output.side_effect = NotImplementedError("provider unsupported")
         llm.invoke.return_value = MagicMock(content=plain_response)
@@ -825,7 +796,6 @@ class TestLegacyRemoval:
             "market_report": "",
             "sentiment_report": "",
             "news_report": "",
-            "fundamentals_report": "",
             "investment_debate_state": {
                 "bull_history": "", "bear_history": "", "history": "",
                 "current_response": "", "judge_decision": "",

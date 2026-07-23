@@ -6,29 +6,37 @@ import questionary
 from dotenv import find_dotenv, set_key
 from rich.console import Console
 
-from cli.models import AnalystType, AssetType
+from cli.models import AnalystType
+from tradingagents.agents.utils.symbol_utils import to_binance_symbol
 from tradingagents.llm_clients.api_key_env import get_api_key_env
 from tradingagents.llm_clients.model_catalog import get_model_options
 
 console = Console()
 
-TICKER_INPUT_EXAMPLES = "Examples: SPY, CNC.TO, 7203.T, 0700.HK"
+TICKER_INPUT_EXAMPLES = "Examples: BTC-USD, ETH-USD, BTCUSDT"
 
 ANALYST_ORDER = [
     ("Market Analyst", AnalystType.MARKET),
     ("Sentiment Analyst", AnalystType.SOCIAL),
     ("News Analyst", AnalystType.NEWS),
-    ("Fundamentals Analyst", AnalystType.FUNDAMENTALS),
 ]
 
-CRYPTO_SUFFIXES = ("-USD", "-USDT", "-USDC", "-BTC", "-ETH")
+
+def validate_crypto_ticker(ticker: str) -> bool:
+    """True when ``ticker`` reduces to a supported crypto perp symbol."""
+    try:
+        to_binance_symbol(ticker)
+        return True
+    except ValueError:
+        return False
 
 
 def get_ticker() -> str:
-    """Prompt the user to enter a ticker symbol."""
+    """Prompt the user to enter a crypto perp ticker symbol."""
     ticker = questionary.text(
         f"Enter the exact ticker symbol to analyze ({TICKER_INPUT_EXAMPLES}):",
-        validate=lambda x: len(x.strip()) > 0 or "Please enter a valid ticker symbol.",
+        validate=lambda x: validate_crypto_ticker(x)
+        or f"Only crypto perp symbols are supported. {TICKER_INPUT_EXAMPLES}",
         style=questionary.Style(
             [
                 ("text", "fg:green"),
@@ -45,27 +53,8 @@ def get_ticker() -> str:
 
 
 def normalize_ticker_symbol(ticker: str) -> str:
-    """Normalize ticker input while preserving exchange suffixes."""
+    """Normalize ticker input while preserving the quote suffix."""
     return ticker.strip().upper()
-
-
-def detect_asset_type(ticker: str) -> AssetType:
-    normalized_ticker = ticker.strip().upper()
-    if normalized_ticker.endswith(CRYPTO_SUFFIXES):
-        return AssetType.CRYPTO
-    return AssetType.STOCK
-
-
-def filter_analysts_for_asset_type(
-    analysts: List[AnalystType], asset_type: AssetType
-) -> List[AnalystType]:
-    if asset_type != AssetType.CRYPTO:
-        return analysts
-    return [
-        analyst
-        for analyst in analysts
-        if analyst != AnalystType.FUNDAMENTALS
-    ]
 
 
 def get_analysis_date() -> str:
@@ -101,18 +90,13 @@ def get_analysis_date() -> str:
     return date.strip()
 
 
-def select_analysts(asset_type: AssetType = AssetType.STOCK) -> List[AnalystType]:
+def select_analysts() -> List[AnalystType]:
     """Select analysts using an interactive checkbox."""
-    available_analysts = filter_analysts_for_asset_type(
-        [value for _, value in ANALYST_ORDER],
-        asset_type,
-    )
     choices = questionary.checkbox(
         "Select Your [Analysts Team]:",
         choices=[
             questionary.Choice(display, value=value)
             for display, value in ANALYST_ORDER
-            if value in available_analysts
         ],
         instruction="\n- Press Space to select/unselect analysts\n- Press 'a' to select/unselect all\n- Press Enter when done",
         validate=lambda x: len(x) > 0 or "You must select at least one analyst.",

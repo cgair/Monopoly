@@ -36,7 +36,7 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 TICKER = "BTC-USD"
 TRADE_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-SELECTED_ANALYSTS = ["market", "social"]   # minimal first run; add news / fundamentals later
+SELECTED_ANALYSTS = ["market", "social"]   # minimal first run; add news later
 
 LLM_PROVIDER = "google"
 DEEP_MODEL = "gemini-3.1-pro-preview"      # Portfolio Manager + Research Manager
@@ -81,15 +81,14 @@ def main() -> None:
     print(f"  graph compiled; nodes: {len(ta.graph.nodes)}")
     print()
 
-    print(f"Propagating {TICKER} ({TRADE_DATE}) as asset_type=crypto…")
+    print(f"Propagating {TICKER} ({TRADE_DATE})…")
     print("  (this will take a few minutes — analysts + researchers + PM + futures tail)")
     print()
-    _, processed = ta.propagate(TICKER, TRADE_DATE, asset_type="crypto")
+    _, processed = ta.propagate(TICKER, TRADE_DATE)
     state = ta.curr_state
 
     print()
     print("=== Final state summary ===")
-    print(f"  asset_type:                 {state.get('asset_type')}")
     print(f"  final_decision_structured:  {state.get('final_decision_structured')}")
     print()
     print(f"  execution_intent:")

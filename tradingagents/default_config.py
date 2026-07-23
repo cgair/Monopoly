@@ -88,15 +88,6 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "news_article_limit": 20,             # max articles per ticker (ticker-news)
     "global_news_article_limit": 10,      # max articles for global/macro news
     "global_news_lookback_days": 7,       # macro news lookback window
-    # Search queries used by get_global_news for macro headlines. Extend or
-    # replace to broaden geographic / sector coverage.
-    "global_news_queries": [
-        "Federal Reserve interest rates inflation",
-        "S&P 500 earnings GDP economic outlook",
-        "geopolitical risk trade war sanctions",
-        "ECB Bank of England BOJ central bank policy",
-        "oil commodities supply chain energy",
-    ],
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
     # Monopoly fork: crypto perpetual futures data vendors
@@ -112,23 +103,9 @@ DEFAULT_CONFIG = _apply_env_overrides({
         # Example: "get_stock_data": "alpha_vantage",  # Override category default
     },
     # Benchmark for alpha calculation in the reflection layer.
-    # ``benchmark_ticker`` (when set) overrides the suffix map for all
-    # tickers; leave it None to use ``benchmark_map`` for auto-detection
-    # based on the ticker's exchange suffix. SPY remains the US default
-    # so the reflection label keeps reading "Alpha vs SPY" for US tickers
-    # while non-US tickers get their regional index automatically.
-    "benchmark_ticker": None,
-    "benchmark_map": {
-        ".NS":  "^NSEI",    # NSE India (Nifty 50)
-        ".BO":  "^BSESN",   # BSE India (Sensex)
-        ".T":   "^N225",    # Tokyo (Nikkei 225)
-        ".HK":  "^HSI",     # Hong Kong (Hang Seng)
-        ".L":   "^FTSE",    # London (FTSE 100)
-        ".TO":  "^GSPTSE",  # Toronto (TSX Composite)
-        ".AX":  "^AXJO",    # Australia (ASX 200)
-        "-USD": "BTC-USD",  # crypto perp (Monopoly): alpha vs BTC (spec §2.1)
-        "":     "SPY",      # default for US-listed tickers (no suffix)
-    },
+    # Alpha is measured against BTC (spec §2.1); override via
+    # TRADINGAGENTS_BENCHMARK_TICKER for experiments (e.g. ETH-USD).
+    "benchmark_ticker": "BTC-USD",
     # ----------------------------------------------------------------------
     # Futures (crypto perp) — risk gate ceilings (Monopoly fork)
     # ----------------------------------------------------------------------

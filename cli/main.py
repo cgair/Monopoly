@@ -57,7 +57,6 @@ class MessageBuffer:
         "market": "Market Analyst",
         "social": "Sentiment Analyst",
         "news": "News Analyst",
-        "fundamentals": "Fundamentals Analyst",
     }
 
     # Report section mapping: section -> (analyst_key for filtering, finalizing_agent)
@@ -67,7 +66,6 @@ class MessageBuffer:
         "market_report": ("market", "Market Analyst"),
         "sentiment_report": ("social", "Sentiment Analyst"),
         "news_report": ("news", "News Analyst"),
-        "fundamentals_report": ("fundamentals", "Fundamentals Analyst"),
         "investment_plan": (None, "Research Manager"),
         "trader_investment_plan": (None, "Trader"),
         "final_trade_decision": (None, "Portfolio Manager"),
@@ -175,7 +173,6 @@ class MessageBuffer:
                 "market_report": "Market Analysis",
                 "sentiment_report": "Social Sentiment",
                 "news_report": "News Analysis",
-                "fundamentals_report": "Fundamentals Analysis",
                 "investment_plan": "Research Team Decision",
                 "trader_investment_plan": "Trading Team Plan",
                 "final_trade_decision": "Portfolio Management Decision",
@@ -191,7 +188,7 @@ class MessageBuffer:
         report_parts = []
 
         # Analyst Team Reports - use .get() to handle missing sections
-        analyst_sections = ["market_report", "sentiment_report", "news_report", "fundamentals_report"]
+        analyst_sections = ["market_report", "sentiment_report", "news_report"]
         if any(self.report_sections.get(section) for section in analyst_sections):
             report_parts.append("## Analyst Team Reports")
             if self.report_sections.get("market_report"):
@@ -205,10 +202,6 @@ class MessageBuffer:
             if self.report_sections.get("news_report"):
                 report_parts.append(
                     f"### News Analysis\n{self.report_sections['news_report']}"
-                )
-            if self.report_sections.get("fundamentals_report"):
-                report_parts.append(
-                    f"### Fundamentals Analysis\n{self.report_sections['fundamentals_report']}"
                 )
 
         # Research Team Reports
@@ -505,15 +498,11 @@ def get_user_selections():
     console.print(
         create_question_box(
             "Step 1: Ticker Symbol",
-            "Enter the exact ticker symbol to analyze, including exchange suffix when needed (examples: SPY, CNC.TO, 7203.T, 0700.HK)",
-            "SPY",
+            "Enter the exact crypto perp ticker to analyze (examples: BTC-USD, ETH-USD, BTCUSDT)",
+            "BTC-USD",
         )
     )
     selected_ticker = get_ticker()
-    asset_type = detect_asset_type(selected_ticker)
-    console.print(
-        f"[green]Detected asset type:[/green] {asset_type.value}"
-    )
 
     # Step 2: Analysis date
     default_date = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -541,7 +530,7 @@ def get_user_selections():
             "Step 4: Analysts Team", "Select your LLM analyst agents for the analysis"
         )
     )
-    selected_analysts = select_analysts(asset_type)
+    selected_analysts = select_analysts()
     console.print(
         f"[green]Selected analysts:[/green] {', '.join(analyst.value for analyst in selected_analysts)}"
     )
@@ -624,7 +613,6 @@ def get_user_selections():
 
     return {
         "ticker": selected_ticker,
-        "asset_type": asset_type.value,
         "analysis_date": analysis_date,
         "analysts": selected_analysts,
         "research_depth": selected_research_depth,
@@ -640,26 +628,23 @@ def get_user_selections():
 
 
 def get_ticker():
-    """Get ticker symbol from user input, preserving exchange suffixes."""
-    # typer.prompt strips trailing dot-suffixes on some shells (e.g. 000404.SH
-    # collapses to 000404). questionary.text reads the raw line.
+    """Get a crypto perp ticker from user input, preserving the quote suffix."""
+    # typer.prompt strips trailing dot-suffixes on some shells; questionary.text
+    # reads the raw line.
     ticker = questionary.text(
         "",
         validate=lambda value: (
             not value.strip()
-            or (
-                all(ch.isalnum() or ch in "._-^" for ch in value.strip())
-                and len(value.strip()) <= 32
-            )
+            or validate_crypto_ticker(value)
         )
-        or "Please enter a valid ticker symbol, e.g. AAPL, 000404.SZ, 0700.HK.",
+        or "Only crypto perp symbols are supported, e.g. BTC-USD, ETH-USD, BTCUSDT.",
     ).ask()
 
     if ticker is None:
         console.print("\n[red]No ticker symbol provided. Exiting...[/red]")
         raise typer.Exit(1)
 
-    return (ticker.strip() or "SPY").upper()
+    return (ticker.strip() or "BTC-USD").upper()
 
 
 def get_analysis_date():
@@ -701,10 +686,6 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
         analysts_dir.mkdir(exist_ok=True)
         (analysts_dir / "news.md").write_text(final_state["news_report"], encoding="utf-8")
         analyst_parts.append(("News Analyst", final_state["news_report"]))
-    if final_state.get("fundamentals_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "fundamentals.md").write_text(final_state["fundamentals_report"], encoding="utf-8")
-        analyst_parts.append(("Fundamentals Analyst", final_state["fundamentals_report"]))
     if analyst_parts:
         content = "\n\n".join(f"### {name}\n{text}" for name, text in analyst_parts)
         sections.append(f"## I. Analyst Team Reports\n\n{content}")
@@ -784,8 +765,6 @@ def display_complete_report(final_state):
         analysts.append(("Sentiment Analyst", final_state["sentiment_report"]))
     if final_state.get("news_report"):
         analysts.append(("News Analyst", final_state["news_report"]))
-    if final_state.get("fundamentals_report"):
-        analysts.append(("Fundamentals Analyst", final_state["fundamentals_report"]))
     if analysts:
         console.print(Panel("[bold]I. Analyst Team Reports[/bold]", border_style="cyan"))
         for title, content in analysts:
@@ -840,18 +819,16 @@ def update_research_team_status(status):
 
 
 # Ordered list of analysts for status transitions
-ANALYST_ORDER = ["market", "social", "news", "fundamentals"]
+ANALYST_ORDER = ["market", "social", "news"]
 ANALYST_AGENT_NAMES = {
     "market": "Market Analyst",
     "social": "Sentiment Analyst",
     "news": "News Analyst",
-    "fundamentals": "Fundamentals Analyst",
 }
 ANALYST_REPORT_MAP = {
     "market": "market_report",
     "social": "sentiment_report",
     "news": "news_report",
-    "fundamentals": "fundamentals_report",
 }
 
 
@@ -1076,7 +1053,6 @@ def run_analysis(checkpoint: bool = False):
 
         # Add initial messages
         message_buffer.add_message("System", f"Selected ticker: {selections['ticker']}")
-        message_buffer.add_message("System", f"Detected asset type: {selections['asset_type']}")
         message_buffer.add_message(
             "System", f"Analysis date: {selections['analysis_date']}"
         )
@@ -1102,7 +1078,6 @@ def run_analysis(checkpoint: bool = False):
         init_agent_state = graph.propagator.create_initial_state(
             selections["ticker"],
             selections["analysis_date"],
-            asset_type=selections["asset_type"],
         )
         # Pass callbacks to graph config for tool execution tracking
         # (LLM tracking is handled separately via LLM constructor)
@@ -1305,14 +1280,12 @@ def run_analysis_json(checkpoint: bool = False) -> int:
     import os
     from tradingagents.default_config import DEFAULT_CONFIG
     from tradingagents.futures.risk_state import default_state_path, load_events, derive_state
-    from tradingagents.agents.utils.symbol_utils import infer_asset_type
     from datetime import datetime, timezone
-    
+
     try:
         # Auto-select minimal config for JSON mode
         ticker = os.getenv("TRADINGAGENTS_JSON_TICKER", "BTC-USD")
-        asset_type = infer_asset_type(ticker)
-        
+
         # Minimal analyst selection (market only for speed)
         selected_analysts = ["market"]
         
@@ -1349,7 +1322,6 @@ def run_analysis_json(checkpoint: bool = False) -> int:
         init_agent_state = graph.propagator.create_initial_state(
             ticker,
             analysis_date,
-            asset_type=asset_type,
         )
         args = graph.propagator.get_graph_args(callbacks=[stats_handler])
         
@@ -1371,7 +1343,6 @@ def run_analysis_json(checkpoint: bool = False) -> int:
             final_state,
             {"ticker": ticker, "analysis_date": analysis_date, "analysts": selected_analysts},
             decision,
-            asset_type,
         )
         result["risk_state"] = {
             "open_positions": risk_snapshot.open_positions,

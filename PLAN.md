@@ -1,6 +1,6 @@
 # Monopoly 开发计划(PLAN.md)
 
-- **更新**: 2026-07-19(**T0–T7 全部完成**并合并回 `dev`,512 passed;剩:用户在 Mac mini 配 OpenClaw+Discord、T3b Reddit OAuth(可选);Hermes 与 T8 On-Chain 均搁置/观察)
+- **更新**: 2026-07-31(新增 **T9–T11 数据源增强**任务卡;此前 2026-07-19:**T0–T7 全部完成**并合并回 `dev`,512 passed;剩:用户在 Mac mini 配 OpenClaw+Discord、T3b Reddit OAuth(可选);Hermes 与 T8 On-Chain 均搁置/观察)
 - **来源**: `~/Desktop/AI/become rich/docs/monopoly-spec.md` §3 / §5 / §8 + 工作区未提交改动盘点
 - **用法**: 每个任务设计为可由一个独立 Claude Code 实例(worktree 或新会话)冷启动执行。
   开工前先读任务卡里的「上下文锚点」,完成后勾选并在 spec §8 追加恢复点。
@@ -20,6 +20,16 @@ T0 ✅ ── T1 ✅ ── T2 ✅ ── T3 ✅ ── T4 ✅ ── T5 ✅ ─
       T3b Reddit OAuth(可选,数据缺口恢复)
 搁置:Hermes 侧集成(代码已在库,用户决定现有工作流够用,暂不配置)
       T8 On-Chain analyst(观察后再决定:testnet 复盘发现链上信号盲区才启动)
+
+新增(2026-07-31,数据源增强,三者互相独立、可并行,全部 $0):
+      T9  Binance 免费多空比端点 → Market Analyst(Coinglass 购买降级为 wait-and-see,
+          触发条件:testnet 复盘发现止损被插针/清算瀑布类亏损)
+      T10 快讯源(BlockBeats/Odaily)→ News Analyst + Sentiment twitter_block
+      T11 经济日历(ForexFactory)→ 前瞻宏观事件风控上下文
+
+新增(2026-07-31,对账闭环加固,QuantDinger 调研引出):
+      T12 对账闭环补全:intent 先行落盘 + 反向对账 + 真实 PnL 回填(P1,mainnet 前置)
+      T13 单写者锁:monitor 与 graph run 并发防护(P3,可选)
 ```
 
 **T0 必须最先在主仓库完成**(worktree 从已提交的 commit 分出,未提交改动不会带过去)。
@@ -246,6 +256,98 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 
 ---
 
+## T9 — 合约情绪信号接线到 Market Analyst(2026-07-31 新增;2026-07-31 改免费方案)
+
+**优先级**: P2
+**触碰文件**: `dataflows/crypto_binance.py`(新增免费多空比端点)、`agents/analysts/market_analyst.py`
++ 对应测试
+**并行安全**: 与 T10/T11 零交集
+
+**决策(2026-07-31)**: **不买 Coinglass**——项目 testnet 验证期无收入,$29/月是纯烧钱,且无基线
+无法衡量其贡献。改用 Binance 免费公开端点(`/futures/data/*`,无需 auth):
+- `globalLongShortAccountRatio` — 全市场多空人数比
+- `topLongShortPositionRatio` — 大户持仓多空比
+- `takerlongshortRatio` — 主动买卖量比
+单所数据,但系统只在 Binance 交易,够用。实现风格对齐 `market_data.py::fetch_mark_price()`
+(unauth GET)或 python-binance 对应方法。
+
+**Coinglass 购买 → wait-and-see(与 T8 同款决策模式)**: 唯一无免费替代的是**清算数据**
+(清算密集区→止损摆放/连环清算预警;Binance 强平 REST 端点已下线)。触发条件:testnet 复盘
+发现「止损频繁被插针扫掉」或「亏损集中在清算瀑布时段」的模式 → 买 Hobbyist($29/月,
+**按月付**,年付折扣虚标)。届时 `crypto_coinglass.py` 已就绪,只需设 `COINGLASS_API_KEY`
++ 把 `get_liquidations` 补进 analyst 工具表。
+**限额结论存档(spec §5 可关闭)**: Hobbyist 30 req/min ≫ 双标的 5min 轮询(≈4 req/5min),够用。
+
+**步骤**:
+1. `crypto_binance.py` 加 `get_long_short_ratio()`(内部聚合上面 3 个免费端点,复用现有
+   cache/Response 模式;与 coinglass 版同名工具冲突的话,vendor 路由优先 binance)。
+2. `market_analyst.py` 工具列表加该工具,prompt 增加使用指引(多空比极值→反向/拥挤信号,
+   大户 vs 散户背离),风格对齐现有 4 个工具说明。
+3. 端点失败优雅降级(复用 Response ok=False 模式),单测不联网。
+
+**验收**: 完整 run 报告含多空比分析;端点失败时报告注明 data gap;零新增费用。
+
+---
+
+## T10 — 快讯源接入:BlockBeats/Odaily → News + Sentiment(2026-07-31 新增)
+
+**优先级**: P2
+**触碰文件**: `dataflows/crypto_news.py`(`_FEEDS` 扩充)或新建 `dataflows/crypto_newsflash.py`、
+`agents/analysts/sentiment_analyst.py`(`twitter_block` 填充)+ 测试
+**并行安全**: 与 T9/T11 零交集
+
+**背景**: 两个缺口一次补。① `crypto_twitter.py` 是占位符,Sentiment Analyst 的 `twitter_block`
+恒为 "data unavailable"——X API 太贵($100/月起且配额小)。② News 源只有 CoinDesk/CoinTelegraph,
+宏观数据(FOMC/CPI/非农)覆盖是文章级、慢。BlockBeats/Odaily 快讯编辑全天盯 crypto Twitter,
+KOL 重要推文几分钟内变快讯("某某发推表示…"),宏观数据公布后几分钟内出数字快讯——等于免费、
+无 key、官方支持的「X 消息面 + 宏观快讯」聚合(follow-builders 同款中心化 feed 模式)。
+
+**端点**(官方 GitHub repo 提供):
+- BlockBeats 快讯: `https://api.theblockbeats.news/v2/rss/newsflash?lang=en`(repo: BlockBeatsOfficial/RSS-v2)
+- Odaily: repo ODAILY/RSS(快讯 + 文章)
+- 可选: CryptoPanic `https://cryptopanic.com/news/rss`
+
+**设计要点**:
+- **语言选 `lang=en`**——现有 symbol 关键词过滤是英文 regex(`crypto_news.py` 的 pattern 表),
+  中文内容会漏筛;LLM 读中文没问题,但过滤层先行。
+- News Analyst 路径:快讯进 `_FEEDS`,`get_news`/`get_global_news` 自动生效,无 prompt 改动。
+- Sentiment 路径:从快讯里筛「KOL 动态」类条目(标题含发推/tweet/表示 等模式,或全量近 24h)
+  填进 `twitter_block`,替换占位符;`crypto_twitter.py` 的对外签名保持,内部换实现,
+  block 头注明来源是编辑转述而非推文原文(无 engagement 数据)。
+- 快讯条目短、量大,注意 `hours` 窗口与条数上限,别把 prompt 撑爆。
+
+**验收**: `get_news` 结果含快讯条目;宏观数据日(如 CPI)当天能拉到数字快讯;Sentiment 的
+`twitter_block` 不再 "data unavailable";RSS 拉取失败时优雅降级(复用现有 fetch_errors 模式)。
+
+---
+
+## T11 — 经济日历前瞻风控(ForexFactory)(2026-07-31 新增)
+
+**优先级**: P3
+**新建文件**: `dataflows/econ_calendar.py` + 测试;接线点在 PM 上下文 + risk gate(可选策略)
+**并行安全**: 与 T9/T10 零交集;触碰 `risk_gate.py` 时注意与未来任务的冲突
+
+**背景**: 现有宏观覆盖全是**回顾式**(新闻发出来才知道)。系统不知道「明天凌晨 2 点 FOMC」——
+对杠杆 + 止损单系统是真实风险:数据公布瞬间的插针足以扫掉止损。手动交易者「数据日不开仓」
+的直觉,系统目前没有。
+
+**数据源**: ForexFactory 免费周历 JSON `https://nfs.faireconomy.media/ff_calendar_thisweek.json`
+(经典免费源,含事件时间/货币/影响等级)。无 key;注意 UA 和缓存(周历,TTL 可以很长)。
+
+**设计要点**(遵守 defense layering,spec §8 locked):
+- 过滤:`currency == USD` 且 `impact == High`(FOMC/CPI/NFP 自然命中)。
+- L1/L2:未来 N 小时(默认 12h,env 可配)内有高影响事件 → 在 PM 上下文注入警示文本
+  (事件名 + 倒计时),让 LLM 自己权衡降杠杆/观望。
+- L3(可选,默认**只提示不硬拒**):risk gate 新增 `macro_event_caution` 策略,
+  `TRADINGAGENTS_FUTURES_MACRO_BLOCK_HOURS` env 开启后,事件前 N 小时内拒绝**新开仓**
+  (写 `trade_skipped`,reason 带事件名);默认关闭,攒样本复盘后再决定要不要开。
+- 日历拉取失败 → 静默降级为无警示(fail-open,这是提示层不是安全层),但要 log。
+
+**验收**: mock 日历单测(事件在窗口内 → PM 上下文含警示;窗口外/拉取失败 → 无警示);
+env 开启硬拒后 gate 拒绝并写审计事件;真实拉取一次确认 schema 没变。
+
+---
+
 ## 手工验证清单(2026-07-18 更新:1–3 已由 Claude 实弹完成,剩 4–5 需用户)
 
 1. ~~Position monitor testnet 实测~~ ✅ 2026-07-18:开仓→平仓→对账→`position_closed` 写入、孤儿单清零、账户干净。
@@ -264,8 +366,11 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 
 ## 其他挂起项(不单开任务)
 
-- **Twitter 数据源**:已主动推迟(option f:先用 News + Reddit),不阻塞。
-- **Coinglass 计费 tier**:双标的 5min 轮询是否够用,待验证(多标的化之前不急)。
+- **Twitter 数据源**:已主动推迟(option f:先用 News + Reddit)→ **2026-07-31 起由 T10 以
+  快讯转述形式部分覆盖**;推文原文 + engagement 数据仍无免费解,永久搁置直到 X API 降价。
+- **Coinglass 计费 tier**:~~待验证~~ → **已在 T9 任务卡结论**:Hobbyist 30 req/min 够双标的
+  5min 轮询;但**购买本身降级为 wait-and-see**(2026-07-31,理由:验证期无收入不烧订阅费,
+  复盘发现清算盲区亏损再买)。
 - **Week 3 验证项**「跑出 BTC-USD 完整 Analyst Team 报告」:6-02 全链路验证实际已覆盖,T0 更新 spec 时顺手勾掉。
 
 ---

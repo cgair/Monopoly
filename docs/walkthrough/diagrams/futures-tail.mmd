@@ -4,10 +4,11 @@ graph LR
     MP --> EX[Executor<br/>reads: intent + mark_price<br/>dryrun OR testnet adapter<br/>writes: execution_result<br/>appends JSONL events]
     EX --> END2([END])
 
-    EX -.success.-> J1[(position_opened)]
-    EX -.naked.-> J2[(position_opened<br/>+ position_naked)]
-    EX -.skip / fail.-> J3[(trade_skipped)]
-    RG -.reject.-> J3
+    EX -.->|write-ahead BEFORE exchange call| J0[(order_submitted)]
+    EX -.->|success| J1[(position_opened)]
+    EX -.->|naked| J2[(position_opened<br/>+ position_naked)]
+    EX -.->|skip / fail| J3[(trade_skipped<br/>intent_id)]
+    RG -.->|"reject (incl. dangling-intent rule 7.5)"| J3
 
     classDef manager fill:#e8f5e9,stroke:#388e3c
     classDef futures fill:#fff9c4,stroke:#f9a825,stroke-width:2px
@@ -17,4 +18,4 @@ graph LR
     class PM manager
     class RG,MP,EX futures
     class END2 endpoint
-    class J1,J2,J3 jsonl
+    class J0,J1,J2,J3 jsonl

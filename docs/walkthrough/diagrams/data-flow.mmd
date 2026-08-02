@@ -35,6 +35,7 @@ sequenceDiagram
         BN-->>MP: mark price
         MP-->>LG: mark_price
         LG->>EX: 读 intent + mark_price
+        EX->>FS: append order_submitted (write-ahead)
         EX->>BN: change_leverage + MARKET open
         BN-->>EX: orderId
         EX->>BN: STOP_MARKET reduceOnly

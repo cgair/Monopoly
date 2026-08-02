@@ -1,6 +1,6 @@
 # Monopoly 开发计划(PLAN.md)
 
-- **更新**: 2026-07-31(新增 **T9–T11 数据源增强**任务卡;此前 2026-07-19:**T0–T7 全部完成**并合并回 `dev`,512 passed;剩:用户在 Mac mini 配 OpenClaw+Discord、T3b Reddit OAuth(可选);Hermes 与 T8 On-Chain 均搁置/观察)
+- **更新**: 2026-08-02(**T9–T11 完成**,533 passed;新增 T12/T13 对账加固任务卡待做;此前 2026-07-19 T0–T7 全部完成;剩:用户在 Mac mini 配 OpenClaw+Discord、T12、T3b(可选);Hermes 与 T8 均搁置/观察)
 - **来源**: `~/Desktop/AI/become rich/docs/monopoly-spec.md` §3 / §5 / §8 + 工作区未提交改动盘点
 - **用法**: 每个任务设计为可由一个独立 Claude Code 实例(worktree 或新会话)冷启动执行。
   开工前先读任务卡里的「上下文锚点」,完成后勾选并在 spec §8 追加恢复点。
@@ -21,11 +21,11 @@ T0 ✅ ── T1 ✅ ── T2 ✅ ── T3 ✅ ── T4 ✅ ── T5 ✅ ─
 搁置:Hermes 侧集成(代码已在库,用户决定现有工作流够用,暂不配置)
       T8 On-Chain analyst(观察后再决定:testnet 复盘发现链上信号盲区才启动)
 
-新增(2026-07-31,数据源增强,三者互相独立、可并行,全部 $0):
-      T9  Binance 免费多空比端点 → Market Analyst(Coinglass 购买降级为 wait-and-see,
+新增(2026-07-31,数据源增强,全部 $0)— **T9/T10/T11 已于 2026-08-02 全部完成**(533 passed):
+      T9 ✅ Binance 免费多空比端点 → Market Analyst(Coinglass 购买仍为 wait-and-see,
           触发条件:testnet 复盘发现止损被插针/清算瀑布类亏损)
-      T10 快讯源(BlockBeats/Odaily)→ News Analyst + Sentiment twitter_block
-      T11 经济日历(ForexFactory)→ 前瞻宏观事件风控上下文
+      T10 ✅ 快讯源 → News Analyst + Sentiment twitter_block(实际由 Odaily 承载,见任务卡注记)
+      T11 ✅ 经济日历(ForexFactory)→ PM 警示 + gate 可选硬拒(默认关)
 
 新增(2026-07-31,对账闭环加固,QuantDinger 调研引出):
       T12 对账闭环补全:intent 先行落盘 + 反向对账 + 真实 PnL 回填(P1,mainnet 前置)
@@ -256,7 +256,12 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 
 ---
 
-## T9 — 合约情绪信号接线到 Market Analyst(2026-07-31 新增;2026-07-31 改免费方案)
+## T9 — 合约情绪信号接线到 Market Analyst ✅ 完成(2026-08-02)
+
+> 实现:`crypto_binance.py` 新增 `get_long_short_ratio`(全市场多空人数比,cache-first + stale
+> fallback)+ 两个辅助指标(大户持仓比、主动买卖比,进程内 TTL memo);vendor 路由 binance 优先,
+> coinglass 保留(有 key 时用 `tool_vendors={"get_long_short_ratio": "coinglass"}` 显式切换);
+> market_analyst 绑第 5 个工具 + prompt 教学(拥挤度/散户-大户背离)。测试 +7。
 
 **优先级**: P2
 **触碰文件**: `dataflows/crypto_binance.py`(新增免费多空比端点)、`agents/analysts/market_analyst.py`
@@ -289,7 +294,15 @@ Binance UI 的 "Cancel All" 能撤,说明有对应 fapi endpoint。
 
 ---
 
-## T10 — 快讯源接入:BlockBeats/Odaily → News + Sentiment(2026-07-31 新增)
+## T10 — 快讯源接入:BlockBeats/Odaily → News + Sentiment ✅ 完成(2026-08-02)
+
+> 实现:两个快讯 feed 进 `_FEEDS` 并入默认源;`crypto_twitter.py` 重写为快讯转述实现
+> (X 动态分层筛选:本标的 X 转述 → 全市场 X 转述 → 本标的快讯 → 全部快讯,各带 note),
+> sentiment prompt 的 twitter block 改为 editorial-relay 语义(无 engagement,禁止推断热度)。
+> **实测发现两处与调研不符**:① BlockBeats v2 语言参数在**请求头**(`language: en`)而非 query;
+> ② 即便如此该 feed 从当前网络出口返回空 payload——保留注册(Mac mini 网络可能正常),
+> **快讯负载实际由 Odaily(中文)承载**,已实弹验证拿到真实 X 转述(CZ 等 KOL 发文)。
+> 中文支持:`_SYMBOL_KEYWORDS` 加 CJK 别名(比特币/以太坊),KOL pattern 加 发推/推文/X平台。
 
 **优先级**: P2
 **触碰文件**: `dataflows/crypto_news.py`(`_FEEDS` 扩充)或新建 `dataflows/crypto_newsflash.py`、
@@ -321,7 +334,13 @@ KOL 重要推文几分钟内变快讯("某某发推表示…"),宏观数据公�
 
 ---
 
-## T11 — 经济日历前瞻风控(ForexFactory)(2026-07-31 新增)
+## T11 — 经济日历前瞻风控(ForexFactory)✅ 完成(2026-08-02)
+
+> 实现:`dataflows/econ_calendar.py`(周历 JSON,进程内 6h TTL 缓存,fail-open + 失败时回落
+> 旧缓存);PM prompt 注入 L1 警示(`futures_macro_warn_hours`,默认 12h);gate 第 8 步可选
+> `macro_block_hours` 硬拒(默认 0=关,`TRADINGAGENTS_FUTURES_MACRO_BLOCK_HOURS` 可开,
+> `macro_events` 参数可注入保证单测离线)。实弹验证:本周 92 条事件解析正常(FOMC/GDP/PCE)。
+> Code review 修复:naive datetime 按 UTC 处理(防服务器时区偏移)。
 
 **优先级**: P3
 **新建文件**: `dataflows/econ_calendar.py` + 测试;接线点在 PM 上下文 + risk gate(可选策略)
@@ -345,6 +364,80 @@ KOL 重要推文几分钟内变快讯("某某发推表示…"),宏观数据公�
 
 **验收**: mock 日历单测(事件在窗口内 → PM 上下文含警示;窗口外/拉取失败 → 无警示);
 env 开启硬拒后 gate 拒绝并写审计事件;真实拉取一次确认 schema 没变。
+
+---
+
+## T12 — 对账闭环补全:intent 先行落盘 + 反向对账 + 真实 PnL 回填(2026-07-31 新增)
+
+**优先级**: P1(**mainnet 前置条件**——三个缺口都属于「资金在交易所、本地失明」类风险)
+**触碰文件**: `futures/risk_state.py`、`futures/executor.py`、`futures/position_monitor.py`、
+`futures/risk_gate.py`(轻)、`futures/alerts.py`(告警接线)+ 测试
+**并行安全**: 与 T9/T10/T11 零交集(它们不碰 `futures/`);T12 内部三步动同一批文件,**不拆分**
+
+**背景(三个互相咬合的缺口,2026-07-31 QuantDinger 调研 + 代码核对确认)**:
+1. **无 intent write-ahead**:executor 的所有状态事件(`position_opened` / `trade_skipped` /
+   `position_naked`)都在 `place_order()` 返回**之后**才写(executor.py:583 起)。进程在
+   「交易所已成交」与 `append_event` 之间崩掉 → 本地 JSONL 完全不知道这笔仓位:
+   仓位在交易所裸奔,gate 并发计数少算一个。
+2. **对账只有单方向**:`reconcile_positions()` 的 `symbols_to_check` 完全来自 JSONL 的
+   `position_opened`(position_monitor.py:343),只能发现「本地开着→交易所已关」;
+   反方向(交易所有仓、本地无记录)检测不到——而这恰好是缺口 1 产生的状态,
+   当前**没有任何机制**能发现它。
+3. **对账平仓事件是空数据**:monitor 补写的 `position_closed` 里 `pnl_usd` 硬编码 `0.0`、
+   `outcome` 多为 `"unknown"`(position_monitor.py:366 附近)→ `daily_drawdown_halt`
+   (需要真实 PnL)和 `cooldown_after_loss`(需要知道是否 stop-out)两条 gate 策略
+   对 stop/TP 触发的平仓完全失明。
+
+**步骤**:
+1. **intent write-ahead**(`risk_state.py` + `executor.py`):新增事件
+   `{"type": "order_submitted", ts, intent_id, symbol, side, stop_loss, take_profit}`,
+   在调 `place_order()` **之前**落盘(dryrun 也写,保持事件流一致);现有
+   position_opened / trade_skipped / position_naked 即结果事件,按 `intent_id` 配对。
+   `derive_state` 新增 `dangling_intents`:submitted 超过 N 分钟(默认 5,env 可配)
+   无结果事件 → gate 保守拒新开仓(reason 带 intent_id),直到 monitor 对账消解。
+2. **`position_opened` 事件增补 `stop_loss` / `take_profit` / `entry_price`**(executor),
+   给步骤 4 的 outcome 推断提供依据。向后兼容:老事件缺字段按 unknown 处理。
+3. **反向对账**(position_monitor):对「交易所有仓、本地无 open」的 symbol:
+   - 有匹配的 dangling intent(同 symbol)→ 补写 `position_opened`(领养,intent_id 沿用),
+     消解 dangling;
+   - 无匹配 → 写新事件 `position_untracked` + 走 `alerts.py` 发 Discord 告警(需人工处理)。
+   两种情况 gate 的并发计数都必须包含该仓位(保守方向)。
+4. **真实 PnL 回填**(position_monitor):平仓对账时调 `futures_income_history`
+   (incomeType=REALIZED_PNL,按 symbol + 开仓 ts 之后的窗口)汇总 `pnl_usd`;
+   outcome 用开仓事件里的 stop/tp 价与成交价近邻判定 stop | tp | manual。
+   income 拉取失败 → 保持 0.0/unknown,但必须 log + 告警(数据缺口要可见,不能静默)。
+5. **测试**(fake adapter,不联网):模拟「submit 后崩溃」→ dangling → gate 拒 → monitor
+   领养;交易所侧未知仓位 → untracked + 告警;stop-out 平仓 → cooldown 生效、drawdown
+   累计;income 失败降级路径;老格式事件(无新字段)回放兼容。
+
+**验收**:
+- 测试注入「place_order 成功但跳过 append_event」→ 下次 monitor run 后 JSONL 与交易所
+  一致、gate 计数正确。
+- testnet 实测:UI 手动开一笔仓 → monitor 检出 `position_untracked` + Discord 告警。
+- testnet 实测:止损触发的平仓,对账事件带非零 `pnl_usd`、`outcome=stop`,其后 60min 内
+  新开仓被 cooldown 拒绝(写 `trade_skipped`)。
+
+**明确不做**(QuantDinger 调研中评估后放弃):Postgres / Celery / 多进程 worker、
+durable command 表——单机 JSONL + launchd 规模下是纯负担;lease/fencing 简化为 T13。
+
+---
+
+## T13 — 单写者锁:monitor 与 graph run 并发防护(2026-07-31 新增,可选)
+
+**优先级**: P3
+**触碰文件**: 新建 `futures/lock.py`(或并入 `risk_state.py`)+ executor / position_monitor 调用点
+**并行安全**: 依赖 T12 合并后再做(同文件)
+
+**背景**: launchd 周期跑的 position_monitor 与手动触发的 graph run 可能同时读改同一份
+JSONL、对同一账户下单/撤单——存在竞态(概率低,但一旦发生极难排查)。QuantDinger 用
+lease + heartbeat + fencing token;单机简化为 lockfile 即可。
+
+**步骤**: PID + ISO ts 写入 lockfile,`O_CREAT|O_EXCL` 原子创建;持锁者才允许写 JSONL /
+调交易所写操作;锁超时(默认 10min,env 可配)视为 stale,可接管(记 log);
+拿不到锁 → monitor 跳过本轮(下轮 launchd 再来),graph run 等待或报错退出。
+
+**验收**: 双进程并发单测(两个进程同时抢锁,只有一个成功);stale lock 接管路径;
+monitor 拿不到锁时静默跳过且写 log。
 
 ---
 

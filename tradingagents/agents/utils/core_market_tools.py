@@ -51,6 +51,25 @@ def get_funding_rate(
 
 
 @tool
+def get_long_short_ratio(
+    symbol: Annotated[str, "Ticker in BASE-USD form, e.g. BTC-USD"],
+    interval: Annotated[str, "Sampling interval: 5m / 15m / 1h / 4h / 1d"] = "1h",
+    limit: Annotated[int, "Number of most recent samples (max 500, ~30d history)"] = 50,
+) -> str:
+    """Retrieve long/short positioning ratios for a perpetual futures pair.
+
+    Returns three metrics: global long/short account ratio history
+    (all accounts), latest top-trader position ratio (what the big
+    accounts hold), and latest taker buy/sell volume ratio (aggressive
+    flow). Extreme readings mark crowded positioning — a contrarian /
+    squeeze-risk signal, strongest when it diverges from funding or from
+    the top-trader ratio.
+    """
+    binance_symbol = to_binance_symbol(symbol)
+    return route_to_vendor("get_long_short_ratio", binance_symbol, interval, limit)
+
+
+@tool
 def get_open_interest(
     symbol: Annotated[str, "Ticker in BASE-USD form, e.g. BTC-USD"],
     interval: Annotated[str, "Sampling interval: 5m / 15m / 1h / 4h / 1d"] = "1h",

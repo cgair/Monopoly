@@ -15,6 +15,7 @@ from tradingagents.dataflows import crypto_binance as cb
 
 @pytest.fixture
 def tmp_root(monkeypatch):
+    cb._AUX_CACHE.clear()
     with tempfile.TemporaryDirectory() as td:
         monkeypatch.setenv("MONOPOLY_DATA_ROOT", td)
         yield td
@@ -102,3 +103,18 @@ def test_indicator_unknown_name_does_not_crash(tmp_root):
         "symbol": "BTC-USD", "indicator": "bogus_xyz", "interval": "1h",
     })
     assert "not supported" in out or "unsupported" in out
+
+
+@pytest.mark.unit
+def test_get_long_short_ratio_normalises_symbol(tmp_root):
+    now = int(time.time() * 1000)
+    payload = [{"symbol": "BTCUSDT", "longAccount": "0.6", "shortAccount": "0.4",
+                "longShortRatio": "1.5", "timestamp": now}]
+    with patch.object(cb, "_http_get", return_value=payload) as mock:
+        out = cmt.get_long_short_ratio.invoke(
+            {"symbol": "BTC-USD", "interval": "1h", "limit": 1})
+    # Every endpoint call (global + two aux) must receive the Binance form.
+    for call in mock.call_args_list:
+        assert call.args[1]["symbol"] == "BTCUSDT"
+    assert "BTCUSDT" in out
+    assert "BTC-USD" not in out

@@ -5,6 +5,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_funding_rate,
     get_indicators,
     get_language_instruction,
+    get_long_short_ratio,
     get_market_data,
     get_open_interest,
 )
@@ -20,6 +21,7 @@ def create_market_analyst(llm):
             get_market_data,
             get_funding_rate,
             get_open_interest,
+            get_long_short_ratio,
             get_indicators,
         ]
 
@@ -31,6 +33,7 @@ def create_market_analyst(llm):
 - `get_market_data(symbol, interval, limit)` — OHLCV bars. Intervals available: 15m, 1h, 4h, 1d. Always inspect at least two intervals — a higher one (4h or 1d) for the dominant trend and a lower one (15m or 1h) for current setup.
 - `get_funding_rate(symbol, limit)` — perpetual funding history (Binance settles every 8h). Persistently positive funding signals crowded longs (mean-reversion candidate); persistent negative funding signals crowded shorts.
 - `get_open_interest(symbol, interval, limit)` — OI history. OI rising with price = trend confirmation; OI rising while price stalls = leverage building, watch for squeezes; OI falling = position unwinding.
+- `get_long_short_ratio(symbol, interval, limit)` — positioning ratios: global long/short account ratio history, latest top-trader position ratio, latest taker buy/sell volume ratio. Extreme global readings (e.g. >70% of accounts long) mark crowded positioning — a contrarian / squeeze-risk signal. Retail (global) crowding one way while top traders lean the other is a classic divergence worth flagging.
 - `get_indicators(symbol, indicator, interval, look_back_bars)` — technical indicator series on cached bars.
 
 ## Indicator menu (pick up to 8, complementary)
@@ -62,7 +65,7 @@ Pick indicators that complement each other. Do not double-count (e.g. don't pick
 
 1. **Trend context**: pull `get_market_data` on `4h` and `1d`. Identify the dominant trend.
 2. **Current setup**: pull `get_market_data` on `15m` and `1h`. Locate the current candle's relation to recent structure (support/resistance, range vs breakout).
-3. **Positioning context**: pull `get_funding_rate` and `get_open_interest` on the appropriate interval. Note any extreme funding or unusual OI behaviour.
+3. **Positioning context**: pull `get_funding_rate`, `get_open_interest`, and `get_long_short_ratio` on the appropriate interval. Note any extreme funding, unusual OI behaviour, crowded long/short readings, or retail-vs-top-trader divergence.
 4. **Indicator confirmation**: pick up to 8 indicators and pull each via `get_indicators`. Briefly justify each pick relative to the current market context.
 5. **Synthesis**: combine the above into a detailed market report. Be specific — refer to concrete price levels, indicator readings, and funding/OI numbers rather than generic descriptions like "uptrend".
 
@@ -72,6 +75,7 @@ Append a Markdown table at the end summarising:
 - timeframe trend (1d / 4h / 1h / 15m bias)
 - funding regime (long-crowded / short-crowded / neutral) with the latest rate
 - OI regime (expanding / contracting / flat)
+- positioning (global long/short account ratio + top-trader ratio, flag extremes/divergence)
 - top three actionable indicator signals with current values
 - net bias (bullish / bearish / neutral) and the strongest contradicting signal
 

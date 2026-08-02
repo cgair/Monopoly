@@ -16,6 +16,7 @@ empty too → return empty ``data`` with ``ok=False`` and a ``note``.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from datetime import datetime, timezone
@@ -23,7 +24,7 @@ from datetime import datetime, timezone
 import requests
 
 from . import crypto_cache as cache
-from .crypto_types import Bar, FundingRate, Meta, OpenInterest, Response
+from .crypto_types import Bar, FundingRate, LongShortRatio, Meta, OpenInterest, Response
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ _HTTP_RETRIES = 1   # one immediate retry; further policy lives at the agent lev
 _OHLCV_TTL = {"15m": 30, "1h": 300, "4h": 1800, "1d": 1800}
 _FUNDING_TTL = 60
 _OI_TTL = {"5m": 30, "15m": 60, "1h": 300, "4h": 1800, "1d": 1800}
+_LS_TTL = {"5m": 60, "15m": 120, "1h": 300, "4h": 1800, "1d": 1800}
 
 # Interval to milliseconds for cache window calculations.
 _INTERVAL_MS = {
@@ -332,4 +334,156 @@ def get_open_interest(symbol: str, interval: str, limit: int = 100) -> str:
     header.append("timestamp,open_interest")
     for o in resp.data:
         header.append(f"{_iso(o.timestamp)},{o.oi}")
+    return "\n".join(header)
+
+
+# ---------------------------------------------------------------------------
+# Long/short ratio (free /futures/data endpoints, no auth; ~30d history)
+# ---------------------------------------------------------------------------
+
+def _ls_id(symbol: str, interval: str, ts: int) -> str:
+    raw = f"{symbol}|{interval}|{ts}".encode()
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def _parse_long_short(symbol: str, interval: str, raw: list) -> list[LongShortRatio]:
+    """Rows: {"symbol", "longAccount", "shortAccount", "longShortRatio", "timestamp"}."""
+    out = []
+    for r in raw:
+        ts = int(r["timestamp"])
+        long_acc = float(r.get("longAccount") or 0.0)
+        short_acc = float(r.get("shortAccount") or 0.0)
+        raw_ratio = r.get("longShortRatio")
+        # `or`-fallback would treat an explicit 0 ratio as missing.
+        ratio = (float(raw_ratio) if raw_ratio not in (None, "")
+                 else (long_acc / short_acc if short_acc else 0.0))
+        out.append(LongShortRatio(
+            id=_ls_id(symbol, interval, ts),
+            symbol=symbol, interval=interval, timestamp=ts,
+            long_account=long_acc, short_account=short_acc, ratio=ratio,
+        ))
+    return out
+
+
+def _get_long_short_ratio(symbol: str, interval: str, *, limit: int = 50) -> Response[LongShortRatio]:
+    """Global long/short *account* ratio; cache-first with stale fallback."""
+    scope = f"binance:ls:{symbol}:{interval}"
+    ttl = _LS_TTL.get(interval, 300)
+    now = _now_ms()
+    interval_ms = _INTERVAL_MS.get(interval, 3_600_000)
+    since_ms = now - (limit + 2) * interval_ms
+
+    if cache.is_fresh(scope, ttl):
+        items = cache.read_long_short(symbol=symbol, interval=interval,
+                                      since_ms=since_ms, until_ms=now)
+        if items:
+            return Response(
+                data=items[-limit:],
+                meta=Meta(fetched_at=cache.get_meta(scope) or now, vendor="binance", ok=True),
+            )
+
+    try:
+        raw = _http_get("/futures/data/globalLongShortAccountRatio", {
+            "symbol": symbol.upper(), "period": interval, "limit": min(limit, 500),
+        })
+        items = _parse_long_short(symbol.upper(), interval, raw)
+        if items:
+            cache.upsert_long_short(items)
+            cache.set_meta(scope, now)
+            window = cache.read_long_short(symbol=symbol, interval=interval,
+                                           since_ms=since_ms, until_ms=now)
+            return Response(data=window[-limit:],
+                            meta=Meta(fetched_at=now, vendor="binance", ok=True))
+        note = "vendor returned empty long/short payload"
+    except requests.RequestException as exc:
+        note = f"binance long/short fetch failed: {exc}"
+        logger.warning("binance ls fetch failed for %s %s: %s", symbol, interval, exc)
+
+    stale = cache.read_long_short(symbol=symbol, interval=interval,
+                                  since_ms=since_ms, until_ms=now)
+    if stale:
+        return Response(
+            data=stale[-limit:],
+            meta=Meta(fetched_at=cache.get_meta(scope) or 0, vendor="binance",
+                      ok=True, is_stale=True, note=note),
+        )
+    return Response(data=[], meta=Meta(fetched_at=now, vendor="binance", ok=False, note=note))
+
+
+# In-process memo for the auxiliary ratio metrics: they are rendered
+# latest-rows-only (no history windowing), so a sqlite/parquet cache is
+# overkill, but repeated tool calls within one run must not re-fetch.
+_AUX_CACHE: dict[tuple, tuple[int, list]] = {}
+
+
+def _aux_ratio_lines(path: str, label: str, columns: str, symbol: str,
+                     interval: str, rows: int) -> list[str]:
+    """Fetch an auxiliary ratio metric and render its latest rows.
+
+    These metrics complement the cached global account ratio; a failure
+    here must not sink the whole report, so errors degrade to a note line.
+    """
+    key = (path, symbol.upper(), interval, rows)
+    ttl_ms = _LS_TTL.get(interval, 300) * 1000
+    cached = _AUX_CACHE.get(key)
+    if cached is not None and _now_ms() - cached[0] < ttl_ms:
+        raw = cached[1]
+    else:
+        try:
+            raw = _http_get(path, {
+                "symbol": symbol.upper(), "period": interval, "limit": rows,
+            })
+        except requests.RequestException as exc:
+            if cached is not None:
+                raw = cached[1]   # stale beats a hole in the report
+            else:
+                return [f"## {label}", f"# Note: fetch failed: {exc}"]
+        else:
+            _AUX_CACHE[key] = (_now_ms(), raw)
+    if not raw:
+        return [f"## {label}", "# Note: vendor returned empty payload"]
+    lines = [f"## {label} (latest {len(raw)})", columns]
+    for r in raw:
+        ts = _iso(int(r["timestamp"]))
+        if "buySellRatio" in r:
+            lines.append(f"{ts},{r['buySellRatio']},{r['buyVol']},{r['sellVol']}")
+        else:
+            lines.append(f"{ts},{r['longAccount']},{r['shortAccount']},{r['longShortRatio']}")
+    return lines
+
+
+def get_long_short_ratio(symbol: str, interval: str = "1h", limit: int = 50) -> str:
+    """Prompt-formatted positioning report: global account ratio history plus
+    latest top-trader position ratio and taker buy/sell volume ratio."""
+    resp = _get_long_short_ratio(symbol, interval, limit=limit)
+    sym = symbol.upper()
+    header = [
+        f"# Binance Futures long/short positioning — {sym} {interval}",
+        f"# Global account-ratio samples: {len(resp.data)} (requested {limit})",
+        f"# Fetched at: {_iso(resp.meta.fetched_at) if resp.meta.fetched_at else 'never'}"
+        f" · vendor: {resp.meta.vendor} · ok={resp.meta.ok} · stale={resp.meta.is_stale}",
+    ]
+    if resp.meta.note:
+        header.append(f"# Note: {resp.meta.note}")
+    if resp.data:
+        header.append("## Global long/short account ratio (all accounts)")
+        header.append("timestamp,long_account,short_account,ratio")
+        for x in resp.data:
+            header.append(f"{_iso(x.timestamp)},{x.long_account},{x.short_account},{x.ratio}")
+    else:
+        header.append(f"<no global long/short data available for {sym} {interval}>")
+
+    aux_rows = 10
+    header += _aux_ratio_lines(
+        "/futures/data/topLongShortPositionRatio",
+        "Top-trader long/short position ratio",
+        "timestamp,long_position,short_position,ratio",
+        sym, interval, aux_rows,
+    )
+    header += _aux_ratio_lines(
+        "/futures/data/takerlongshortRatio",
+        "Taker buy/sell volume ratio",
+        "timestamp,buy_sell_ratio,buy_vol,sell_vol",
+        sym, interval, aux_rows,
+    )
     return "\n".join(header)

@@ -48,7 +48,7 @@ class DataflowsConfigIsolationTests(unittest.TestCase):
 
         fresh = get_config()
         self.assertEqual(fresh["data_vendors"]["crypto_market_data"], "ccxt")
-        self.assertEqual(fresh["data_vendors"]["crypto_derivatives"], "coinglass")
+        self.assertEqual(fresh["data_vendors"]["crypto_derivatives"], "binance,coinglass")
         self.assertEqual(fresh["data_vendors"]["crypto_news"], "rss")
         self.assertEqual(fresh["data_vendors"]["crypto_social_reddit"], "reddit")
 

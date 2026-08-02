@@ -7,6 +7,7 @@ market-data vendor) drop in without churning callers.
 """
 
 from .crypto_binance import get_funding_rate, get_ohlcv, get_open_interest
+from .crypto_binance import get_long_short_ratio as binance_get_long_short_ratio
 from .crypto_coinglass import get_liquidations, get_long_short_ratio
 from .crypto_news import get_news
 from .crypto_reddit import get_reddit
@@ -40,7 +41,7 @@ TOOLS_CATEGORIES = {
         "tools": ["get_reddit"],
     },
     "crypto_social_twitter": {
-        "description": "Twitter / X posts for crypto symbols (placeholder; source pending)",
+        "description": "X/KOL activity relayed via newsflash desks (BlockBeats / Odaily)",
         "tools": ["get_tweets"],
     },
 }
@@ -54,7 +55,8 @@ VENDOR_METHODS = {
     "get_open_interest":      {"binance": get_open_interest},
     # crypto_derivatives
     "get_liquidations":       {"coinglass": get_liquidations},
-    "get_long_short_ratio":   {"coinglass": get_long_short_ratio},
+    "get_long_short_ratio":   {"binance": binance_get_long_short_ratio,
+                               "coinglass": get_long_short_ratio},
     # crypto_news
     "get_news":               {"rss": get_news},
     # crypto_social

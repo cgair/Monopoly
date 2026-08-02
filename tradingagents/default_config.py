@@ -24,6 +24,8 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_FUTURES_COOLDOWN_MINUTES":          "futures_cooldown_after_loss_minutes",
     "TRADINGAGENTS_FUTURES_MAX_CONCURRENT_POSITIONS":  "futures_max_concurrent_positions",
     "TRADINGAGENTS_FUTURES_STARTING_EQUITY_USD":       "futures_starting_equity_usd",
+    "TRADINGAGENTS_FUTURES_MACRO_WARN_HOURS":          "futures_macro_warn_hours",
+    "TRADINGAGENTS_FUTURES_MACRO_BLOCK_HOURS":         "futures_macro_block_hours",
 }
 
 
@@ -93,7 +95,11 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Monopoly fork: crypto perpetual futures data vendors
     "data_vendors": {
         "crypto_market_data": "binance",         # OHLCV / funding rate / open interest
-        "crypto_derivatives": "coinglass",       # liquidations / long-short ratio
+        # binance first: free unauth long/short endpoints; coinglass remains the
+        # only liquidations vendor (needs COINGLASS_API_KEY, wait-and-see — PLAN.md T9).
+        # Fallback only fires on VendorRateLimitError, so with a Coinglass key
+        # prefer it explicitly: tool_vendors={"get_long_short_ratio": "coinglass"}.
+        "crypto_derivatives": "binance,coinglass",
         "crypto_news": "rss",                    # CoinDesk + CoinTelegraph RSS
         "crypto_social_reddit": "reddit",        # crypto subreddits
         "crypto_social_twitter": "twitter",      # placeholder (data source pending)
@@ -117,6 +123,11 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "futures_cooldown_after_loss_minutes": 60,
     "futures_max_concurrent_positions": 2,        # matches the BTC + ETH scope
     "futures_starting_equity_usd": 1000.0,        # used when state doesn't carry live equity yet
+    # Macro-event calendar (ForexFactory, free). Warn hours feed the PM
+    # prompt advisory (L1); block hours arm a hard gate rejection (L3,
+    # default off — enable only if testnet reviews show macro-window losses).
+    "futures_macro_warn_hours": 12.0,
+    "futures_macro_block_hours": 0.0,
     # Optional override for the risk-gate state file (JSONL event log).
     # ``None`` → ~/.tradingagents/risk_gate_state.jsonl
     "futures_risk_state_path": os.getenv("TRADINGAGENTS_RISK_GATE_STATE_PATH"),

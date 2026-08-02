@@ -1,6 +1,6 @@
 # Monopoly 开发计划(PLAN.md)
 
-- **更新**: 2026-08-02(**T9–T11 完成**,533 passed;新增 T12/T13 对账加固任务卡待做;此前 2026-07-19 T0–T7 全部完成;剩:用户在 Mac mini 配 OpenClaw+Discord、T12、T3b(可选);Hermes 与 T8 均搁置/观察)
+- **更新**: 2026-08-02(**T12 代码+单测完成**,559 passed;剩 T12 的 2 项 testnet 实测(操作步骤见任务卡注记,等用户确认后实弹)、用户在 Mac mini 配 OpenClaw+Discord、T13/T3b(可选);此前同日 T9–T11 完成;Hermes 与 T8 均搁置/观察)
 - **来源**: `~/Desktop/AI/become rich/docs/monopoly-spec.md` §3 / §5 / §8 + 工作区未提交改动盘点
 - **用法**: 每个任务设计为可由一个独立 Claude Code 实例(worktree 或新会话)冷启动执行。
   开工前先读任务卡里的「上下文锚点」,完成后勾选并在 spec §8 追加恢复点。
@@ -28,7 +28,8 @@ T0 ✅ ── T1 ✅ ── T2 ✅ ── T3 ✅ ── T4 ✅ ── T5 ✅ ─
       T11 ✅ 经济日历(ForexFactory)→ PM 警示 + gate 可选硬拒(默认关)
 
 新增(2026-07-31,对账闭环加固,QuantDinger 调研引出):
-      T12 对账闭环补全:intent 先行落盘 + 反向对账 + 真实 PnL 回填(P1,mainnet 前置)
+      T12 ✅ 对账闭环补全:intent 先行落盘 + 反向对账 + 真实 PnL 回填(P1,mainnet 前置)
+          (2026-08-02 代码+单测完成;剩 2 项 testnet 实测待用户确认后实弹,见任务卡)
       T13 单写者锁:monitor 与 graph run 并发防护(P3,可选)
 ```
 
@@ -367,7 +368,26 @@ env 开启硬拒后 gate 拒绝并写审计事件;真实拉取一次确认 schem
 
 ---
 
-## T12 — 对账闭环补全:intent 先行落盘 + 反向对账 + 真实 PnL 回填(2026-07-31 新增)
+## T12 — 对账闭环补全:intent 先行落盘 + 反向对账 + 真实 PnL 回填 ✅ 代码完成(2026-08-02)
+
+> **实现(2026-08-02,559 passed)**:
+> ① write-ahead:`executor.py` 新增 `execute_with_ledger()`——`place_order()` 前落盘
+> `order_submitted`,之后写配对结果事件(`position_opened` 增补 side/entry_price/quantity/
+> stop_loss/take_profit;失败路径 `trade_skipped` 带 intent_id);graph 节点与 CLI
+> `trade_execute` 共用(顺带修好 CLI 路径失败/naked 不写事件的旧缺口)。
+> ② `derive_state` 产出 `dangling_intents`(submitted 超 5min 无结果事件,
+> `TRADINGAGENTS_FUTURES_DANGLING_INTENT_MINUTES` 可配);gate 第 7.5 步保守拒
+> (`REASON_DANGLING_INTENT`,reason 带 intent_id)。`position_untracked` 计入并发数。
+> ③ monitor 三段对账:正向(本地开→交易所关,`futures_income_history` 回填真实 pnl,
+> outcome 由 pnl 反推成交价近邻判定 stop/tp/manual,1% 容差;老格式事件按 pnl 符号降级:
+> 亏→stop 保守触发 cooldown);反向(交易所有仓本地无:同 symbol dangling → 领养沿用
+> intent_id,无匹配 → `position_untracked` + alerts CRITICAL);消解(dangling 无仓:
+> income 有 pnl → 补写 open+close 对,无 → intent 带 id 的 trade_skipped;income 拉取
+> 失败 → 保持 dangling,gate 继续关闸)。income 失败的平仓记 `pnl_backfill_failed=true`
+> → alerts WARN。顺手修:`alerts.py`/`approval.py` 逐字段重建 config 丢新字段的 bug
+> (改 `dataclasses.replace`,T11 的 macro_block_hours 也曾被 approval 路径丢掉)。
+> **剩余 2 项 testnet 实测**(操作步骤已交用户,确认后实弹):UI 手动开仓 → untracked
+> 告警;真实止损 → 非零 pnl + outcome=stop + cooldown 拒新开仓。
 
 **优先级**: P1(**mainnet 前置条件**——三个缺口都属于「资金在交易所、本地失明」类风险)
 **触碰文件**: `futures/risk_state.py`、`futures/executor.py`、`futures/position_monitor.py`、
@@ -411,10 +431,12 @@ env 开启硬拒后 gate 拒绝并写审计事件;真实拉取一次确认 schem
    累计;income 失败降级路径;老格式事件(无新字段)回放兼容。
 
 **验收**:
-- 测试注入「place_order 成功但跳过 append_event」→ 下次 monitor run 后 JSONL 与交易所
-  一致、gate 计数正确。
-- testnet 实测:UI 手动开一笔仓 → monitor 检出 `position_untracked` + Discord 告警。
-- testnet 实测:止损触发的平仓,对账事件带非零 `pnl_usd`、`outcome=stop`,其后 60min 内
+- ~~测试注入「place_order 成功但跳过 append_event」→ 下次 monitor run 后 JSONL 与交易所
+  一致、gate 计数正确。~~ ✅ `tests/test_futures_t12_reconciliation.py`(24 个场景测试,
+  fake adapter 全离线)。
+- [ ] testnet 实测:UI 手动开一笔仓 → monitor 检出 `position_untracked` + 告警(alerts
+  CRITICAL 退出码 2;Discord 推送仍是 alerts.py 的 TODO,现阶段看 JSON 输出)。
+- [ ] testnet 实测:止损触发的平仓,对账事件带非零 `pnl_usd`、`outcome=stop`,其后 60min 内
   新开仓被 cooldown 拒绝(写 `trade_skipped`)。
 
 **明确不做**(QuantDinger 调研中评估后放弃):Postgres / Celery / 多进程 worker、

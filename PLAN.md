@@ -434,8 +434,11 @@ env 开启硬拒后 gate 拒绝并写审计事件;真实拉取一次确认 schem
 - ~~测试注入「place_order 成功但跳过 append_event」→ 下次 monitor run 后 JSONL 与交易所
   一致、gate 计数正确。~~ ✅ `tests/test_futures_t12_reconciliation.py`(24 个场景测试,
   fake adapter 全离线)。
-- [ ] testnet 实测:UI 手动开一笔仓 → monitor 检出 `position_untracked` + 告警(alerts
+- [x] testnet 实测:UI 手动开一笔仓 → monitor 检出 `position_untracked` + 告警(alerts
   CRITICAL 退出码 2;Discord 推送仍是 alerts.py 的 TODO,现阶段看 JSON 输出)。
+  ✅ 2026-08-02 实弹通过:demo.binance.com(与 testnet API 同账户,余额比对确认)手动开
+  BTCUSDT 0.002 → untracked 检出/告警/不重复/gate 计数全对;手动平仓后对账回填**真实
+  pnl -0.0382**(income history),小亏无止损价比对 → 保守标 `stop` 武装 cooldown(预期内)。
 - [ ] testnet 实测:止损触发的平仓,对账事件带非零 `pnl_usd`、`outcome=stop`,其后 60min 内
   新开仓被 cooldown 拒绝(写 `trade_skipped`)。
 

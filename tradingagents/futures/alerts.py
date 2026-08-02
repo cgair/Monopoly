@@ -33,7 +33,7 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -85,6 +85,15 @@ class AlertConfig:
     consecutive_stop_threshold: int = 3
     """N consecutive position_closed with outcome=stop triggers WARN. 0 = disabled."""
 
+    untracked_position_threshold: int = 1
+    """If any position_untracked events appear, raise CRITICAL — the
+    exchange holds a position the local log couldn't account for
+    (manual open or unexplained fill). 0 = disabled."""
+
+    pnl_backfill_failure_threshold: int = 1
+    """If any position_closed carries pnl_backfill_failed=true, raise WARN —
+    drawdown/cooldown are blind to that close's real P&L. 0 = disabled."""
+
     state_path: Optional[Path] = None
     """Path to risk_gate_state.jsonl. CLI --state-path overrides env."""
 
@@ -97,6 +106,8 @@ class AlertConfig:
             naked_position_threshold=_get_env_int("TRADINGAGENTS_FUTURES_ALERT_NAKED_POSITION_THRESHOLD", 1),
             executor_error_threshold=_get_env_int("TRADINGAGENTS_FUTURES_ALERT_EXECUTOR_ERROR_THRESHOLD", 5),
             consecutive_stop_threshold=_get_env_int("TRADINGAGENTS_FUTURES_ALERT_CONSECUTIVE_STOP_THRESHOLD", 3),
+            untracked_position_threshold=_get_env_int("TRADINGAGENTS_FUTURES_ALERT_UNTRACKED_POSITION_THRESHOLD", 1),
+            pnl_backfill_failure_threshold=_get_env_int("TRADINGAGENTS_FUTURES_ALERT_PNL_BACKFILL_FAILURE_THRESHOLD", 1),
             state_path=Path(p) if (p := os.getenv("TRADINGAGENTS_RISK_GATE_STATE_PATH")) else None,
         )
 
@@ -206,6 +217,8 @@ class EventStats:
     total_events: int = 0
     gate_rejections: dict = field(default_factory=dict)  # reason -> count
     position_naked_count: int = 0
+    position_untracked_count: int = 0
+    pnl_backfill_failures: int = 0
     executor_errors: list[str] = field(default_factory=list)  # runs of consecutive stop-closes
     consecutive_stops: list[int] = field(default_factory=list)  # runs of consecutive stop-closes
 
@@ -271,8 +284,14 @@ def analyze_events(
                 stats.position_naked_count += 1
                 consecutive_stop_run = 0  # Reset
 
+            # Untracked exchange position (monitor's reverse reconciliation)
+            elif event_type == "position_untracked":
+                stats.position_untracked_count += 1
+
             # Position closed
             elif event_type == "position_closed":
+                if event.get("pnl_backfill_failed"):
+                    stats.pnl_backfill_failures += 1
                 if event.get("outcome") == "stop":
                     consecutive_stop_run += 1
                 else:
@@ -329,6 +348,27 @@ def evaluate_alerts(stats: EventStats, config: AlertConfig) -> AlertReport:
             f"CRITICAL: Naked position event(s) detected ({stats.position_naked_count}). "
             "Manual intervention required.",
             {"count": stats.position_naked_count},
+        ))
+
+    # 2b. Untracked exchange position (same severity as naked — the
+    # exchange holds risk the local log couldn't account for)
+    if config.untracked_position_threshold > 0 and stats.position_untracked_count >= config.untracked_position_threshold:
+        level = AlertLevel.CRITICAL
+        findings.append(Finding(
+            f"CRITICAL: Untracked exchange position(s) detected ({stats.position_untracked_count}). "
+            "No local record and no dangling intent — manual intervention required.",
+            {"count": stats.position_untracked_count},
+        ))
+
+    # 2c. P&L backfill failures (data gap: drawdown/cooldown blind to a close)
+    if config.pnl_backfill_failure_threshold > 0 and stats.pnl_backfill_failures >= config.pnl_backfill_failure_threshold:
+        if level != AlertLevel.CRITICAL:
+            level = AlertLevel.WARN
+        findings.append(Finding(
+            f"P&L backfill failed for {stats.pnl_backfill_failures} close(s): "
+            "recorded with pnl_usd=0.0/outcome=unknown — daily drawdown and "
+            "cooldown did not see the real result.",
+            {"count": stats.pnl_backfill_failures},
         ))
 
     # 3. Executor error threshold
@@ -397,24 +437,10 @@ def main(args: Optional[list[str]] = None, now: Optional[datetime] = None) -> in
 
     # Override with CLI args
     if parsed.window_hours is not None:
-        config = AlertConfig(
-            window_hours=parsed.window_hours,
-            rejection_threshold=config.rejection_threshold,
-            naked_position_threshold=config.naked_position_threshold,
-            executor_error_threshold=config.executor_error_threshold,
-            consecutive_stop_threshold=config.consecutive_stop_threshold,
-            state_path=config.state_path,
-        )
+        config = replace(config, window_hours=parsed.window_hours)
 
     if parsed.state_path is not None:
-        config = AlertConfig(
-            window_hours=config.window_hours,
-            rejection_threshold=config.rejection_threshold,
-            naked_position_threshold=config.naked_position_threshold,
-            executor_error_threshold=config.executor_error_threshold,
-            consecutive_stop_threshold=config.consecutive_stop_threshold,
-            state_path=Path(parsed.state_path),
-        )
+        config = replace(config, state_path=Path(parsed.state_path))
 
     # Load events and analyze
     state_path = config.resolved_state_path()

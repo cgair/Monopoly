@@ -179,10 +179,12 @@ class TestReconcilePositions:
             },
         )
 
-        # Mock exchange returns empty (position closed)
+        # Mock exchange returns empty (position closed); income history
+        # reports a loss → sign-based inference (old-format event) → stop.
         mock_ex = Mock()
         mock_ex.get_open_positions.return_value = {}
         mock_ex.cancel_all_basic_orders.return_value = True
+        mock_ex.get_realized_pnl.return_value = -25.0
 
         result = reconcile_positions(temp_jsonl, mock_ex, now=NOW)
 
@@ -191,13 +193,14 @@ class TestReconcilePositions:
         assert result.positions_closed == 1
         assert result.orphan_basic_orders_cancelled == 1
 
-        # Verify position_closed event was written
+        # Verify position_closed event was written with the real P&L
         events = load_events(temp_jsonl)
         closed_events = [e for e in events if e.get("type") == "position_closed"]
         assert len(closed_events) == 1
         assert closed_events[0]["symbol"] == "BTC-USD"
         assert closed_events[0]["intent_id"] == "intent-1"
-        assert closed_events[0]["outcome"] == "stop"  # Default inference
+        assert closed_events[0]["pnl_usd"] == -25.0
+        assert closed_events[0]["outcome"] == "stop"  # loss → conservative stop
 
         # Verify cancel was called
         mock_ex.cancel_all_basic_orders.assert_called_once_with("BTCUSDT")
@@ -229,6 +232,7 @@ class TestReconcilePositions:
         mock_ex = Mock()
         mock_ex.get_open_positions.return_value = {"ETHUSDT": {"symbol": "ETHUSDT"}}
         mock_ex.cancel_all_basic_orders.return_value = True
+        mock_ex.get_realized_pnl.return_value = 0.0
 
         result = reconcile_positions(temp_jsonl, mock_ex, now=NOW)
 
@@ -268,6 +272,7 @@ class TestReconcilePositions:
         )
 
         mock_ex = Mock()
+        mock_ex.get_open_positions.return_value = {}
         result = reconcile_positions(temp_jsonl, mock_ex, now=NOW)
 
         assert result.positions_checked == 0  # BTC was already closed
@@ -298,6 +303,7 @@ class TestReconcilePositions:
         mock_ex = Mock()
         mock_ex.get_open_positions.return_value = {}
         mock_ex.cancel_all_basic_orders.return_value = True
+        mock_ex.get_realized_pnl.return_value = 0.0
 
         # Only check BTC
         result = reconcile_positions(
@@ -362,6 +368,7 @@ class TestReconcilePositions:
         mock_ex.get_open_positions.return_value = {}
         # BTC cancel succeeds, ETH cancel fails
         mock_ex.cancel_all_basic_orders.side_effect = [True, False]
+        mock_ex.get_realized_pnl.return_value = 0.0
 
         result = reconcile_positions(temp_jsonl, mock_ex, now=NOW)
 
@@ -419,6 +426,7 @@ class TestReconcilePositions:
         mock_ex = Mock()
         mock_ex.get_open_positions.return_value = {}
         mock_ex.cancel_all_basic_orders.return_value = True
+        mock_ex.get_realized_pnl.return_value = 0.0
 
         result = reconcile_positions(temp_jsonl, mock_ex)  # No explicit now
 
@@ -461,6 +469,7 @@ class TestReconcileIntegration:
         mock_ex = Mock()
         mock_ex.get_open_positions.return_value = {}
         mock_ex.cancel_all_basic_orders.return_value = True
+        mock_ex.get_realized_pnl.return_value = 0.0
 
         result = reconcile_positions(temp_jsonl, mock_ex, now=NOW)
 
@@ -587,6 +596,7 @@ class TestAlgoOrderCancellation:
         mock_ex.get_open_positions.return_value = {}
         mock_ex.cancel_all_basic_orders.return_value = True
         mock_ex.cancel_all_algo_orders.return_value = 1  # 1 algo order cancelled
+        mock_ex.get_realized_pnl.return_value = 0.0
 
         result = reconcile_positions(temp_jsonl, mock_ex, now=NOW)
 

@@ -1,4 +1,4 @@
-"""Position monitor — reconciles Binance and local state.
+"""Position monitor — reconciles Binance and local state, both directions.
 
 When a stop-loss or take-profit order triggers on Binance, the position is
 closed on the exchange but the local risk_gate_state.jsonl does not
@@ -9,37 +9,46 @@ automatically record the closure. This creates two problems:
 2. **Orphan orders** — the unused stop or TP order (whichever didn't
    trigger) accumulates on the exchange, eventually causing -4130 errors.
 
+The reverse direction matters too (T12): if the process died between the
+exchange fill and the local ``position_opened`` append, the exchange holds
+a position the JSONL knows nothing about. The executor's write-ahead
+``order_submitted`` event marks these as *dangling intents* — the gate
+blocks new entries until this monitor resolves them against live state.
+
 **Design**: independent of LangGraph, designed for periodic execution
 (launchd job or pre-step hook). Polls Binance testnet position information,
-diffs against the JSONL, and:
+diffs against the JSONL in both directions, and:
 
-- Writes a ``position_closed`` event for positions closed on the exchange.
-- Infers the closure mode (stop / tp / manual / unknown) from available signals.
-- Cancels orphaned Basic orders via ``futures_cancel_all_open_orders``.
-- Logs and fails loud on algo order orphans (T2 dependency: algo cancel API).
+- Writes a ``position_closed`` event for positions closed on the exchange,
+  with real P&L backfilled from ``futures_income_history`` and the closure
+  mode (stop / tp / manual / unknown) inferred from the opening event's
+  stop/TP prices.
+- Adopts exchange positions that match a dangling intent (``position_opened``
+  with the original ``intent_id``), and flags ones that match nothing as
+  ``position_untracked`` — both count toward the gate's concurrency cap;
+  untracked ones additionally raise a critical alert (see futures/alerts.py).
+- Dismisses dangling intents with no exchange position and no realized
+  P&L (the submit never filled) via an intent-resolving ``trade_skipped``.
+- Cancels orphaned Basic and algo orders.
 
 Dryrun mode: reads JSONL, mocks exchange state, no network.
-
-Module docstring follows the pattern of futures/executor.py:
-- design motivation up-front
-- public API second
-- implementation details last
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
 from tradingagents.agents.utils.symbol_utils import to_binance_symbol
 from tradingagents.futures.risk_state import (
+    DEFAULT_DANGLING_INTENT_MINUTES,
+    _parse_ts,
     append_event,
     default_state_path,
     load_events,
-    utcnow_iso,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +71,22 @@ class MonitorResult:
     orphan_basic_orders_cancelled: int
     orphan_algo_orders_pending: int
     """Algo orders that need T2 cancel API (deferred)."""
+
+    positions_adopted: int = 0
+    """Exchange positions matched to a dangling intent and recorded as
+    ``position_opened`` with the original intent_id."""
+
+    untracked_found: int = 0
+    """Exchange positions with no local record and no dangling intent —
+    recorded as ``position_untracked`` (manual attention required)."""
+
+    dangling_dismissed: int = 0
+    """Dangling intents resolved as never-filled (no exchange position,
+    no realized P&L) via an intent-resolving ``trade_skipped``."""
+
+    pnl_backfill_failures: int = 0
+    """Closes recorded with pnl_usd=0.0 / outcome=unknown because the
+    income-history fetch failed — the data gap is flagged on the event."""
 
     error: Optional[str] = None
 
@@ -118,16 +143,26 @@ class ExchangeAdapter(Protocol):
 
     def cancel_all_algo_orders(self, symbol: str) -> int:
         """Cancel all algo orders for a symbol.
-        
+
         Parameters
         ----------
         symbol
             Trading symbol (e.g. ``"BTCUSDT"``).
-            
+
         Returns
         -------
         int
             Number of orders cancelled. Returns 0 on failure.
+        """
+        ...
+
+    def get_realized_pnl(self, symbol: str, start_time_ms: int) -> Optional[float]:
+        """Sum of realized P&L for ``symbol`` since ``start_time_ms``.
+
+        Wraps ``futures_income_history`` (incomeType=REALIZED_PNL) on the
+        live adapter. Returns ``None`` when the fetch fails — callers must
+        degrade to pnl_usd=0.0 / outcome=unknown and flag the data gap
+        (never silently).
         """
         ...
 
@@ -161,6 +196,10 @@ class DryrunExchange:
     def cancel_all_algo_orders(self, symbol: str) -> int:
         self.cancelled_symbols.add(symbol)
         return 0  # Mock: no orders to cancel in dryrun
+
+    def get_realized_pnl(self, symbol: str, start_time_ms: int) -> Optional[float]:
+        # No real trades happen in dryrun; realized P&L is always zero.
+        return 0.0
 
 
 
@@ -242,6 +281,25 @@ class TestnetExchange:
             logger.error("Failed to cancel all algo orders for %s: %s", symbol, exc)
             return 0
 
+    def get_realized_pnl(self, symbol: str, start_time_ms: int) -> Optional[float]:
+        """Sum REALIZED_PNL income entries for ``symbol`` since ``start_time_ms``.
+
+        With one position per symbol at a time (one-way mode, 2-symbol
+        scope), the sum over the window since the open is exactly this
+        position's realized P&L.
+        """
+        try:
+            entries = self.client.futures_income_history(
+                symbol=symbol,
+                incomeType="REALIZED_PNL",
+                startTime=start_time_ms,
+                limit=1000,
+            )
+            return sum(float(e.get("income", 0.0)) for e in entries)
+        except Exception as exc:
+            logger.error("Failed to fetch income history for %s: %s", symbol, exc)
+            return None
+
 
 
 # ---------------------------------------------------------------------------
@@ -254,28 +312,86 @@ def _symbol_from_state(state_ticker: str) -> str:
     return to_binance_symbol(state_ticker)
 
 
-def _infer_close_outcome(
-    open_event: dict,
-    binance_positions: dict[str, dict],
-    binance_symbol: str,
-) -> str:
-    """Infer closure mode (stop / tp / manual / unknown).
+def _state_symbol_from_binance(binance_symbol: str) -> str:
+    """Reverse of :func:`to_binance_symbol` (``"BTCUSDT"`` → ``"BTC-USD"``).
 
-    Heuristic:
-    - If the position exists in Binance but with a different sign
-      (long → short or vice versa), it was likely manually reversed.
-    - If neither, assume stop or TP (we can't tell which without
-      checking actual order history).
-    - Default to "unknown" if any information is missing.
+    Needed for exchange-only positions, which arrive keyed by Binance
+    symbol but must be logged in the state-ticker convention.
     """
-    # For now, we infer "stop" when we can't determine otherwise.
-    # A real implementation would query order history or event logs.
-    if binance_symbol in binance_positions:
-        # Position exists but closed locally — possible reversal.
-        # For now, default to "unknown" to be conservative.
-        return "unknown"
-    # Position closed; assume stop or TP (we check order state in T2).
-    return "stop"
+    s = binance_symbol.strip().upper()
+    if s.endswith("USDT") and len(s) > 4:
+        return f"{s[:-4]}-USD"
+    return s
+
+
+def _ts_to_ms(ts_str: str) -> int:
+    return int(_parse_ts(ts_str).timestamp() * 1000)
+
+
+_OUTCOME_PRICE_TOLERANCE = 0.01
+"""Relative distance within which the derived close price must land on
+the stop / TP to claim that outcome; farther than this from both → manual."""
+
+
+def _infer_close_outcome(open_event: dict, pnl_usd: float) -> str:
+    """Infer closure mode (stop / tp / manual / unknown) from real P&L.
+
+    New-format opening events (T12) carry ``side`` / ``entry_price`` /
+    ``quantity`` / ``stop_loss`` / ``take_profit``, so the close price can
+    be derived from the realized P&L and nearest-neighbour matched against
+    the stop / TP prices. Old-format events lack those fields — fall back
+    to the P&L sign: a loss is treated as a stop-out (conservative: it
+    arms the cooldown), a gain as a manual/TP close (indistinguishable),
+    zero as unknown.
+    """
+    entry = open_event.get("entry_price")
+    qty = open_event.get("quantity")
+    side = open_event.get("side")
+    stop = open_event.get("stop_loss")
+
+    if entry and qty and side in ("BUY", "SELL") and stop:
+        close = entry + pnl_usd / qty if side == "BUY" else entry - pnl_usd / qty
+        candidates = [("stop", float(stop))]
+        tp = open_event.get("take_profit")
+        if tp:
+            candidates.append(("tp", float(tp)))
+        outcome, price = min(candidates, key=lambda c: abs(close - c[1]))
+        if abs(close - price) <= _OUTCOME_PRICE_TOLERANCE * abs(close):
+            return outcome
+        return "manual"
+
+    if pnl_usd < 0:
+        return "stop"
+    if pnl_usd > 0:
+        return "manual"
+    return "unknown"
+
+
+def _backfill_close_pnl(
+    exchange: ExchangeAdapter,
+    binance_symbol: str,
+    open_event: dict,
+) -> tuple[float, str, bool]:
+    """Return ``(pnl_usd, outcome, backfill_failed)`` for a detected close.
+
+    Real P&L comes from the exchange income history over the window since
+    the opening event. A failed fetch degrades to ``(0.0, "unknown",
+    True)`` — the caller flags the event so the data gap is visible to
+    the alerts layer instead of silently deflating the drawdown counter.
+    """
+    try:
+        start_ms = _ts_to_ms(open_event["ts"])
+    except (KeyError, ValueError):
+        start_ms = 0
+    pnl = exchange.get_realized_pnl(binance_symbol, start_ms)
+    if pnl is None:
+        logger.error(
+            "P&L backfill failed for %s — recording pnl_usd=0.0/outcome=unknown; "
+            "daily drawdown and cooldown are blind to this close",
+            binance_symbol,
+        )
+        return 0.0, "unknown", True
+    return pnl, _infer_close_outcome(open_event, pnl), False
 
 
 def reconcile_positions(
@@ -284,8 +400,9 @@ def reconcile_positions(
     *,
     symbol_filter: Optional[list[str]] = None,
     now: Optional[datetime] = None,
+    dangling_intent_minutes: float = DEFAULT_DANGLING_INTENT_MINUTES,
 ) -> MonitorResult:
-    """Poll the exchange and reconcile open positions into the JSONL log.
+    """Poll the exchange and reconcile positions with the JSONL, both ways.
 
     Parameters
     ----------
@@ -294,37 +411,67 @@ def reconcile_positions(
     exchange
         Exchange adapter (testnet or dryrun).
     symbol_filter
-        If set, only reconcile these symbols (e.g. ``["BTCUSDT"]``).
+        If set, only reconcile these state symbols (e.g. ``["BTC-USD"]``).
         Useful for testing a single pair.
     now
         Current UTC time. Defaults to ``datetime.now(timezone.utc)``.
         Tests should pass an explicit value for determinism.
+    dangling_intent_minutes
+        Only ``order_submitted`` events older than this are reconciled;
+        younger ones are assumed in-flight in a live run (the same
+        threshold the gate uses, so monitor and gate agree on what
+        "dangling" means).
 
-    Returns
-    -------
-    MonitorResult
-        Summary of the run: positions checked/closed, orders cancelled, errors.
+    Three passes:
 
-    Side effects:
-    - Appends ``position_closed`` events to the JSONL.
-    - Calls ``exchange.cancel_all_basic_orders()`` for each symbol.
+    1. **Forward** — locally open, gone on the exchange → ``position_closed``
+       with real P&L from income history + outcome inference; cancel
+       orphaned Basic/algo orders.
+    2. **Reverse** — on the exchange, unknown locally → adopt into
+       ``position_opened`` when a dangling intent matches the symbol,
+       else record ``position_untracked`` (alerts layer escalates).
+    3. **Dismissal** — dangling intents with no exchange position: if the
+       income history shows realized P&L since the submit, the position
+       opened *and* closed while we were blind → backfill an opened +
+       closed pair; otherwise the submit never filled → resolve with an
+       intent-carrying ``trade_skipped``. A failed income fetch leaves the
+       intent dangling (gate stays closed) rather than guessing.
     """
     if now is None:
         now = datetime.now(timezone.utc)
+    # Events written this run are stamped with ``now`` so tests injecting a
+    # fixed clock get a consistent JSONL (write-time == reconcile-time).
+    now_iso = now.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
-    # Load current state from JSONL.
+    # Load current state from JSONL. position_untracked counts as an open
+    # marker: it holds a gate-concurrency slot and must not be re-reported
+    # on every monitor run.
     events = load_events(jsonl_path)
-    open_by_symbol: dict[str, dict] = {}  # symbol -> last position_opened event
+    open_by_symbol: dict[str, dict] = {}  # state symbol -> last opening event
+    submitted: dict[str, dict] = {}       # intent_id -> order_submitted event
+    resolved_intents: set[str] = set()
     for ev in events:
-        if ev.get("type") == "position_opened":
-            symbol = ev.get("symbol")
+        ev_type = ev.get("type")
+        symbol = ev.get("symbol")
+        intent_id = ev.get("intent_id")
+        if ev_type == "order_submitted":
+            if intent_id:
+                submitted[intent_id] = ev
+            continue
+        if intent_id:
+            resolved_intents.add(intent_id)
+        if ev_type in ("position_opened", "position_untracked"):
             if symbol:
                 open_by_symbol[symbol] = ev
-        elif ev.get("type") == "position_closed":
-            # Remove from open tracking.
-            symbol = ev.get("symbol")
+        elif ev_type == "position_closed":
             if symbol in open_by_symbol:
                 del open_by_symbol[symbol]
+
+    cutoff = now - timedelta(minutes=dangling_intent_minutes)
+    dangling: dict[str, dict] = {
+        intent_id: ev for intent_id, ev in submitted.items()
+        if intent_id not in resolved_intents and _parse_ts(ev["ts"]) <= cutoff
+    }
 
     # Fetch live positions from the exchange.
     try:
@@ -347,35 +494,43 @@ def reconcile_positions(
     positions_closed = 0
     orphan_basic_cancelled = 0
     orphan_algo_pending = 0
+    positions_adopted = 0
+    untracked_found = 0
+    dangling_dismissed = 0
+    pnl_backfill_failures = 0
 
+    # ----- Pass 1: forward — locally open, closed on the exchange. -----
     for state_symbol in symbols_to_check:
         binance_symbol = _symbol_from_state(state_symbol)
         open_event = open_by_symbol[state_symbol]
 
         if binance_symbol not in binance_positions:
-            # Position closed on Binance but open in JSONL.
-            outcome = _infer_close_outcome(
-                open_event, binance_positions, binance_symbol,
+            pnl_usd, outcome, backfill_failed = _backfill_close_pnl(
+                exchange, binance_symbol, open_event,
             )
             close_event = {
                 "type": "position_closed",
-                "ts": utcnow_iso(),
+                "ts": now_iso,
                 "intent_id": open_event.get("intent_id", "unknown"),
                 "symbol": state_symbol,
-                "pnl_usd": 0.0,  # We don't compute actual P&L here; that's executor's job.
+                "pnl_usd": pnl_usd,
                 "outcome": outcome,
             }
+            if backfill_failed:
+                close_event["pnl_backfill_failed"] = True
+                pnl_backfill_failures += 1
             append_event(jsonl_path, close_event)
             positions_closed += 1
             logger.info(
-                "Reconciled closed position: %s (outcome=%s)",
-                state_symbol, outcome,
+                "Reconciled closed position: %s (outcome=%s, pnl_usd=%.2f)",
+                state_symbol, outcome, pnl_usd,
             )
 
             # Cancel orphaned orders for this symbol.
             # Basic orders (MARKET, LIMIT, STOP_MARKET/TAKE_PROFIT_MARKET on some systems)
             # can be cancelled via futures_cancel_all_open_orders. Algo orders
-            # (STOP_MARKET/TAKE_PROFIT_MARKET on algo-order systems) need T2.
+            # (STOP_MARKET/TAKE_PROFIT_MARKET on algo-order systems) go through
+            # the adapter's algo-cancel endpoints.
             if exchange.cancel_all_basic_orders(binance_symbol):
                 # TODO: count how many orders were actually cancelled
                 # (Binance API doesn't return count; we'd need to fetch
@@ -399,12 +554,147 @@ def reconcile_positions(
                     binance_symbol, exc,
                 )
 
+    # ----- Pass 2: reverse — on the exchange, unknown locally. -----
+    local_binance_symbols = {_symbol_from_state(s) for s in open_by_symbol}
+    for binance_symbol, position in binance_positions.items():
+        if binance_symbol in local_binance_symbols:
+            continue
+        state_symbol = _state_symbol_from_binance(binance_symbol)
+        if symbol_filter and state_symbol not in symbol_filter:
+            continue
+
+        position_amt = float(position.get("positionAmt", 0.0))
+        entry_price = float(position.get("entryPrice", 0.0))
+
+        # Adopt when a dangling intent matches the symbol (the write-ahead
+        # proves we submitted this order and died before recording the
+        # result). Pick the most recent match if several dangle.
+        match_id = None
+        for intent_id, sub_ev in dangling.items():
+            try:
+                if _symbol_from_state(sub_ev.get("symbol", "")) != binance_symbol:
+                    continue
+            except ValueError:
+                continue
+            if match_id is None or sub_ev["ts"] > dangling[match_id]["ts"]:
+                match_id = intent_id
+
+        if match_id is not None:
+            sub_ev = dangling.pop(match_id)
+            append_event(jsonl_path, {
+                "type": "position_opened",
+                "ts": now_iso,
+                "intent_id": match_id,
+                "symbol": sub_ev.get("symbol", state_symbol),
+                "adopted": True,
+                "side": "BUY" if position_amt > 0 else "SELL",
+                "entry_price": entry_price,
+                "quantity": abs(position_amt),
+                "stop_loss": sub_ev.get("stop_loss"),
+                "take_profit": sub_ev.get("take_profit"),
+            })
+            positions_adopted += 1
+            logger.warning(
+                "Adopted exchange position %s from dangling intent %s — "
+                "protective stop/TP placement is unverified, check the exchange",
+                binance_symbol, match_id,
+            )
+        else:
+            append_event(jsonl_path, {
+                "type": "position_untracked",
+                "ts": now_iso,
+                "symbol": state_symbol,
+                "binance_symbol": binance_symbol,
+                "quantity": position_amt,
+                "entry_price": entry_price,
+            })
+            untracked_found += 1
+            logger.error(
+                "UNTRACKED position on exchange: %s (amt=%s, entry=%s) — "
+                "no local record and no dangling intent; manual intervention required",
+                binance_symbol, position_amt, entry_price,
+            )
+
+    # ----- Pass 3: dismiss dangling intents with no exchange position. -----
+    for intent_id, sub_ev in list(dangling.items()):
+        try:
+            binance_symbol = _symbol_from_state(sub_ev.get("symbol", ""))
+        except ValueError:
+            binance_symbol = None
+        if binance_symbol and binance_symbol in binance_positions:
+            # Exchange has a position for this symbol but it's already
+            # locally tracked — whether the dangling order contributed to
+            # it is undecidable here. Leave the intent dangling (gate stays
+            # closed) for the operator.
+            logger.error(
+                "Dangling intent %s for %s overlaps an already-tracked exchange "
+                "position — cannot auto-reconcile, manual review required",
+                intent_id, binance_symbol,
+            )
+            continue
+
+        pnl = None
+        if binance_symbol:
+            pnl = exchange.get_realized_pnl(binance_symbol, _ts_to_ms(sub_ev["ts"]))
+        if pnl is None:
+            logger.error(
+                "Cannot verify dangling intent %s (%s): income history "
+                "unavailable — leaving it dangling, gate stays closed",
+                intent_id, sub_ev.get("symbol"),
+            )
+            continue
+
+        if pnl != 0.0:
+            # The order filled and the position already closed while we
+            # were blind — backfill the full open/close pair so drawdown
+            # and cooldown see the loss.
+            outcome = _infer_close_outcome(sub_ev, pnl)
+            append_event(jsonl_path, {
+                "type": "position_opened",
+                "ts": now_iso,
+                "intent_id": intent_id,
+                "symbol": sub_ev.get("symbol"),
+                "adopted": True,
+                "side": sub_ev.get("side"),
+                "stop_loss": sub_ev.get("stop_loss"),
+                "take_profit": sub_ev.get("take_profit"),
+            })
+            append_event(jsonl_path, {
+                "type": "position_closed",
+                "ts": now_iso,
+                "intent_id": intent_id,
+                "symbol": sub_ev.get("symbol"),
+                "pnl_usd": pnl,
+                "outcome": outcome,
+            })
+            positions_closed += 1
+            logger.warning(
+                "Dangling intent %s reconciled as opened-and-closed "
+                "(pnl_usd=%.2f, outcome=%s)", intent_id, pnl, outcome,
+            )
+        else:
+            append_event(jsonl_path, {
+                "type": "trade_skipped",
+                "ts": now_iso,
+                "intent_id": intent_id,
+                "symbol": sub_ev.get("symbol"),
+                "reason": ("dangling intent reconciled: no exchange position or "
+                           "realized pnl since submit — order presumed never filled"),
+            })
+            logger.info("Dismissed dangling intent %s (never filled)", intent_id)
+        dangling_dismissed += 1
+        del dangling[intent_id]
+
     return MonitorResult(
         success=True,
         positions_checked=len(symbols_to_check),
         positions_closed=positions_closed,
         orphan_basic_orders_cancelled=orphan_basic_cancelled,
         orphan_algo_orders_pending=orphan_algo_pending,
+        positions_adopted=positions_adopted,
+        untracked_found=untracked_found,
+        dangling_dismissed=dangling_dismissed,
+        pnl_backfill_failures=pnl_backfill_failures,
     )
 
 

@@ -620,3 +620,44 @@ class TestExecuteWithLedger:
         assert opened["entry_price"] == 65000.0
         assert opened["stop_loss"] == 60000.0
         assert opened["take_profit"] == 70000.0
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point — dryrun, no network
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMonitorMain:
+    def test_main_dryrun_clean_log_exits_zero(self, jsonl, monkeypatch, capsys):
+        import json
+
+        from tradingagents.futures.position_monitor import main
+
+        monkeypatch.delenv("MONITOR_MODE", raising=False)
+        rc = main(["--state-path", str(jsonl)])
+        assert rc == 0
+        summary = json.loads(capsys.readouterr().out)
+        assert summary["mode"] == "dryrun"
+        assert summary["success"] is True
+
+    def test_main_flags_attention_on_backfill_failure(self, jsonl, monkeypatch, capsys):
+        """An untracked find or a data gap surfaces as exit code 1 so a
+        launchd hook can escalate. Simulated via an open position that the
+        dryrun exchange reports closed with zero P&L — then a doctored
+        pnl_backfill_failed close to exercise the flag path."""
+        import json
+
+        from tradingagents.futures import position_monitor
+
+        monkeypatch.delenv("MONITOR_MODE", raising=False)
+        monkeypatch.setattr(
+            position_monitor, "create_monitor",
+            lambda cfg: FakeExchange(positions={
+                "ETHUSDT": {"symbol": "ETHUSDT", "positionAmt": "-0.5", "entryPrice": "3300.0"},
+            }),
+        )
+        rc = position_monitor.main(["--state-path", str(jsonl)])
+        assert rc == 1  # untracked position found
+        summary = json.loads(capsys.readouterr().out)
+        assert summary["untracked_found"] == 1

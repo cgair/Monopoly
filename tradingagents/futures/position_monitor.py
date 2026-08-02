@@ -742,3 +742,56 @@ def create_monitor(config: dict, *, client_cls=None) -> ExchangeAdapter:
     if mode == "dryrun":
         return DryrunExchange()
     raise ValueError(f"Unknown MONITOR_MODE: {mode!r} (expected 'dryrun' or 'testnet')")
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point (launchd job / manual reconciliation runs)
+# ---------------------------------------------------------------------------
+
+
+def main(args: Optional[list] = None) -> int:
+    """Run one reconciliation pass and print a JSON summary.
+
+    ``python -m tradingagents.futures.position_monitor [--state-path P]``
+    Mode comes from ``MONITOR_MODE`` (dryrun default; testnet needs
+    BINANCE_TESTNET_API_KEY/SECRET). Exit codes: 0 = clean, 1 = attention
+    needed (untracked positions / P&L data gaps / left-dangling intents),
+    2 = run failed. Suitable as a launchd hook next to futures.alerts.
+    """
+    import argparse
+    import json as _json
+
+    parser = argparse.ArgumentParser(
+        description="Reconcile Binance positions with the local risk-state JSONL",
+    )
+    parser.add_argument(
+        "--state-path", type=str, default=None,
+        help="Path to risk_gate_state.jsonl (default: standard state path)",
+    )
+    parsed = parser.parse_args(args)
+
+    state_path = Path(parsed.state_path) if parsed.state_path else default_state_path()
+    exchange = create_monitor({})
+    result = reconcile_positions(state_path, exchange)
+
+    print(_json.dumps({
+        "mode": getattr(exchange, "mode", "unknown"),
+        "state_path": str(state_path),
+        **{k: getattr(result, k) for k in (
+            "success", "positions_checked", "positions_closed",
+            "positions_adopted", "untracked_found", "dangling_dismissed",
+            "pnl_backfill_failures", "error",
+        )},
+    }, indent=2))
+
+    if not result.success:
+        return 2
+    if result.untracked_found or result.pnl_backfill_failures:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())

@@ -979,7 +979,7 @@ def derive_state(events, *, now, dangling_intent_minutes=5) -> RiskGateSnapshot:
 
 **CLI 入口（T12 收尾新增，line 752-797）**：`python -m tradingagents.futures.position_monitor [--state-path P]` 跑一遍对账、打 JSON 摘要。退出码与 `futures.alerts` 对齐：0 = 干净，1 = 需要关注（untracked / PnL 数据缺口），2 = 运行失败——**launchd 周期任务可直接挂**。
 
-**testnet 实弹验证**：2026-07-18（T1 单向：开→平→对账→事件正确、孤儿单清零）；2026-08-02（T12 验证 A：untracked 检测 + 真实 PnL 回填实测通过，见 PLAN.md）。
+**testnet 实弹验证**：2026-07-18（T1 单向：开→平→对账→事件正确、孤儿单清零）；2026-08-02 **T12 全部验收完成**——验证 A（UI 手动开仓 → untracked 检出/告警/不重复/gate 计数正确，平仓回填真实 pnl）+ 验证 B（审批链路开仓 → 35min 后真实止损触发 → 回填 `pnl_usd=-2.9172`、pnl 反推成交价 63191 近邻匹配止损价 → `outcome=stop`、孤儿 TP 算法单自动撤净 → cooldown 生效，下一次 `trade_execute` 被 gate 拒并写带审批元数据的 `trade_skipped`）。详见 PLAN.md T12 验收记录。
 
 ### 10.6 OpenClaw 侧接口（T4 + T5，Monopoly 侧全部完成）
 
@@ -1035,7 +1035,7 @@ Week 5 方案 A 的 Monopoly 侧已完成（T4 2026-07-14、T5 2026-07-19 `cf8e5
 | 4 | mark_price 用 mainnet，executor 用 testnet | **未修** | `market_data.py:25` 仍是 `fapi.binance.com` |
 | 5 | `final_decision_structured` 在 LangGraph state 透传，checkpointer 序列化未验证 | **未验证** | 建议跑一遍 `checkpoint_enabled=True` 的 crypto path |
 | 6 | `_round_qty` 硬编码 step=0.001 | **未修但更稳健** | 改成 floor 而非 round（`executor.py:490-498`），BTC/ETH 可接受；扩 symbol 前必须改 |
-| 7（T12 新识别并同批修复） | 事件全部在 `place_order` 返回后才写 → 进程死在「交易所成交、本地未落账」窗口 = 本地账本失明 | **已修**（T12，8-02 验证 A 实测） | `execute_with_ledger` write-ahead（§10.3.4）+ gate 规则 7.5 dangling 阻断 + monitor Pass 2/3 收养/注销（§10.5） |
+| 7（T12 新识别并同批修复） | 事件全部在 `place_order` 返回后才写 → 进程死在「交易所成交、本地未落账」窗口 = 本地账本失明 | **已修**（T12，8-02 验证 A+B 全部实弹通过） | `execute_with_ledger` write-ahead（§10.3.4）+ gate 规则 7.5 dangling 阻断 + monitor Pass 2/3 收养/注销（§10.5） |
 
 **T0 提交的新增防御**（上一版未列出的潜在风险）：
 
@@ -1093,5 +1093,5 @@ Week 5 方案 A 的 Monopoly 侧已完成（T4 2026-07-14、T5 2026-07-19 `cf8e5
 4. **naked 模拟路径**：用 mock 让 stop 单的 `_extract_order_id` 抛 RuntimeError，验证 `_try_unwind` 真的发了反向 MARKET 单
 5. **checkpointer 路径**：`checkpoint_enabled=True` 跑一个 crypto run，中途 Ctrl+C，重启验证能从最后节点恢复（重点看 `final_decision_structured` 反序列化是否完整）
 6. ~~**untracked 路径（T12 验证 A）**：交易所 UI 手动开仓 → monitor 检出 `position_untracked` + CRITICAL、手动平仓后回填真实 PnL~~ ✅ 2026-08-02 实弹通过（demo.binance.com 开 BTCUSDT 0.002，untracked 检出/不重复/gate 计数正确，平仓回填 pnl -0.0382）
-7. **真实止损路径（T12 验证 B，待做）**：止损真实触发 → 对账事件带非零 `pnl_usd`、`outcome=stop`，其后 60min 内新开仓被 cooldown 拒绝
+7. ~~**真实止损路径（T12 验证 B）**：止损真实触发 → 对账事件带非零 `pnl_usd`、`outcome=stop`，其后 60min 内新开仓被 cooldown 拒绝~~ ✅ 2026-08-02 实弹通过（`trade_execute` 审批链开 0.033 BTC 多单，stop 63190/TP 64500 双保护单挂上 → 35min 后真实止损 → 对账回填 pnl -2.9172、outcome=stop、孤儿 TP 撤净 → cooldown 拒掉下一次开仓）
 8. **审批三路径（OpenClaw 部署验收）**：Discord 上批准（→ testnet 下单 + `position_opened`）、拒绝（→ `trade_skipped`）、超时 >15min 后再批（→ `stale` + `trade_skipped`）各跑一遍，`trade_review` 核对审计事件

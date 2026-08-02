@@ -13,7 +13,7 @@ from langchain_core.tools import tool
 from tradingagents.dataflows.interface import route_to_vendor
 
 
-_DEFAULT_SOURCES = ("coindesk", "cointelegraph")
+_DEFAULT_SOURCES = ("coindesk", "cointelegraph", "blockbeats", "odaily")
 
 
 def _normalize_sources(sources: Optional[list[str]]) -> tuple[str, ...]:
@@ -28,10 +28,16 @@ def get_news(
     hours: Annotated[int, "Look-back window in hours (e.g. 24 for last day, 168 for last week)"] = 24,
     sources: Annotated[
         Optional[list[str]],
-        "RSS sources, subset of ['coindesk','cointelegraph']. Omit to use both.",
+        "RSS sources, subset of ['coindesk','cointelegraph','blockbeats','odaily']. "
+        "Omit for the default set (article feeds + newsflash desks; "
+        "'odaily' is Chinese-language but symbol filtering handles it).",
     ] = None,
 ) -> str:
     """Retrieve crypto news headlines filtered to the given base symbols.
+
+    Sources mix article feeds (CoinDesk / CoinTelegraph) with newsflash
+    desks (BlockBeats / Odaily), which relay macro prints (FOMC / CPI /
+    NFP figures) and notable X/KOL statements within minutes.
 
     Symbol filter matches keywords in title or summary (e.g. ``BTC`` →
     matches "Bitcoin" or "BTC"). Use this FIRST for asset-specific
@@ -49,7 +55,9 @@ def get_global_news(
     hours: Annotated[int, "Look-back window in hours (e.g. 48 for last two days)"] = 48,
     sources: Annotated[
         Optional[list[str]],
-        "RSS sources, subset of ['coindesk','cointelegraph']. Omit to use both.",
+        "RSS sources, subset of ['coindesk','cointelegraph','blockbeats','odaily']. "
+        "Omit for the default set (article feeds + newsflash desks; "
+        "'odaily' is Chinese-language but symbol filtering handles it).",
     ] = None,
 ) -> str:
     """Retrieve broad crypto industry news WITHOUT symbol filter.

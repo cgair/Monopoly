@@ -1,9 +1,18 @@
-"""Crypto news vendor: CoinDesk + CoinTelegraph RSS.
+"""Crypto news vendor: CoinDesk + CoinTelegraph articles, BlockBeats /
+Odaily newsflashes.
 
 Public RSS feeds, no API key needed. Items are deduplicated by
 ``id = sha1(url)`` so the same article from multiple polls stays a
 single row in the events sqlite. Symbol filtering matches keywords in
 title or summary (e.g. BTC/Bitcoin for symbol ``BTC``).
+
+Newsflash desks (BlockBeats, Odaily) relay macro prints (FOMC / CPI /
+NFP) and notable X/KOL activity within minutes — faster than article
+feeds. Odaily is Chinese-language; the symbol keyword table carries CJK
+aliases (比特币/以太坊) so filtering still works. BlockBeats selects
+language via a ``language`` request header (2026-07-31: the v2 feed
+returns empty payloads from some network exits — it degrades to a
+no-op source in that case, Odaily carries the newsflash load).
 """
 
 from __future__ import annotations
@@ -26,12 +35,23 @@ _NEWS_TTL = 300  # 5 min per docs/dataflows-decisions.md §4.2
 _FEEDS: dict[str, str] = {
     "coindesk": "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "cointelegraph": "https://cointelegraph.com/rss",
+    "blockbeats": "https://api.theblockbeats.news/v2/rss/newsflash",
+    "odaily": "https://rss.odaily.news/rss/newsflash",
 }
 
+# Extra request headers per source (feedparser passes them through).
+_FEED_HEADERS: dict[str, dict[str, str]] = {
+    "blockbeats": {"language": "en", "Accept": "application/xml"},
+}
+
+DEFAULT_SOURCES = ("coindesk", "cointelegraph", "blockbeats", "odaily")
+
 # Symbol → list of keyword regex patterns (case-insensitive) for filtering.
+# CJK aliases carry the Chinese newsflash feeds; \b does not work across
+# CJK boundaries so those patterns are plain substrings.
 _SYMBOL_KEYWORDS: dict[str, list[str]] = {
-    "BTC": [r"\bBTC\b", r"\bbitcoin\b"],
-    "ETH": [r"\bETH\b", r"\bether\b", r"\bethereum\b"],
+    "BTC": [r"\bBTC\b", r"\bbitcoin\b", r"比特币"],
+    "ETH": [r"\bETH\b", r"\bether\b", r"\bethereum\b", r"以太坊"],
     "SOL": [r"\bSOL\b", r"\bsolana\b"],
 }
 
@@ -46,7 +66,7 @@ def _iso(ms: int) -> str:
 
 
 def _parse_feed(source: str, url: str) -> list[NewsItem]:
-    parsed = feedparser.parse(url)
+    parsed = feedparser.parse(url, request_headers=_FEED_HEADERS.get(source))
     items = []
     for e in parsed.entries:
         link = (e.get("link") or "").strip()
@@ -80,7 +100,7 @@ def _matches_symbols(item: NewsItem, symbols: list[str]) -> bool:
     return False
 
 
-def _get_news(sources: tuple[str, ...] = ("coindesk", "cointelegraph"),
+def _get_news(sources: tuple[str, ...] = DEFAULT_SOURCES,
               *, hours: int = 24,
               symbols: tuple[str, ...] | None = None) -> Response[NewsItem]:
     scope = f"news:{','.join(sorted(sources))}"
@@ -135,7 +155,7 @@ def _get_news(sources: tuple[str, ...] = ("coindesk", "cointelegraph"),
     ))
 
 
-def get_news(sources: tuple[str, ...] = ("coindesk", "cointelegraph"),
+def get_news(sources: tuple[str, ...] = DEFAULT_SOURCES,
              hours: int = 24,
              symbols: tuple[str, ...] | None = None) -> str:
     resp = _get_news(sources, hours=hours, symbols=symbols)

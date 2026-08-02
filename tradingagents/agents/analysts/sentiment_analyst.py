@@ -6,11 +6,11 @@ emerging catalysts. The News block is framing baseline only — the
 News Analyst already covers depth — so this agent's distinct job is
 the retail / community pulse that news flow does not capture.
 
-Twitter is currently a deliberate placeholder. See
-`docs/dataflows-decisions.md` §5 — the source decision is open and
-`crypto_twitter.get_tweets` returns an explicit "data unavailable"
-string. The prompt telegraphs this so the LLM treats Twitter as
-missing-on-purpose, not forgotten.
+The Twitter block is an editorial relay: `crypto_twitter.get_tweets`
+surfaces KOL / institution X activity as reported by newsflash desks
+(BlockBeats) rather than raw tweets, so engagement metrics are absent.
+The prompt telegraphs this so the LLM reads it as a directional
+narrative signal and never weights it by engagement.
 """
 
 from datetime import datetime, timedelta
@@ -115,8 +115,8 @@ def _build_system_message(
 {news_block}
 <end_of_news>
 
-### Twitter posts — past 7 days
-**Deliberately unavailable.** The Twitter vendor decision is open (see `docs/dataflows-decisions.md` §5); the block below is an explicit placeholder, not a fetch failure. Treat this dimension as missing-on-purpose and flag the gap in your report's data-limits note — do not invent Twitter signal.
+### X / Twitter signal — editorial relay, past 7 days
+**Not raw tweets.** This block relays KOL / institution X activity as reported by crypto newsflash desks (minutes-level latency, but editorially filtered). There are **no engagement metrics** — treat each item as a directional narrative data point of roughly equal weight, and never infer virality. If the block notes "general newsflash items as weak proxy", explicit X activity was quiet in the window — say so rather than over-reading.
 
 <start_of_twitter>
 {twitter_block}
@@ -148,7 +148,7 @@ Weight by engagement (upvote score + comment count) within a subreddit, **but do
 
 4. **Cross-source divergence is the highest-value signal.** When News framing and Reddit mood disagree — bearish news but euphoric retail, or quiet news with rising community anxiety — explicitly name the divergence and offer a read on which is likely leading.
 
-5. **Be honest about data limits.** Twitter is unavailable by design (see above); if the Reddit block is thin or a subreddit is silent, say so. A confident sentiment read on three engaged posts is not a confident read.
+5. **Be honest about data limits.** The X block is an editorial relay without engagement data (see above); if it fell back to general newsflash, or the Reddit block is thin or a subreddit is silent, say so. A confident sentiment read on three engaged posts is not a confident read.
 
 6. **Past sentiment is not predictive.** Your output is signal for the Researchers and Risk team to weigh against price, funding, and on-chain — not a price call.
 
@@ -160,7 +160,7 @@ Produce a markdown report in this order:
 2. **Dominant narratives (2–4)** — for each: name, which subreddits / news carry it, supporting evidence (cite engagement numbers and notable posts), and whether it's *consensus* or *emerging*.
 3. **News-vs-Reddit divergence** — explicit call-out if framing disagrees; "no meaningful divergence" is a valid finding if true.
 4. **Emerging catalysts surfaced by the community** — what retail is positioning around that's not yet in the news flow.
-5. **Data-limits note** — Twitter unavailable; any thin subreddits; any subreddit returning `<unavailable>`.
+5. **Data-limits note** — X signal is relay-based (no engagement data; note if it fell back to general newsflash); any thin subreddits; any subreddit returning `<unavailable>`.
 6. **Summary table** at the end with columns: Signal | Direction | Source | Evidence | Confidence.
 
 {get_language_instruction()}"""

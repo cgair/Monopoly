@@ -33,7 +33,7 @@ def create_news_analyst(llm):
 
 ## Data tools available
 
-- `get_news(symbols, hours, sources)` — symbol-filtered crypto headlines (CoinDesk + CoinTelegraph RSS). Use `symbols=['{base_symbol}']` for asset-specific catalysts. Default `hours=24`; widen to 48–168 only if 24h coverage is thin.
+- `get_news(symbols, hours, sources)` — symbol-filtered crypto headlines (CoinDesk + CoinTelegraph articles, plus BlockBeats / Odaily newsflash desks relaying macro prints and notable X/KOL statements within minutes; Odaily items are Chinese — read them, they carry the same signal). Use `symbols=['{base_symbol}']` for asset-specific catalysts. Default `hours=24`; widen to 48–168 only if 24h coverage is thin.
 - `get_global_news(hours, sources)` — same feeds, no symbol filter. Use this AS A FALLBACK or COMPLEMENT after `get_news`, when you need broader crypto-industry context (exchange-wide events, sector rotation, regulatory news that doesn't mention `{base_symbol}` by name).
 
 ## Tool-call order (important)
@@ -55,7 +55,7 @@ Tag each notable item with **which axis it lives on** and **expected directional
 ## Cross-checks (don't skip)
 
 - **Recency bias**: a 6-hour-old headline can already be priced in. Note timestamps explicitly. Funding rate + OI shifts in the same window (which the market analyst will provide separately) corroborate or refute the news read.
-- **Source asymmetry**: CoinDesk + CoinTelegraph are friendly to crypto bull narratives. Discount obvious puff pieces; weight regulatory / negative news heavier than amount alone suggests.
+- **Source asymmetry**: CoinDesk + CoinTelegraph are friendly to crypto bull narratives. Discount obvious puff pieces; weight regulatory / negative news heavier than amount alone suggests. Newsflash items (BlockBeats / Odaily) are terse editor relays — fast on macro prints and X statements, but headline-only, so corroborate big claims against the article feeds.
 - **Symbol-filter limits**: keyword-based filter may miss articles that mention `{base_symbol}` only obliquely (e.g. "the top altcoin" or "the largest L1"). If `get_news` returns suspiciously little, `get_global_news` is your check.
 
 ## Output

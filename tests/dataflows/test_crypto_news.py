@@ -76,3 +76,26 @@ def test_get_news_all_sources_fail_returns_ok_false(tmp_root):
         out = cn.get_news(sources=("coindesk",), hours=24, symbols=None)
     assert "ok=False" in out
     assert "network down" in out
+
+
+@pytest.mark.unit
+def test_newsflash_feeds_registered():
+    assert "blockbeats" in cn._FEEDS
+    assert "odaily" in cn._FEEDS
+    # BlockBeats selects language via request header, not query param.
+    assert cn._FEED_HEADERS["blockbeats"]["language"] == "en"
+    assert "blockbeats" in cn.DEFAULT_SOURCES
+    assert "odaily" in cn.DEFAULT_SOURCES
+
+
+@pytest.mark.unit
+def test_get_news_includes_newsflash_source(tmp_root):
+    now_epoch = time.time()
+    flash = [_FakeEntry("Fed holds rates; BTC steady",
+                        "https://theblockbeats.news/flash/1",
+                        "FOMC statement unchanged.", now_epoch - 600)]
+    with patch.object(cn.feedparser, "parse", return_value=_FakeFeed(flash)):
+        out = cn.get_news(sources=("blockbeats",), hours=24, symbols=("BTC",))
+    assert "Fed holds rates" in out
+    assert "blockbeats" in out
+    assert "ok=True" in out

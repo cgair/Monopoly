@@ -53,11 +53,14 @@ Public API:
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -112,18 +115,46 @@ def append_event(path: Path | str, event: dict) -> None:
 
 
 def load_events(path: Path | str) -> list[dict]:
-    """Return all events in chronological (file) order. Missing file → []."""
+    """Return all events in chronological (file) order. Missing file → [].
+
+    Malformed lines (torn writes from a crash / power loss) are skipped
+    with a warning instead of raising — a single bad line must not brick
+    every gate evaluation and monitor run until someone hand-edits the
+    file. Callers that need the skip count (alerts) use
+    :func:`load_events_with_errors`.
+    """
+    events, _ = load_events_with_errors(path)
+    return events
+
+
+def load_events_with_errors(path: Path | str) -> tuple[list[dict], int]:
+    """Like :func:`load_events`, but also return the malformed-line count.
+
+    The count feeds the alerts layer: skipping a torn line is the right
+    availability call, but if the dropped line happened to be a
+    ``position_opened`` the replayed state silently drifts from reality —
+    the operator has to be told the file needs inspection.
+    """
     p = Path(path)
     if not p.exists():
-        return []
-    events = []
+        return [], 0
+    events: list[dict] = []
+    malformed = 0
     with p.open("r", encoding="utf-8") as fh:
-        for line in fh:
+        for line_num, line in enumerate(fh, start=1):
             line = line.strip()
             if not line:
                 continue
-            events.append(json.loads(line))
-    return events
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                malformed += 1
+                logger.warning(
+                    "Skipping malformed line %d in %s (torn write?) — "
+                    "replayed state may be missing an event; inspect the file",
+                    line_num, p,
+                )
+    return events, malformed
 
 
 DEFAULT_DANGLING_INTENT_MINUTES = 5

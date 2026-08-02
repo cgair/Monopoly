@@ -219,6 +219,42 @@ class TestCrashAfterSubmit:
         assert snapshot.daily_realised_pnl_usd == -12.5
         assert snapshot.last_stop_loss_close_ts is not None
 
+    def test_ambiguous_multiple_dangling_intents_not_adopted(self, jsonl):
+        """Two dangling intents for the same symbol: guessing which one
+        filled would pair the position with the wrong stop/TP — refuse
+        adoption, record untracked, leave both dangling for a human."""
+        append_event(jsonl, _submit_event(intent_id="intent-1", age_minutes=20))
+        append_event(jsonl, _submit_event(intent_id="intent-2", age_minutes=10))
+        exchange = FakeExchange(positions={
+            "BTCUSDT": {"symbol": "BTCUSDT", "positionAmt": "0.010", "entryPrice": "65000.0"},
+        })
+
+        result = reconcile_positions(jsonl, exchange, now=NOW)
+
+        assert result.positions_adopted == 0
+        assert result.untracked_found == 1
+        assert result.dangling_remaining == 2
+        types = [e["type"] for e in load_events(jsonl)]
+        assert "position_opened" not in types
+        assert "position_untracked" in types
+
+    def test_side_mismatch_refuses_adoption(self, jsonl):
+        """Dangling intent says BUY but the exchange position is short —
+        the position was reversed outside our control; adopting would
+        record the wrong direction under that intent_id."""
+        append_event(jsonl, _submit_event(intent_id="intent-1", age_minutes=10, side="BUY"))
+        exchange = FakeExchange(positions={
+            "BTCUSDT": {"symbol": "BTCUSDT", "positionAmt": "-0.010", "entryPrice": "65000.0"},
+        })
+
+        result = reconcile_positions(jsonl, exchange, now=NOW)
+
+        assert result.positions_adopted == 0
+        assert result.untracked_found == 1
+        assert result.dangling_remaining == 1
+        types = [e["type"] for e in load_events(jsonl)]
+        assert "position_opened" not in types
+
     def test_dangling_overlapping_tracked_position_left_for_operator(self, jsonl):
         """Exchange position exists for the symbol but is already locally
         tracked — whether the dangling order contributed is undecidable;
@@ -236,6 +272,7 @@ class TestCrashAfterSubmit:
 
         assert result.positions_adopted == 0
         assert result.dangling_dismissed == 0
+        assert result.dangling_remaining == 1
         snapshot = derive_state(load_events(jsonl), now=NOW)
         assert len(snapshot.dangling_intents) == 1
 
@@ -369,6 +406,35 @@ class TestStopOutBackfill:
         closed = load_events(jsonl)[-1]
         assert closed["outcome"] == "manual"
 
+    def test_breakeven_manual_close_with_tight_stop_not_labelled_stop(self, jsonl):
+        """With a tight stop (0.14% away), 1% relative tolerance dwarfs
+        the whole stop distance — a break-even manual close must NOT be
+        claimed as a stop-out. The per-candidate cap (half the
+        entry→trigger distance) keeps the claim meaningful."""
+        append_event(jsonl, self._open_event(
+            entry_price=63279.0, quantity=0.033,
+            stop_loss=63190.0, take_profit=64500.0,
+        ))
+        # Zero realized P&L → derived close == entry (89 points from the
+        # stop, > half-distance cap of 44.5) → manual, not stop.
+        reconcile_positions(jsonl, FakeExchange(realized_pnl=0.0), now=NOW)
+
+        closed = load_events(jsonl)[-1]
+        assert closed["outcome"] == "manual"
+
+    def test_tight_stop_genuine_stop_out_still_matches(self, jsonl):
+        """Mirror of the live T12-B trade: tight stop, loss lands the
+        derived close exactly on the stop price → outcome=stop."""
+        append_event(jsonl, self._open_event(
+            entry_price=63279.0, quantity=0.033,
+            stop_loss=63190.0, take_profit=64500.0,
+        ))
+        # (63190 - 63279) * 0.033 = -2.937 → derived close == stop.
+        reconcile_positions(jsonl, FakeExchange(realized_pnl=-2.937), now=NOW)
+
+        closed = load_events(jsonl)[-1]
+        assert closed["outcome"] == "stop"
+
     def test_short_side_close_price_derivation(self, jsonl):
         append_event(jsonl, self._open_event(
             side="SELL", entry_price=65000.0, stop_loss=70000.0, take_profit=60000.0,
@@ -452,6 +518,43 @@ class TestIncomeFailureDegradation:
         assert report.level == "warn"
         assert any("backfill" in f.message for f in report.findings)
 
+    def test_unresolvable_dangling_surfaces_in_exit_code_and_alerts(self, jsonl, monkeypatch, capsys):
+        """A left-dangling intent must not be log-only: the monitor CLI
+        exits 1 and the alerts layer raises a WARN finding, so a launchd
+        operator learns why the gate is closed without reading logs."""
+        import json
+
+        from tradingagents.futures import position_monitor
+        from tradingagents.futures.alerts import AlertConfig, analyze_events, evaluate_alerts
+
+        append_event(jsonl, _submit_event(age_minutes=10))
+        monkeypatch.delenv("MONITOR_MODE", raising=False)
+        monkeypatch.setattr(
+            position_monitor, "create_monitor",
+            lambda cfg: FakeExchange(realized_pnl=None),  # income unavailable
+        )
+        rc = position_monitor.main(["--state-path", str(jsonl)])
+        assert rc == 1
+        summary = json.loads(capsys.readouterr().out)
+        assert summary["dangling_remaining"] == 1
+
+        stats = analyze_events(load_events(jsonl), window_hours=24, now=NOW)
+        assert stats.dangling_intents == 1
+        report = evaluate_alerts(stats, AlertConfig())
+        assert report.level == "warn"
+        assert any("Dangling" in f.message for f in report.findings)
+
+    def test_old_dangling_outside_scan_window_still_alerts(self, jsonl):
+        """Dangling pairing ignores the 24h scan window — an unresolved
+        submit from 3 days ago is exactly what must stay visible."""
+        from tradingagents.futures.alerts import AlertConfig, analyze_events, evaluate_alerts
+
+        append_event(jsonl, _submit_event(age_minutes=3 * 24 * 60))
+        stats = analyze_events(load_events(jsonl), window_hours=24, now=NOW)
+        assert stats.dangling_intents == 1
+        report = evaluate_alerts(stats, AlertConfig())
+        assert report.level == "warn"
+
     def test_dangling_intent_preserved_when_income_unavailable(self, jsonl):
         """Without income data a dangling intent cannot be verified —
         it must stay dangling (gate closed) rather than being guessed away."""
@@ -470,6 +573,50 @@ class TestIncomeFailureDegradation:
         )
         assert not gate_result.approved
         assert REASON_DANGLING_INTENT in gate_result.reason
+
+
+# ---------------------------------------------------------------------------
+# Torn-write resilience — malformed lines skip + alert, never crash
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMalformedLineResilience:
+    def test_torn_line_does_not_crash_replay(self, jsonl):
+        """A half-written line (crash / power loss mid-append) must not
+        brick every gate evaluation and monitor run."""
+        append_event(jsonl, {
+            "type": "position_opened", "ts": _iso(NOW - timedelta(hours=1)),
+            "intent_id": "i-1", "symbol": "BTC-USD",
+        })
+        with open(jsonl, "a", encoding="utf-8") as fh:
+            fh.write('{"type": "position_clo')  # torn write, no newline
+
+        events = load_events(jsonl)  # must not raise
+        assert len(events) == 1
+        snapshot = derive_state(events, now=NOW)
+        assert snapshot.open_positions == 1
+
+        result = reconcile_positions(jsonl, FakeExchange(realized_pnl=0.0), now=NOW)
+        assert result.success
+
+    def test_malformed_lines_raise_warn_alert(self, jsonl):
+        from tradingagents.futures.alerts import AlertConfig, analyze_events, evaluate_alerts
+        from tradingagents.futures.risk_state import load_events_with_errors
+
+        with open(jsonl, "w", encoding="utf-8") as fh:
+            fh.write('{"type": "position_opened", "ts": "2026-06-15T10:00:00+00:00", "intent_id": "i-1", "symbol": "BTC-USD"}\n')
+            fh.write('not json at all\n')
+
+        events, malformed = load_events_with_errors(jsonl)
+        assert len(events) == 1
+        assert malformed == 1
+
+        stats = analyze_events(events, window_hours=24, now=NOW)
+        stats.malformed_lines = malformed
+        report = evaluate_alerts(stats, AlertConfig())
+        assert report.level == "warn"
+        assert any("malformed" in f.message for f in report.findings)
 
 
 # ---------------------------------------------------------------------------

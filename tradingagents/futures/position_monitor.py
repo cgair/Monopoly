@@ -88,6 +88,12 @@ class MonitorResult:
     """Closes recorded with pnl_usd=0.0 / outcome=unknown because the
     income-history fetch failed — the data gap is flagged on the event."""
 
+    dangling_remaining: int = 0
+    """Dangling intents this run could NOT resolve (income unavailable,
+    overlap with a tracked position, or ambiguous adoption) — the gate
+    stays closed until a human intervenes, so this must surface in the
+    exit code and alerts, not just the log."""
+
     error: Optional[str] = None
 
 
@@ -330,7 +336,12 @@ def _ts_to_ms(ts_str: str) -> int:
 
 _OUTCOME_PRICE_TOLERANCE = 0.01
 """Relative distance within which the derived close price must land on
-the stop / TP to claim that outcome; farther than this from both → manual."""
+the stop / TP to claim that outcome; farther than this from both → manual.
+Capped per candidate at half the entry→trigger distance: with a tight
+stop (e.g. 0.15% away), 1% of price dwarfs the whole stop distance and a
+break-even manual close would otherwise be labelled a stop-out (arming
+the cooldown for nothing). Half-distance keeps the claim meaningful —
+the close must be nearer the trigger than the entry."""
 
 
 def _infer_close_outcome(open_event: dict, pnl_usd: float) -> str:
@@ -355,9 +366,16 @@ def _infer_close_outcome(open_event: dict, pnl_usd: float) -> str:
         tp = open_event.get("take_profit")
         if tp:
             candidates.append(("tp", float(tp)))
-        outcome, price = min(candidates, key=lambda c: abs(close - c[1]))
-        if abs(close - price) <= _OUTCOME_PRICE_TOLERANCE * abs(close):
-            return outcome
+        matched = []
+        for outcome, price in candidates:
+            tolerance = min(
+                _OUTCOME_PRICE_TOLERANCE * abs(close),
+                0.5 * abs(float(entry) - price),
+            )
+            if abs(close - price) <= tolerance:
+                matched.append((abs(close - price), outcome))
+        if matched:
+            return min(matched)[1]
         return "manual"
 
     if pnl_usd < 0:
@@ -565,19 +583,42 @@ def reconcile_positions(
 
         position_amt = float(position.get("positionAmt", 0.0))
         entry_price = float(position.get("entryPrice", 0.0))
+        position_side = "BUY" if position_amt > 0 else "SELL"
 
-        # Adopt when a dangling intent matches the symbol (the write-ahead
-        # proves we submitted this order and died before recording the
-        # result). Pick the most recent match if several dangle.
-        match_id = None
+        # Adopt ONLY when exactly one dangling intent matches the symbol
+        # AND its recorded side agrees with the live position. With
+        # several candidates, guessing (e.g. "newest") can pair the
+        # position with the wrong intent's stop/TP — corrupting the later
+        # close-outcome inference — while the leftover intent parks in
+        # the overlap branch of pass 3 forever. A side mismatch means the
+        # position was reversed outside our control. Both cases fall
+        # through to position_untracked + alert for a human to resolve.
+        matches = []
         for intent_id, sub_ev in dangling.items():
             try:
                 if _symbol_from_state(sub_ev.get("symbol", "")) != binance_symbol:
                     continue
             except ValueError:
                 continue
-            if match_id is None or sub_ev["ts"] > dangling[match_id]["ts"]:
-                match_id = intent_id
+            matches.append(intent_id)
+
+        match_id = None
+        if len(matches) == 1:
+            if dangling[matches[0]].get("side") == position_side:
+                match_id = matches[0]
+            else:
+                logger.error(
+                    "Dangling intent %s for %s has side %s but the exchange "
+                    "position is %s — refusing adoption, manual review required",
+                    matches[0], binance_symbol,
+                    dangling[matches[0]].get("side"), position_side,
+                )
+        elif len(matches) > 1:
+            logger.error(
+                "%d dangling intents (%s) match exchange position %s — "
+                "ambiguous, refusing adoption; manual review required",
+                len(matches), ", ".join(matches), binance_symbol,
+            )
 
         if match_id is not None:
             sub_ev = dangling.pop(match_id)
@@ -587,7 +628,7 @@ def reconcile_positions(
                 "intent_id": match_id,
                 "symbol": sub_ev.get("symbol", state_symbol),
                 "adopted": True,
-                "side": "BUY" if position_amt > 0 else "SELL",
+                "side": position_side,
                 "entry_price": entry_price,
                 "quantity": abs(position_amt),
                 "stop_loss": sub_ev.get("stop_loss"),
@@ -695,6 +736,7 @@ def reconcile_positions(
         untracked_found=untracked_found,
         dangling_dismissed=dangling_dismissed,
         pnl_backfill_failures=pnl_backfill_failures,
+        dangling_remaining=len(dangling),
     )
 
 
@@ -780,13 +822,13 @@ def main(args: Optional[list] = None) -> int:
         **{k: getattr(result, k) for k in (
             "success", "positions_checked", "positions_closed",
             "positions_adopted", "untracked_found", "dangling_dismissed",
-            "pnl_backfill_failures", "error",
+            "pnl_backfill_failures", "dangling_remaining", "error",
         )},
     }, indent=2))
 
     if not result.success:
         return 2
-    if result.untracked_found or result.pnl_backfill_failures:
+    if result.untracked_found or result.pnl_backfill_failures or result.dangling_remaining:
         return 1
     return 0
 

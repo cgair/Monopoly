@@ -94,6 +94,16 @@ class AlertConfig:
     """If any position_closed carries pnl_backfill_failed=true, raise WARN —
     drawdown/cooldown are blind to that close's real P&L. 0 = disabled."""
 
+    dangling_intent_threshold: int = 1
+    """If any order_submitted is still unresolved past the dangling
+    timeout, raise WARN — the gate is rejecting all new entries and the
+    monitor could not clear it (income unavailable / ambiguous adoption /
+    overlap); a human has to act. 0 = disabled."""
+
+    malformed_line_threshold: int = 1
+    """If the state file contains lines that fail to parse (torn writes),
+    raise WARN — replayed state may be missing events. 0 = disabled."""
+
     state_path: Optional[Path] = None
     """Path to risk_gate_state.jsonl. CLI --state-path overrides env."""
 
@@ -108,6 +118,8 @@ class AlertConfig:
             consecutive_stop_threshold=_get_env_int("TRADINGAGENTS_FUTURES_ALERT_CONSECUTIVE_STOP_THRESHOLD", 3),
             untracked_position_threshold=_get_env_int("TRADINGAGENTS_FUTURES_ALERT_UNTRACKED_POSITION_THRESHOLD", 1),
             pnl_backfill_failure_threshold=_get_env_int("TRADINGAGENTS_FUTURES_ALERT_PNL_BACKFILL_FAILURE_THRESHOLD", 1),
+            dangling_intent_threshold=_get_env_int("TRADINGAGENTS_FUTURES_ALERT_DANGLING_INTENT_THRESHOLD", 1),
+            malformed_line_threshold=_get_env_int("TRADINGAGENTS_FUTURES_ALERT_MALFORMED_LINE_THRESHOLD", 1),
             state_path=Path(p) if (p := os.getenv("TRADINGAGENTS_RISK_GATE_STATE_PATH")) else None,
         )
 
@@ -219,6 +231,8 @@ class EventStats:
     position_naked_count: int = 0
     position_untracked_count: int = 0
     pnl_backfill_failures: int = 0
+    dangling_intents: int = 0
+    malformed_lines: int = 0  # set by main() from the loader, not the event scan
     executor_errors: list[str] = field(default_factory=list)  # runs of consecutive stop-closes
     consecutive_stops: list[int] = field(default_factory=list)  # runs of consecutive stop-closes
 
@@ -228,6 +242,7 @@ def analyze_events(
     *,
     window_hours: int,
     now: Optional[datetime] = None,
+    dangling_intent_minutes: float = 5.0,
 ) -> EventStats:
     """Scan events in the time window and collect statistics.
     
@@ -251,6 +266,29 @@ def analyze_events(
 
     cutoff_ts = now - timedelta(hours=window_hours)
     stats = EventStats()
+
+    # Dangling-intent pairing runs over ALL events, ignoring the scan
+    # window: an order_submitted from 3 days ago that never resolved is
+    # exactly the situation that must not age out of visibility — the
+    # gate is closed because of it.
+    submitted: dict = {}
+    resolved: set = set()
+    for event in events:
+        intent_id = event.get("intent_id")
+        if event.get("type") == "order_submitted":
+            if intent_id:
+                submitted[intent_id] = event
+        elif intent_id:
+            resolved.add(intent_id)
+    dangling_cutoff = now - timedelta(minutes=dangling_intent_minutes)
+    for intent_id, event in submitted.items():
+        if intent_id in resolved:
+            continue
+        try:
+            if _parse_ts(event["ts"]) <= dangling_cutoff:
+                stats.dangling_intents += 1
+        except Exception:
+            pass
 
     # Track consecutive stops (for consecutive-loss detection)
     consecutive_stop_run = 0
@@ -371,6 +409,26 @@ def evaluate_alerts(stats: EventStats, config: AlertConfig) -> AlertReport:
             {"count": stats.pnl_backfill_failures},
         ))
 
+    # 2d. Dangling intents (gate is closed and the monitor couldn't clear it)
+    if config.dangling_intent_threshold > 0 and stats.dangling_intents >= config.dangling_intent_threshold:
+        if level != AlertLevel.CRITICAL:
+            level = AlertLevel.WARN
+        findings.append(Finding(
+            f"Dangling order intent(s) awaiting manual reconciliation ({stats.dangling_intents}): "
+            "the gate rejects all new entries until resolved.",
+            {"count": stats.dangling_intents},
+        ))
+
+    # 2e. Malformed state-file lines (torn writes — replay may be missing events)
+    if config.malformed_line_threshold > 0 and stats.malformed_lines >= config.malformed_line_threshold:
+        if level != AlertLevel.CRITICAL:
+            level = AlertLevel.WARN
+        findings.append(Finding(
+            f"State file has {stats.malformed_lines} malformed line(s) — "
+            "skipped on replay; derived state may be missing events, inspect the file.",
+            {"count": stats.malformed_lines},
+        ))
+
     # 3. Executor error threshold
     if config.executor_error_threshold > 0:
         if len(stats.executor_errors) >= config.executor_error_threshold:
@@ -442,10 +500,21 @@ def main(args: Optional[list[str]] = None, now: Optional[datetime] = None) -> in
     if parsed.state_path is not None:
         config = replace(config, state_path=Path(parsed.state_path))
 
-    # Load events and analyze
+    # Load events and analyze. The shared loader reports the malformed-line
+    # count so torn writes surface as a finding instead of vanishing.
+    from tradingagents.futures.risk_state import load_events_with_errors
+
     state_path = config.resolved_state_path()
-    events = load_events(state_path)
-    stats = analyze_events(events, window_hours=config.window_hours, now=now)
+    events, malformed = load_events_with_errors(state_path)
+    stats = analyze_events(
+        events,
+        window_hours=config.window_hours,
+        now=now,
+        dangling_intent_minutes=_get_env_float(
+            "TRADINGAGENTS_FUTURES_DANGLING_INTENT_MINUTES", 5.0,
+        ),
+    )
+    stats.malformed_lines = malformed
     report = evaluate_alerts(stats, config)
 
     # Output JSON

@@ -1616,20 +1616,18 @@ def trade_execute(
                     "timestamp": now.isoformat(),
                 })
                 sys.exit(2)
-        exec_result = executor.place_order(intent, equity_usd=equity_usd, mark_price=mark_price)
+        # execute_with_ledger writes the intent write-ahead (order_submitted)
+        # before the exchange call and the paired result event after it
+        # (position_opened / position_naked / trade_skipped) — same ledger
+        # discipline as the graph's executor node.
+        from tradingagents.futures.executor import execute_with_ledger
 
-        if exec_result.success:
-            # Log position_opened event
-            from tradingagents.futures.risk_state import append_event
-            append_event(
-                default_state_path(),
-                {
-                    "type": "position_opened",
-                    "ts": exec_result.placed_at,
-                    "intent_id": exec_result.intent_id,
-                    "symbol": exec_result.symbol,
-                },
-            )
+        exec_result = execute_with_ledger(
+            executor, intent,
+            equity_usd=equity_usd,
+            mark_price=mark_price,
+            state_path=default_state_path(),
+        )
 
         result = {
             "status": "executed" if exec_result.success else "execution_failed",

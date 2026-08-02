@@ -10,6 +10,7 @@ the approval semantics (who, when, staleness bounds, gate re-evaluation).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -199,18 +200,18 @@ def reconstruct_intent_from_decision(
 
     gate_config = from_config(config)
     if state_path is not None:
-        gate_config = gate_config.__class__(
-            max_leverage=gate_config.max_leverage,
-            per_trade_risk_pct=gate_config.per_trade_risk_pct,
-            daily_drawdown_halt_pct=gate_config.daily_drawdown_halt_pct,
-            cooldown_after_loss_minutes=gate_config.cooldown_after_loss_minutes,
-            max_concurrent_positions=gate_config.max_concurrent_positions,
-            state_path=state_path,
-        )
+        # dataclasses.replace keeps every other ceiling intact — a
+        # field-by-field rebuild here previously dropped newer fields
+        # (macro_block_hours, dangling_intent_minutes) silently.
+        gate_config = dataclasses.replace(gate_config, state_path=state_path)
 
     # Load current risk state
     risk_events = load_events(gate_config.resolved_state_path())
-    snapshot = derive_state(risk_events, now=now)
+    snapshot = derive_state(
+        risk_events,
+        now=now,
+        dangling_intent_minutes=gate_config.dangling_intent_minutes,
+    )
 
     # Evaluate through the gate
     result = evaluate(

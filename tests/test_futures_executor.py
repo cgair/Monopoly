@@ -435,9 +435,19 @@ class TestExecutorNode:
         })
         assert out["execution_result"]["success"] is True
         events = load_events(state_path)
-        assert len(events) == 1
-        assert events[0]["type"] == "position_opened"
+        # Write-ahead: order_submitted lands BEFORE the result event.
+        assert [e["type"] for e in events] == ["order_submitted", "position_opened"]
+        assert events[0]["intent_id"] == "i-1"
         assert events[0]["symbol"] == "BTC-USD"
+        assert events[0]["stop_loss"] == 62800.0
+        opened = events[1]
+        assert opened["symbol"] == "BTC-USD"
+        assert opened["intent_id"] == "i-1"
+        # Enriched fields for the monitor's close-outcome inference.
+        assert opened["side"] == "BUY"
+        assert opened["entry_price"] == 64500.0
+        assert opened["stop_loss"] == 62800.0
+        assert opened["take_profit"] == 68000.0
 
     def test_naked_result_logs_position_opened_and_naked(self, tmp_path, monkeypatch):
         """H1: when the adapter reports position_naked, the node must record a

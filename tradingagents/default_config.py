@@ -26,6 +26,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_FUTURES_STARTING_EQUITY_USD":       "futures_starting_equity_usd",
     "TRADINGAGENTS_FUTURES_MACRO_WARN_HOURS":          "futures_macro_warn_hours",
     "TRADINGAGENTS_FUTURES_MACRO_BLOCK_HOURS":         "futures_macro_block_hours",
+    "TRADINGAGENTS_FUTURES_DANGLING_INTENT_MINUTES":   "futures_dangling_intent_minutes",
 }
 
 
@@ -128,6 +129,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # default off — enable only if testnet reviews show macro-window losses).
     "futures_macro_warn_hours": 12.0,
     "futures_macro_block_hours": 0.0,
+    # An order_submitted with no result event after this many minutes is a
+    # dangling intent (process died mid-execution) — the gate blocks new
+    # entries until the position monitor reconciles it.
+    "futures_dangling_intent_minutes": 5.0,
     # Optional override for the risk-gate state file (JSONL event log).
     # ``None`` → ~/.tradingagents/risk_gate_state.jsonl
     "futures_risk_state_path": os.getenv("TRADINGAGENTS_RISK_GATE_STATE_PATH"),

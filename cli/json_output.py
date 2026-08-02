@@ -49,6 +49,14 @@ def serialize_risk_snapshot(snapshot: Optional[RiskGateSnapshot]) -> dict:
             if snapshot.last_stop_loss_close_ts
             else None
         ),
+        "dangling_intents": [
+            {
+                "intent_id": d.intent_id,
+                "symbol": d.symbol,
+                "submitted_ts": d.submitted_ts.isoformat(),
+            }
+            for d in snapshot.dangling_intents
+        ],
     }
 
 

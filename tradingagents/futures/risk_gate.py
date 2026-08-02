@@ -76,6 +76,12 @@ class RiskGateConfig:
     Calendar failures fail-open — this is a caution layer, not the
     safety floor."""
 
+    dangling_intent_minutes: float = 5.0
+    """Minutes after which an ``order_submitted`` with no result event
+    counts as dangling — the process died mid-execution and a position
+    may be live on the exchange unrecorded. The gate rejects new entries
+    while any intent dangles, until the position monitor reconciles."""
+
     state_path: Optional[Path] = None
     """Path to the JSONL event log. ``None`` → :func:`default_state_path`."""
 
@@ -98,6 +104,7 @@ def from_config(config: dict) -> RiskGateConfig:
         cooldown_after_loss_minutes=int(config.get("futures_cooldown_after_loss_minutes", 60)),
         max_concurrent_positions=int(config.get("futures_max_concurrent_positions", 2)),
         macro_block_hours=float(config.get("futures_macro_block_hours", 0.0)),
+        dangling_intent_minutes=float(config.get("futures_dangling_intent_minutes", 5.0)),
         state_path=Path(state_path) if state_path else None,
     )
 
@@ -152,6 +159,7 @@ REASON_DAILY_DRAWDOWN_HALT = "daily drawdown halt active until next UTC day"
 REASON_COOLDOWN_ACTIVE = "cooldown window active after recent stop-out"
 REASON_MAX_POSITIONS = "max_concurrent_positions already open"
 REASON_MACRO_EVENT_WINDOW = "high-impact macro event inside block window"
+REASON_DANGLING_INTENT = "dangling order intent awaiting reconciliation"
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +209,11 @@ def evaluate(
         raise ValueError("evaluate requires a timezone-aware 'now' (UTC)")
 
     if snapshot is None:
-        snapshot = derive_state(load_events(config.resolved_state_path()), now=now)
+        snapshot = derive_state(
+            load_events(config.resolved_state_path()),
+            now=now,
+            dangling_intent_minutes=config.dangling_intent_minutes,
+        )
 
     # 1) Flat is a no-op; not a rejection in the user-facing sense, but the
     # gate emits no intent. Caller distinguishes via approved=False + reason.
@@ -296,6 +308,20 @@ def evaluate(
             approved=False,
             reason=(f"{REASON_MAX_POSITIONS} "
                     f"({snapshot.open_positions} / {config.max_concurrent_positions})"),
+            snapshot=snapshot,
+        )
+
+    # 7.5) Cross-run policies: dangling intents. An order_submitted with
+    # no result event means a previous run died between the exchange call
+    # and the local append — a position may be live and uncounted. Reject
+    # conservatively until the position monitor adopts or dismisses it.
+    if snapshot.dangling_intents:
+        ids = ", ".join(d.intent_id for d in snapshot.dangling_intents)
+        return GateResult(
+            approved=False,
+            reason=(f"{REASON_DANGLING_INTENT} "
+                    f"({len(snapshot.dangling_intents)} unresolved: {ids}) "
+                    f"— run the position monitor to reconcile"),
             snapshot=snapshot,
         )
 

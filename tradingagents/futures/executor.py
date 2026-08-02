@@ -498,6 +498,91 @@ class TestnetExecutor:
 
 
 # ---------------------------------------------------------------------------
+# Write-ahead ledger wrapper
+# ---------------------------------------------------------------------------
+
+
+def execute_with_ledger(
+    executor: ExecutorAdapter,
+    intent: ExecutionIntent,
+    *,
+    equity_usd: float,
+    mark_price: float,
+    state_path: Path | str,
+) -> ExecutionResult:
+    """Place an order with intent write-ahead + paired result events.
+
+    Appends ``order_submitted`` to the risk-state log **before** calling
+    ``place_order()`` (dryrun included, so the event stream is uniform),
+    then appends the matching result event after it returns:
+
+    - success       → ``position_opened`` (with side / entry / stop / TP,
+                      so the monitor can later infer the close outcome)
+    - naked         → ``position_opened`` + ``position_naked`` (the gate's
+                      concurrent count must include a naked position)
+    - failure       → ``trade_skipped`` (carries ``intent_id`` so it
+                      resolves the write-ahead)
+
+    If the process dies between the exchange fill and the result append,
+    the unresolved ``order_submitted`` surfaces as a dangling intent: the
+    gate blocks new entries and the position monitor adopts or dismisses
+    it against live exchange state. Every ``place_order()`` call site
+    must go through here — a bare call reintroduces the blind window.
+    """
+    append_event(state_path, {
+        "type": "order_submitted",
+        "ts": utcnow_iso(),
+        "intent_id": intent.intent_id,
+        "symbol": intent.symbol,
+        "side": _intent_to_binance_side(intent.side),
+        "stop_loss": intent.stop_loss,
+        "take_profit": intent.take_profit,
+        "mode": executor.mode,
+    })
+
+    result = executor.place_order(intent, equity_usd=equity_usd, mark_price=mark_price)
+
+    if result.success or result.position_naked:
+        append_event(state_path, {
+            "type": "position_opened",
+            "ts": result.placed_at,
+            "intent_id": intent.intent_id,
+            "symbol": intent.symbol,
+            "mode": result.mode,
+            "order_id": result.order_id,
+            "quantity": result.quantity,
+            "notional_usd": result.notional_usd,
+            "side": result.side,
+            "entry_price": result.avg_fill_price if result.avg_fill_price
+                           else mark_price,
+            "stop_loss": intent.stop_loss,
+            "take_profit": intent.take_profit,
+        })
+        if result.position_naked:
+            # The opening order filled but the stop failed AND the unwind
+            # failed: a live, unprotected position is on the exchange.
+            # Recorded as opened above (so the gate blocks new entries) AND
+            # flagged for the operator. NOT trade_skipped — would undercount.
+            append_event(state_path, {
+                "type": "position_naked", "ts": result.placed_at,
+                "intent_id": intent.intent_id, "symbol": intent.symbol,
+                "reason": result.error or "naked position — manual intervention required",
+            })
+            logger.error(
+                "NAKED POSITION on %s (intent %s): %s",
+                intent.symbol, intent.intent_id, result.error,
+            )
+    else:
+        append_event(state_path, {
+            "type": "trade_skipped", "ts": result.placed_at,
+            "intent_id": intent.intent_id,
+            "symbol": intent.symbol, "reason": result.error or "execution failed",
+        })
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Factory + LangGraph node
 # ---------------------------------------------------------------------------
 
@@ -540,9 +625,9 @@ def create_executor_node(config: dict):
     Writes to state:
     - ``execution_result``: dict (ExecutionResult as dict) or ``None``.
 
-    On successful placement, also appends a ``position_opened`` event to
-    the risk-state JSONL so the next run's snapshot reflects the live
-    position. Failures are logged as ``trade_skipped`` for audit.
+    Event logging goes through :func:`execute_with_ledger` — intent
+    write-ahead before the order, paired result event after — so the
+    risk-state JSONL never has a blind window around the exchange call.
     """
     executor = create_executor(config)
     starting_equity = float(config.get("futures_starting_equity_usd", 1000.0))
@@ -579,49 +664,12 @@ def create_executor_node(config: dict):
             return {"execution_result": {"success": False, "error": error,
                                          "intent_id": intent.intent_id}}
 
-        result = executor.place_order(intent, equity_usd=equity_usd, mark_price=float(mark_price))
-
-        if result.success:
-            append_event(state_path, {
-                "type": "position_opened",
-                "ts": result.placed_at,
-                "intent_id": intent.intent_id,
-                "symbol": intent.symbol,
-                "mode": result.mode,
-                "order_id": result.order_id,
-                "quantity": result.quantity,
-                "notional_usd": result.notional_usd,
-            })
-        elif result.position_naked:
-            # The opening order filled but the stop failed AND the unwind
-            # failed: a live, unprotected position is on the exchange. Record
-            # it as opened (so the gate's concurrent-position count includes
-            # it and blocks new entries) AND raise a distinct naked alert for
-            # the operator. Do NOT log trade_skipped — that would undercount.
-            append_event(state_path, {
-                "type": "position_opened",
-                "ts": result.placed_at,
-                "intent_id": intent.intent_id,
-                "symbol": intent.symbol,
-                "mode": result.mode,
-                "order_id": result.order_id,
-                "quantity": result.quantity,
-                "notional_usd": result.notional_usd,
-            })
-            append_event(state_path, {
-                "type": "position_naked", "ts": result.placed_at,
-                "intent_id": intent.intent_id, "symbol": intent.symbol,
-                "reason": result.error or "naked position — manual intervention required",
-            })
-            logger.error(
-                "NAKED POSITION on %s (intent %s): %s",
-                intent.symbol, intent.intent_id, result.error,
-            )
-        else:
-            append_event(state_path, {
-                "type": "trade_skipped", "ts": result.placed_at,
-                "symbol": intent.symbol, "reason": result.error or "execution failed",
-            })
+        result = execute_with_ledger(
+            executor, intent,
+            equity_usd=equity_usd,
+            mark_price=float(mark_price),
+            state_path=state_path,
+        )
 
         return {"execution_result": asdict(result)}
 

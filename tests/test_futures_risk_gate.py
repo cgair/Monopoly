@@ -13,6 +13,7 @@ from tradingagents.agents.schemas import FuturesDecision, FuturesSide
 from tradingagents.futures.risk_gate import (
     REASON_COOLDOWN_ACTIVE,
     REASON_DAILY_DRAWDOWN_HALT,
+    REASON_DANGLING_INTENT,
     REASON_FLAT,
     REASON_LEVERAGE_BELOW_MIN,
     REASON_LEVERAGE_OVER_CAP,
@@ -324,6 +325,24 @@ class TestEvaluateRejections:
         assert not result.approved
         assert REASON_MAX_POSITIONS in result.reason
 
+    def test_dangling_intent_blocks_new_entry(self):
+        from tradingagents.futures.risk_state import DanglingIntent
+
+        snap = RiskGateSnapshot(
+            open_positions=0,
+            daily_realised_pnl_usd=0.0,
+            last_stop_loss_close_ts=None,
+            dangling_intents=(DanglingIntent(
+                intent_id="i-dangling", symbol="BTC-USD",
+                submitted_ts=NOW - timedelta(minutes=10),
+            ),),
+        )
+        result = evaluate(_ok_long(), symbol="ETH-USD", equity_usd=1000.0,
+                          config=RiskGateConfig(), now=NOW, snapshot=snap)
+        assert not result.approved
+        assert REASON_DANGLING_INTENT in result.reason
+        assert "i-dangling" in result.reason
+
 
 # ---------------------------------------------------------------------------
 # Node factory: state writes + state-dict shape
@@ -436,3 +455,10 @@ def test_from_config_reads_macro_block_hours():
     cfg = from_config({"futures_macro_block_hours": 4.5})
     assert cfg.macro_block_hours == 4.5
     assert from_config({}).macro_block_hours == 0.0
+
+
+@pytest.mark.unit
+def test_from_config_reads_dangling_intent_minutes():
+    cfg = from_config({"futures_dangling_intent_minutes": 15})
+    assert cfg.dangling_intent_minutes == 15.0
+    assert from_config({}).dangling_intent_minutes == 5.0

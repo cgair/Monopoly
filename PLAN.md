@@ -1,6 +1,6 @@
 # Monopoly 开发计划(PLAN.md)
 
-- **更新**: 2026-08-02(**T12 代码+单测完成**,559 passed;剩 T12 的 2 项 testnet 实测(操作步骤见任务卡注记,等用户确认后实弹)、用户在 Mac mini 配 OpenClaw+Discord、T13/T3b(可选);此前同日 T9–T11 完成;Hermes 与 T8 均搁置/观察)
+- **更新**: 2026-08-02(**T12 全部完成**:代码+单测 561 passed + 2 项 testnet 实弹验收通过;剩:用户在 Mac mini 配 OpenClaw+Discord、T13/T3b(可选);此前同日 T9–T11 完成;Hermes 与 T8 均搁置/观察。**mainnet 前置条件中 T12 已闭合**,还差 OpenClaw 人工审批链路配置)
 - **来源**: `~/Desktop/AI/become rich/docs/monopoly-spec.md` §3 / §5 / §8 + 工作区未提交改动盘点
 - **用法**: 每个任务设计为可由一个独立 Claude Code 实例(worktree 或新会话)冷启动执行。
   开工前先读任务卡里的「上下文锚点」,完成后勾选并在 spec §8 追加恢复点。
@@ -29,7 +29,7 @@ T0 ✅ ── T1 ✅ ── T2 ✅ ── T3 ✅ ── T4 ✅ ── T5 ✅ ─
 
 新增(2026-07-31,对账闭环加固,QuantDinger 调研引出):
       T12 ✅ 对账闭环补全:intent 先行落盘 + 反向对账 + 真实 PnL 回填(P1,mainnet 前置)
-          (2026-08-02 代码+单测完成;剩 2 项 testnet 实测待用户确认后实弹,见任务卡)
+          (2026-08-02 代码+单测+2 项 testnet 实弹验收全部完成,见任务卡)
       T13 单写者锁:monitor 与 graph run 并发防护(P3,可选)
 ```
 
@@ -439,8 +439,13 @@ env 开启硬拒后 gate 拒绝并写审计事件;真实拉取一次确认 schem
   ✅ 2026-08-02 实弹通过:demo.binance.com(与 testnet API 同账户,余额比对确认)手动开
   BTCUSDT 0.002 → untracked 检出/告警/不重复/gate 计数全对;手动平仓后对账回填**真实
   pnl -0.0382**(income history),小亏无止损价比对 → 保守标 `stop` 武装 cooldown(预期内)。
-- [ ] testnet 实测:止损触发的平仓,对账事件带非零 `pnl_usd`、`outcome=stop`,其后 60min 内
+- [x] testnet 实测:止损触发的平仓,对账事件带非零 `pnl_usd`、`outcome=stop`,其后 60min 内
   新开仓被 cooldown 拒绝(写 `trade_skipped`)。
+  ✅ 2026-08-02 实弹通过:trade_execute 审批链路开 0.033 BTC 多单(write-ahead 配对入账,
+  stop 63190 / TP 64500 双保护单挂上)→ 35min 后真实止损触发 → monitor 对账
+  `pnl_usd=-2.9172`(income history),pnl 反推成交价 63191 近邻匹配止损价 →
+  `outcome=stop`,孤儿 TP 算法单自动撤净 → cooldown 生效,再次 trade_execute 被 gate 拒
+  (`gate_rejected` + `trade_skipped` 带审批元数据)。**T12 全部验收完成。**
 
 **明确不做**(QuantDinger 调研中评估后放弃):Postgres / Celery / 多进程 worker、
 durable command 表——单机 JSONL + launchd 规模下是纯负担;lease/fencing 简化为 T13。

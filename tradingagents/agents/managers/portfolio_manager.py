@@ -54,6 +54,7 @@ def create_portfolio_manager(llm):
             trader_plan=trader_plan,
             history=history,
             lessons_line=lessons_line,
+            macro_block=_macro_event_block(),
         )
         # Inline the structured-then-fallback flow so we can capture
         # the typed FuturesDecision object for the downstream risk
@@ -103,6 +104,25 @@ def create_portfolio_manager(llm):
     return portfolio_manager_node
 
 
+def _macro_event_block() -> str:
+    """Advisory macro-event warning for the PM prompt (L1 layer).
+
+    Fail-open by design: calendar problems must never block the PM.
+    """
+    from tradingagents.dataflows.config import get_config
+    from tradingagents.dataflows import econ_calendar
+
+    try:
+        hours = float(get_config().get("futures_macro_warn_hours", 12))
+        if hours <= 0:
+            return ""
+        warning = econ_calendar.format_macro_event_warning(hours)
+    except Exception as exc:
+        logger.warning("macro event block skipped (fail-open): %s", exc)
+        return ""
+    return f"\n{warning}\n" if warning else ""
+
+
 def _build_crypto_prompt(
     *,
     instrument_context: str,
@@ -110,6 +130,7 @@ def _build_crypto_prompt(
     trader_plan: str,
     history: str,
     lessons_line: str,
+    macro_block: str = "",
 ) -> str:
     return f"""As the Portfolio Manager for a crypto perpetual-futures desk, synthesise the risk analysts' debate and emit the **final** futures decision the risk gate will validate.
 
@@ -146,7 +167,7 @@ def _build_crypto_prompt(
 **Context:**
 - Research Manager's investment plan: **{research_plan}**
 - Trader's futures proposal: **{trader_plan}**
-{lessons_line}
+{lessons_line}{macro_block}
 **Risk Analysts Debate History:**
 {history}
 

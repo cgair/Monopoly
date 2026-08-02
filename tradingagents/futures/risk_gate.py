@@ -68,6 +68,14 @@ class RiskGateConfig:
     """Maximum number of simultaneously open positions across all
     symbols. Matches the 2-symbol scope (BTC + ETH) in the spec."""
 
+    macro_block_hours: float = 0.0
+    """When > 0, reject new entries if a high-impact USD macro event
+    (FOMC / CPI / NFP …) is within this many hours ahead. Default off:
+    the PM prompt already carries an advisory warning (L1); enable this
+    hard block (L3) only if testnet reviews show macro-window losses.
+    Calendar failures fail-open — this is a caution layer, not the
+    safety floor."""
+
     state_path: Optional[Path] = None
     """Path to the JSONL event log. ``None`` → :func:`default_state_path`."""
 
@@ -89,6 +97,7 @@ def from_config(config: dict) -> RiskGateConfig:
         daily_drawdown_halt_pct=float(config.get("futures_daily_drawdown_halt_pct", 0.03)),
         cooldown_after_loss_minutes=int(config.get("futures_cooldown_after_loss_minutes", 60)),
         max_concurrent_positions=int(config.get("futures_max_concurrent_positions", 2)),
+        macro_block_hours=float(config.get("futures_macro_block_hours", 0.0)),
         state_path=Path(state_path) if state_path else None,
     )
 
@@ -142,6 +151,7 @@ REASON_STOP_WRONG_SIDE = "stop_loss is on the wrong side of entry"
 REASON_DAILY_DRAWDOWN_HALT = "daily drawdown halt active until next UTC day"
 REASON_COOLDOWN_ACTIVE = "cooldown window active after recent stop-out"
 REASON_MAX_POSITIONS = "max_concurrent_positions already open"
+REASON_MACRO_EVENT_WINDOW = "high-impact macro event inside block window"
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +167,7 @@ def evaluate(
     config: RiskGateConfig,
     now: Optional[datetime] = None,
     snapshot: Optional[RiskGateSnapshot] = None,
+    macro_events: Optional[list] = None,
 ) -> GateResult:
     """Validate ``decision`` against ``config`` and optional cross-run state.
 
@@ -179,6 +190,10 @@ def evaluate(
         Cross-run state. If ``None``, the gate loads + derives from
         ``config.resolved_state_path()``. Tests can pass a synthesised
         snapshot to skip file I/O.
+    macro_events
+        Injectable calendar events for the optional macro-window block.
+        ``None`` → fetched lazily (only when ``config.macro_block_hours``
+        > 0); tests pass synthetic events to stay offline.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -283,6 +298,26 @@ def evaluate(
                     f"({snapshot.open_positions} / {config.max_concurrent_positions})"),
             snapshot=snapshot,
         )
+
+    # 8) Optional macro-event window block (default off). Fail-open: a
+    # calendar failure yields no events and therefore no block — the PM
+    # advisory warning (L1) and the ceilings above remain the real floor.
+    if config.macro_block_hours > 0:
+        from tradingagents.dataflows.econ_calendar import upcoming_high_impact
+
+        try:
+            hits = upcoming_high_impact(config.macro_block_hours, now=now,
+                                        events=macro_events)
+        except Exception:
+            hits = []
+        if hits:
+            nxt = hits[0]
+            return GateResult(
+                approved=False,
+                reason=(f"{REASON_MACRO_EVENT_WINDOW} "
+                        f"({nxt.title} at {nxt.when.isoformat()})"),
+                snapshot=snapshot,
+            )
 
     intent = ExecutionIntent(
         intent_id=str(uuid.uuid4()),

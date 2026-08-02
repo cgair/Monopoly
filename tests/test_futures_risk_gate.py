@@ -385,3 +385,54 @@ class TestRiskGateNode:
         events = load_events(state_path)
         assert len(events) == 1
         assert events[0]["type"] == "trade_skipped"
+
+
+# ---------------------------------------------------------------------------
+# Macro-event window block (optional, default off)
+# ---------------------------------------------------------------------------
+
+def _macro_event(hours_from_now: float, *, country="USD", impact="High"):
+    from tradingagents.dataflows.econ_calendar import EconEvent
+    return EconEvent(title="FOMC Statement", country=country, impact=impact,
+                     when=NOW + timedelta(hours=hours_from_now))
+
+
+@pytest.mark.unit
+def test_macro_block_disabled_by_default_ignores_events():
+    result = evaluate(_ok_long(), symbol="BTC-USD", equity_usd=1000.0,
+                      config=RiskGateConfig(), now=NOW,
+                      snapshot=_empty_snapshot(),
+                      macro_events=[_macro_event(1.0)])
+    assert result.approved is True
+
+
+@pytest.mark.unit
+def test_macro_block_rejects_inside_window():
+    from tradingagents.futures.risk_gate import REASON_MACRO_EVENT_WINDOW
+    result = evaluate(_ok_long(), symbol="BTC-USD", equity_usd=1000.0,
+                      config=RiskGateConfig(macro_block_hours=6.0), now=NOW,
+                      snapshot=_empty_snapshot(),
+                      macro_events=[_macro_event(2.0)])
+    assert result.approved is False
+    assert REASON_MACRO_EVENT_WINDOW in result.reason
+    assert "FOMC Statement" in result.reason
+
+
+@pytest.mark.unit
+def test_macro_block_passes_outside_window_or_low_impact():
+    cfg = RiskGateConfig(macro_block_hours=6.0)
+    outside = evaluate(_ok_long(), symbol="BTC-USD", equity_usd=1000.0,
+                       config=cfg, now=NOW, snapshot=_empty_snapshot(),
+                       macro_events=[_macro_event(12.0)])
+    assert outside.approved is True
+    medium = evaluate(_ok_long(), symbol="BTC-USD", equity_usd=1000.0,
+                      config=cfg, now=NOW, snapshot=_empty_snapshot(),
+                      macro_events=[_macro_event(2.0, impact="Medium")])
+    assert medium.approved is True
+
+
+@pytest.mark.unit
+def test_from_config_reads_macro_block_hours():
+    cfg = from_config({"futures_macro_block_hours": 4.5})
+    assert cfg.macro_block_hours == 4.5
+    assert from_config({}).macro_block_hours == 0.0

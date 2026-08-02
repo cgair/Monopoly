@@ -206,7 +206,11 @@ class TestExportHermesMemory:
     def test_export_with_decisions(self, temp_dirs):
         """Test exporting with recent decisions."""
         memory_path = temp_dirs["memory"] / "trading_memory.md"
-        content = """[2026-07-19 | BTC-USD | Buy | pending]
+        # Entry date must fall inside the default 168h lookback, so it is
+        # generated relative to today rather than hardcoded.
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        content = f"""[{today} | BTC-USD | Buy | pending]
 
 DECISION:
 Strong momentum signal. Recommend 2.0x leverage long entry.

@@ -421,3 +421,75 @@ class TestApprovalScenarios:
         events = load_events(tmp_path / "state.jsonl")
         assert events[0]["approval_decision"] == "approved"  # Was approved
         assert "max" in events[0]["reason"].lower()  # But gate rejected
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-02 review fixes (F3: replay protection; F12: ticker fail-fast)
+# ---------------------------------------------------------------------------
+
+
+def _invoke_cli(args):
+    from typer.testing import CliRunner
+    from cli.main import app
+
+    return CliRunner().invoke(app, args)
+
+
+@pytest.mark.unit
+class TestDecisionReplayProtection:
+    """F3: re-running the CLI on an already-executed decision file must be
+    refused — in one-way mode a repeat opens a second same-direction
+    position, doubling exposure past what was approved."""
+
+    def test_second_execution_of_same_decision_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(
+            "TRADINGAGENTS_RISK_GATE_STATE_PATH", str(tmp_path / "state.jsonl"),
+        )
+        monkeypatch.delenv("EXECUTOR_MODE", raising=False)
+        import cli.main as cli_main
+        monkeypatch.setitem(
+            cli_main.DEFAULT_CONFIG,
+            "futures_orders_log_path", str(tmp_path / "orders.jsonl"),
+        )
+        monkeypatch.setitem(cli_main.DEFAULT_CONFIG, "futures_executor_mode", "dryrun")
+        import tradingagents.futures.market_data as market_data
+        monkeypatch.setattr(market_data, "fetch_mark_price", lambda s: 64500.0)
+
+        decision_file = tmp_path / "decision.json"
+        decision_file.write_text(json.dumps(_sample_decision_json()))
+        args = ["trade_execute", "--decision-file", str(decision_file),
+                "--approved", "--approved-by", "alice@discord"]
+
+        first = _invoke_cli(args)
+        assert first.exit_code == 0, first.stdout
+        assert '"executed"' in first.stdout
+
+        second = _invoke_cli(args)
+        assert second.exit_code == 1, second.stdout
+        assert "duplicate" in second.stdout.lower()
+        # Exactly one position was opened across both runs.
+        events = load_events(tmp_path / "state.jsonl")
+        assert [e["type"] for e in events].count("position_opened") == 1
+
+
+@pytest.mark.unit
+class TestTickerFailFast:
+    """F12: a decision without analysis.ticker must error out, not proceed
+    as symbol UNKNOWN (which only fails much later, at the exchange,
+    with a baffling message)."""
+
+    def test_missing_ticker_exits_2_with_clear_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(
+            "TRADINGAGENTS_RISK_GATE_STATE_PATH", str(tmp_path / "state.jsonl"),
+        )
+        decision = _sample_decision_json()
+        del decision["analysis"]["ticker"]
+        decision_file = tmp_path / "decision.json"
+        decision_file.write_text(json.dumps(decision))
+
+        # Rejected path touches no executor/network, yet still needs the
+        # symbol — fail-fast must trigger before any event is written.
+        result = _invoke_cli(["trade_execute", "--decision-file", str(decision_file),
+                              "--rejected", "--approved-by", "alice@discord"])
+        assert result.exit_code == 2, result.stdout
+        assert "ticker" in result.stdout

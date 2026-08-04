@@ -83,6 +83,10 @@ class ExecutionResult:
 # ---------------------------------------------------------------------------
 
 
+_UNWIND_FAILED_STATUSES = frozenset({"REJECTED", "EXPIRED", "CANCELED", "CANCELLED"})
+"""Terminal order statuses that mean the unwind did NOT close the position."""
+
+
 class ExecutorAdapter(Protocol):
     mode: str
 
@@ -282,12 +286,21 @@ class TestnetExecutor:
 
     mode = "testnet"
 
+    _REQUEST_TIMEOUT_SECONDS = 10
+    """Per-request HTTP timeout. python-binance passes requests_params
+    through to every requests call; without it the default is NO timeout,
+    so a stalled connection would hang the order placement forever with a
+    possibly-live position unmonitored until the next monitor run."""
+
     def __init__(self, api_key: str, api_secret: str, *, client_cls=None):
         # Lazy import so dryrun-only runs do not require python-binance.
         if client_cls is None:
             from binance.client import Client  # type: ignore[import-untyped]
             client_cls = Client
-        self.client = client_cls(api_key, api_secret, testnet=True)
+        self.client = client_cls(
+            api_key, api_secret, testnet=True,
+            requests_params={"timeout": self._REQUEST_TIMEOUT_SECONDS},
+        )
 
     def place_order(
         self,
@@ -370,6 +383,14 @@ class TestnetExecutor:
                 margin_required_usd=margin_required,
             )
 
+        # Partial fills: everything downstream must use what actually
+        # filled, not what was requested — a reduceOnly stop/TP (or the
+        # emergency unwind) sized off the requested qty is over-sized and
+        # gets rejected by the exchange, leaving the position naked.
+        executed_qty = _safe_float(open_resp.get("executedQty"))
+        filled_qty = executed_qty if executed_qty and executed_qty > 0 else qty_rounded
+        notional_filled = filled_qty * reference_price
+
         # Phase 2 — protective orders. The position now EXISTS. Any failure
         # here leaves it naked, so we attempt a market unwind before
         # returning. If the unwind also fails, flag position_naked so the
@@ -380,7 +401,7 @@ class TestnetExecutor:
                 side=close_side,
                 type="STOP_MARKET",
                 stopPrice=str(intent.stop_loss),
-                quantity=qty_rounded,
+                quantity=filled_qty,
                 reduceOnly=True,
                 workingType="MARK_PRICE",
             )
@@ -394,22 +415,22 @@ class TestnetExecutor:
                     side=close_side,
                     type="TAKE_PROFIT_MARKET",
                     stopPrice=str(intent.take_profit),
-                    quantity=qty_rounded,
+                    quantity=filled_qty,
                     reduceOnly=True,
                     workingType="MARK_PRICE",
                 )
                 tp_order_id = _extract_order_id(tp_resp, "take_profit")
         except Exception as exc:  # protective order failed — position is naked
             unwound, unwind_err = self._try_unwind(
-                binance_symbol, close_side, qty_rounded,
+                binance_symbol, close_side, filled_qty,
             )
             if unwound:
                 return self._error_result(
                     intent,
                     error=(f"protective order failed, position unwound: "
                            f"{type(exc).__name__}: {exc}"),
-                    quantity=qty_rounded,
-                    notional_usd=notional_rounded,
+                    quantity=filled_qty,
+                    notional_usd=notional_filled,
                     margin_required_usd=margin_required,
                 )
             return self._error_result(
@@ -417,8 +438,8 @@ class TestnetExecutor:
                 error=(f"protective order failed AND unwind failed — POSITION NAKED, "
                        f"manual intervention required. stop_err={type(exc).__name__}: {exc}; "
                        f"unwind_err={unwind_err}"),
-                quantity=qty_rounded,
-                notional_usd=notional_rounded,
+                quantity=filled_qty,
+                notional_usd=notional_filled,
                 margin_required_usd=margin_required,
                 position_naked=True,
             )
@@ -430,8 +451,8 @@ class TestnetExecutor:
             placed_at=utcnow_iso(),
             symbol=intent.symbol,
             side=binance_side,
-            quantity=qty_rounded,
-            notional_usd=notional_rounded,
+            quantity=filled_qty,
+            notional_usd=notional_filled,
             margin_required_usd=margin_required,
             order_id=open_order_id,
             avg_fill_price=_safe_float(open_resp.get("avgPrice")),
@@ -446,20 +467,30 @@ class TestnetExecutor:
         """Best-effort market close of a just-opened position whose stop failed.
 
         Returns ``(True, None)`` on success, ``(False, error_str)`` if the
-        unwind order itself raised — in which case the position is naked and
-        the caller must escalate.
+        unwind order raised or came back rejected — in which case the
+        position is naked and the caller must escalate.
+
+        A MARKET reduceOnly order essentially always fills, but Binance
+        can still answer with a terminal non-fill status (REJECTED /
+        EXPIRED / CANCELED) instead of raising. Treating any non-raising
+        response as success would report a naked position as safely
+        unwound, which is the one mistake this path exists to prevent.
         """
         try:
-            self.client.futures_create_order(
+            resp = self.client.futures_create_order(
                 symbol=binance_symbol,
                 side=close_side,
                 type="MARKET",
                 quantity=qty,
                 reduceOnly=True,
             )
-            return True, None
         except Exception as exc:
             return False, f"{type(exc).__name__}: {exc}"
+
+        status = resp.get("status") if isinstance(resp, dict) else None
+        if status in _UNWIND_FAILED_STATUSES:
+            return False, f"unwind order came back {status}: {resp!r}"
+        return True, None
 
     def _error_result(self, intent: ExecutionIntent, *,
                       error: str,
@@ -520,8 +551,10 @@ def execute_with_ledger(
                       so the monitor can later infer the close outcome)
     - naked         → ``position_opened`` + ``position_naked`` (the gate's
                       concurrent count must include a naked position)
-    - failure       → ``trade_skipped`` (carries ``intent_id`` so it
-                      resolves the write-ahead)
+    - failure       → ``trade_skipped`` with ``origin="executor"`` (carries
+                      ``intent_id`` so it resolves the write-ahead, and the
+                      origin marks it as an executor error for the alerts
+                      layer rather than a gate rejection)
 
     If the process dies between the exchange fill and the result append,
     the unresolved ``order_submitted`` surfaces as a dangling intent: the
@@ -573,9 +606,13 @@ def execute_with_ledger(
                 intent.symbol, intent.intent_id, result.error,
             )
     else:
+        # origin=executor separates "the exchange call failed" from the far
+        # more common "the gate rejected this decision". Both land as
+        # trade_skipped; only the former should count toward the alerts
+        # layer's executor-error threshold.
         append_event(state_path, {
             "type": "trade_skipped", "ts": result.placed_at,
-            "intent_id": intent.intent_id,
+            "intent_id": intent.intent_id, "origin": "executor",
             "symbol": intent.symbol, "reason": result.error or "execution failed",
         })
 

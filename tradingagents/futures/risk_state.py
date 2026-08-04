@@ -115,7 +115,7 @@ def append_event(path: Path | str, event: dict) -> None:
 
 
 def load_events(path: Path | str) -> list[dict]:
-    """Return all events in chronological (file) order. Missing file → [].
+    """Return all events in chronological (``ts``) order. Missing file → [].
 
     Malformed lines (torn writes from a crash / power loss) are skipped
     with a warning instead of raising — a single bad line must not brick
@@ -134,6 +134,14 @@ def load_events_with_errors(path: Path | str) -> tuple[list[dict], int]:
     availability call, but if the dropped line happened to be a
     ``position_opened`` the replayed state silently drifts from reality —
     the operator has to be told the file needs inspection.
+
+    Events are returned sorted by ``ts`` (stable, so same-second events
+    keep their append order). The gate CLI and the launchd monitor append
+    to this file independently, so file order is not guaranteed to be time
+    order — and every consumer here folds events sequentially
+    (open/close pairing, consecutive-stop runs, cooldown start), which
+    silently miscounts on an out-of-order line. Events with a missing or
+    unparseable ``ts`` sort last rather than raising.
     """
     p = Path(path)
     if not p.exists():
@@ -154,7 +162,30 @@ def load_events_with_errors(path: Path | str) -> tuple[list[dict], int]:
                     "replayed state may be missing an event; inspect the file",
                     line_num, p,
                 )
+    events.sort(key=_sort_key)
     return events, malformed
+
+
+_TS_SORT_LAST = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def _sort_key(event: dict) -> datetime:
+    """Sortable UTC timestamp for an event; unusable ``ts`` sorts last.
+
+    Naive timestamps (older hand-written entries) are read as UTC so they
+    stay comparable with the aware ones — mixing the two would raise
+    mid-sort and take down every consumer.
+    """
+    ts = event.get("ts")
+    if not isinstance(ts, str):
+        return _TS_SORT_LAST
+    try:
+        parsed = _parse_ts(ts)
+    except ValueError:
+        return _TS_SORT_LAST
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 DEFAULT_DANGLING_INTENT_MINUTES = 5
@@ -208,6 +239,18 @@ def derive_state(
             open_count -= 1
             ts = _parse_ts(ev["ts"])
             if ts >= today_start:
+                # A close with no pnl_usd contributes 0 to the drawdown
+                # tally — correct as a fallback, but if it happens because
+                # the writer dropped the field the halt is quietly blind to
+                # a real loss. Warn so it shows up rather than accumulating
+                # silently. (The monitor always writes pnl_usd, marking
+                # unavailable data with pnl_backfill_failed instead.)
+                if "pnl_usd" not in ev:
+                    logger.warning(
+                        "position_closed at %s (intent %s) has no pnl_usd — "
+                        "counted as 0 in the daily drawdown; check the writer",
+                        ev.get("ts"), ev.get("intent_id", "unknown"),
+                    )
                 daily_pnl += float(ev.get("pnl_usd", 0.0))
             if ev.get("outcome") == "stop":
                 if last_stop_close_ts is None or ts > last_stop_close_ts:

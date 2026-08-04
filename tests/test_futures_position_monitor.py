@@ -82,7 +82,9 @@ class TestTestnetExchange:
         mock_cls.return_value = mock_client
         ex = TestnetExchange("key", "secret", client_cls=mock_cls)
         assert ex.client == mock_client
-        mock_cls.assert_called_once_with("key", "secret", testnet=True)
+        mock_cls.assert_called_once_with(
+            "key", "secret", testnet=True, requests_params={"timeout": 10},
+        )
 
     def test_get_open_positions_filters_zero_amounts(self):
         mock_client = Mock()
@@ -568,14 +570,15 @@ class TestAlgoOrderCancellation:
         mock_client.futures_cancel_all_algo_open_orders.assert_called_once()
 
     def test_testnet_cancel_all_algo_orders_api_failure(self):
-        """TestnetExchange.cancel_all_algo_orders returns 0 on any API failure."""
+        """An API failure returns None, not 0 — 0 means "nothing to cancel"
+        and would read as a clean run while conditionals stay live."""
         mock_client = Mock()
         mock_client.futures_get_open_algo_orders.side_effect = Exception("Network error")
         ex = TestnetExchange("key", "secret", client_cls=lambda *a, **kw: mock_client)
 
         count = ex.cancel_all_algo_orders("BTCUSDT")
 
-        assert count == 0
+        assert count is None
 
     def test_reconcile_calls_cancel_all_algo_orders(self, temp_jsonl: Path):
         """reconcile_positions calls cancel_all_algo_orders for closed positions."""

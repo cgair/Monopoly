@@ -1,8 +1,9 @@
 """Human approval gate for trade execution.
 
 This module implements the final safety fence before orders hit the wire:
-approval timestamps, staleness validation, and the decision → ExecutionIntent
-reconstruction flow that the CLI uses before calling the executor.
+approval timestamps, staleness validation, replay protection, and the
+decision → ExecutionIntent reconstruction flow that the CLI uses before
+calling the executor.
 
 Design principle: the CLI parses args and decision JSON, this module enforces
 the approval semantics (who, when, staleness bounds, gate re-evaluation).
@@ -11,6 +12,7 @@ the approval semantics (who, when, staleness bounds, gate re-evaluation).
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -227,6 +229,72 @@ def reconstruct_intent_from_decision(
         return result.intent, None
     else:
         return None, result.reason or "gate rejected decision (reason unknown)"
+
+
+def decision_fingerprint(decision_json: dict) -> str:
+    """Stable identifier for one decision document.
+
+    Hashes the decision body together with its timestamp, so re-running
+    the same approved file is recognised while a genuinely new decision
+    for the same symbol (new timestamp / different levels) is not.
+    """
+    payload = decision_json.get("decision", decision_json)
+    ts = (decision_json.get("timestamp") or decision_json.get("created_at")
+          or payload.get("timestamp") or payload.get("created_at") or "")
+    canonical = json.dumps(
+        {"ts": ts, "decision": payload}, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def find_prior_execution(
+    fingerprint: str, *, state_path: Optional[Path] = None,
+) -> Optional[dict]:
+    """Return the earlier ``decision_executed`` event for ``fingerprint``.
+
+    ``None`` when this decision has not been executed before.
+    """
+    from tradingagents.futures.risk_state import default_state_path
+
+    if state_path is None:
+        state_path = default_state_path()
+    for event in load_events(state_path):
+        if (event.get("type") == "decision_executed"
+                and event.get("decision_fingerprint") == fingerprint):
+            return event
+    return None
+
+
+def record_decision_execution(
+    fingerprint: str,
+    *,
+    symbol: str,
+    approval_metadata: Optional[ApprovalMetadata] = None,
+    state_path: Optional[Path] = None,
+) -> None:
+    """Claim a decision as executed, before the order goes to the exchange.
+
+    Written ahead of the exchange call on purpose: if the process dies
+    mid-execution, a re-run must still be refused (the position may be
+    live — the dangling-intent path is what reconciles it), rather than
+    opening a second position on top of the first.
+    """
+    from tradingagents.futures.risk_state import default_state_path
+
+    if state_path is None:
+        state_path = default_state_path()
+
+    event = {
+        "type": "decision_executed",
+        "ts": utcnow_iso(),
+        "symbol": symbol,
+        "decision_fingerprint": fingerprint,
+    }
+    if approval_metadata is not None:
+        event["approval_by"] = approval_metadata.approved_by
+        event["approval_at"] = approval_metadata.approved_at
+
+    append_event(state_path, event)
 
 
 def write_trade_skipped_event(

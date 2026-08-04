@@ -685,9 +685,13 @@ class TestExecuteWithLedger:
         )
 
     def _result(self, intent, **overrides):
+        # execute_with_ledger stamps the write-ahead with wall-clock time,
+        # so the result must be wall-clock too — a fixed NOW in the past
+        # would make the pair look out of order once events are ts-sorted.
         base = dict(
             success=True, intent_id=intent.intent_id, mode="fake",
-            placed_at=_iso(NOW), symbol=intent.symbol, side="BUY",
+            placed_at=_iso(datetime.now(timezone.utc)),
+            symbol=intent.symbol, side="BUY",
             quantity=0.01, notional_usd=650.0, margin_required_usd=325.0,
             avg_fill_price=65000.0,
         )
@@ -808,3 +812,34 @@ class TestMonitorMain:
         assert rc == 1  # untracked position found
         summary = json.loads(capsys.readouterr().out)
         assert summary["untracked_found"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-02 review fixes (F5b: orphan_algo_orders_pending was a dead metric)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestOrphanAlgoPendingMetric:
+    def test_algo_cancel_failure_increments_pending(self, jsonl):
+        """F5b: when algo-order cancellation fails after a close, the
+        stop/TP conditionals may still be live on the exchange — the
+        result must count them as pending, not report 0 forever."""
+        class FailingAlgoCancelExchange(FakeExchange):
+            def cancel_all_algo_orders(self, symbol):
+                return None  # adapter contract: None == cancellation failed
+
+        append_event(jsonl, {
+            "type": "position_opened", "ts": _iso(NOW - timedelta(hours=2)),
+            "intent_id": "i-1", "symbol": "BTC-USD", "side": "BUY",
+            "entry_price": 65000.0, "quantity": 0.01,
+            "stop_loss": 63000.0, "take_profit": 70000.0,
+        })
+        # Position gone on the exchange → pass 1 closes it and cancels
+        # orphaned orders; the algo cancellation fails.
+        result = reconcile_positions(
+            jsonl, FailingAlgoCancelExchange(realized_pnl=-5.0), now=NOW,
+        )
+        assert result.success
+        assert result.positions_closed == 1
+        assert result.orphan_algo_orders_pending == 1

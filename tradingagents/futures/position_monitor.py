@@ -147,7 +147,7 @@ class ExchangeAdapter(Protocol):
         """
         ...
 
-    def cancel_all_algo_orders(self, symbol: str) -> int:
+    def cancel_all_algo_orders(self, symbol: str) -> Optional[int]:
         """Cancel all algo orders for a symbol.
 
         Parameters
@@ -157,8 +157,12 @@ class ExchangeAdapter(Protocol):
 
         Returns
         -------
-        int
-            Number of orders cancelled. Returns 0 on failure.
+        Optional[int]
+            Number of orders cancelled (0 when there was nothing to
+            cancel), or ``None`` if the call failed. The two must stay
+            distinguishable: a failure can leave live conditionals with
+            no position behind them, and the caller counts those into
+            ``orphan_algo_orders_pending``.
         """
         ...
 
@@ -220,11 +224,19 @@ class TestnetExchange:
 
     mode = "testnet"
 
+    _REQUEST_TIMEOUT_SECONDS = 10
+    """Same reasoning as the executor's: python-binance defaults to no HTTP
+    timeout, and a launchd-driven monitor that hangs stops reconciling
+    silently — the gate then runs on stale state."""
+
     def __init__(self, api_key: str, api_secret: str, *, client_cls=None):
         if client_cls is None:
             from binance.client import Client  # type: ignore[import-untyped]
             client_cls = Client
-        self.client = client_cls(api_key, api_secret, testnet=True)
+        self.client = client_cls(
+            api_key, api_secret, testnet=True,
+            requests_params={"timeout": self._REQUEST_TIMEOUT_SECONDS},
+        )
 
     def get_open_positions(self) -> dict[str, dict]:
         """Fetch open positions via futures_position_information."""
@@ -263,7 +275,7 @@ class TestnetExchange:
             logger.error("Failed to cancel algo order %d for %s: %s", algo_id, symbol, exc)
             return False
 
-    def cancel_all_algo_orders(self, symbol: str) -> int:
+    def cancel_all_algo_orders(self, symbol: str) -> Optional[int]:
         """Cancel all open algo orders for a symbol.
 
         Lists via GET /fapi/v1/openAlgoOrders to report an accurate count,
@@ -271,6 +283,9 @@ class TestnetExchange:
         are exposed by python-binance as ``futures_get_open_algo_orders`` /
         ``futures_cancel_all_algo_open_orders``. Verified live on testnet
         2026-07-18.
+
+        ``None`` on failure — distinct from 0 ("nothing to cancel"), which
+        would otherwise read as a clean run while conditionals stay live.
         """
         try:
             resp = self.client.futures_get_open_algo_orders(symbol=symbol)
@@ -285,7 +300,7 @@ class TestnetExchange:
             return len(orders)
         except Exception as exc:
             logger.error("Failed to cancel all algo orders for %s: %s", symbol, exc)
-            return 0
+            return None
 
     def get_realized_pnl(self, symbol: str, start_time_ms: int) -> Optional[float]:
         """Sum REALIZED_PNL income entries for ``symbol`` since ``start_time_ms``.
@@ -561,10 +576,15 @@ def reconcile_positions(
                     binance_symbol,
                 )
 
-            # Algo orders: cancel via the exchange adapter.
+            # Algo orders: cancel via the exchange adapter. A failure here
+            # leaves live stop/TP conditionals with no position behind them
+            # — on the next entry they could fire against the new position,
+            # so the count has to reach the operator, not just the log.
             try:
-                _cancel_orphaned_algo_orders(binance_symbol, exchange)
+                if not _cancel_orphaned_algo_orders(binance_symbol, exchange):
+                    orphan_algo_pending += 1
             except Exception as exc:
+                orphan_algo_pending += 1
                 # If algo cancellation fails, log it but don't block other symbols
                 logger.warning(
                     "Failed to cancel algo orders for %s: %s; "
@@ -740,17 +760,31 @@ def reconcile_positions(
     )
 
 
-def _cancel_orphaned_algo_orders(binance_symbol: str, exchange: ExchangeAdapter) -> None:
+def _cancel_orphaned_algo_orders(binance_symbol: str, exchange: ExchangeAdapter) -> bool:
     """Cancel orphaned algo orders (STOP_MARKET / TAKE_PROFIT_MARKET).
 
     Calls exchange.cancel_all_algo_orders() which is implemented in T2.
     See: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/Cancel-Algo-Order
+
+    Returns ``True`` when the cancellation call completed (including the
+    "nothing to cancel" case, which returns 0), ``False`` when the adapter
+    signalled failure by returning ``None``. The caller counts failures
+    into ``orphan_algo_orders_pending`` so a stuck conditional is visible
+    in the exit code and the alerts layer.
     """
     try:
         count = exchange.cancel_all_algo_orders(binance_symbol)
-        logger.info("Cancelled %d algo orders for %s", count, binance_symbol)
     except Exception as exc:
         logger.error("Algo order cancellation failed for %s: %s", binance_symbol, exc)
+        return False
+    if count is None:
+        logger.error(
+            "Algo order cancellation failed for %s — conditionals may still "
+            "be live with no position behind them", binance_symbol,
+        )
+        return False
+    logger.info("Cancelled %d algo orders for %s", count, binance_symbol)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -797,8 +831,9 @@ def main(args: Optional[list] = None) -> int:
     ``python -m tradingagents.futures.position_monitor [--state-path P]``
     Mode comes from ``MONITOR_MODE`` (dryrun default; testnet needs
     BINANCE_TESTNET_API_KEY/SECRET). Exit codes: 0 = clean, 1 = attention
-    needed (untracked positions / P&L data gaps / left-dangling intents),
-    2 = run failed. Suitable as a launchd hook next to futures.alerts.
+    needed (untracked positions / P&L data gaps / left-dangling intents /
+    uncancelled algo orders), 2 = run failed. Suitable as a launchd hook
+    next to futures.alerts.
     """
     import argparse
     import json as _json
@@ -822,13 +857,15 @@ def main(args: Optional[list] = None) -> int:
         **{k: getattr(result, k) for k in (
             "success", "positions_checked", "positions_closed",
             "positions_adopted", "untracked_found", "dangling_dismissed",
-            "pnl_backfill_failures", "dangling_remaining", "error",
+            "pnl_backfill_failures", "dangling_remaining",
+            "orphan_algo_orders_pending", "error",
         )},
     }, indent=2))
 
     if not result.success:
         return 2
-    if result.untracked_found or result.pnl_backfill_failures or result.dangling_remaining:
+    if (result.untracked_found or result.pnl_backfill_failures
+            or result.dangling_remaining or result.orphan_algo_orders_pending):
         return 1
     return 0
 

@@ -27,19 +27,19 @@
 | # | Sev | 文件 | 一句话 | 状态 |
 |---|-----|------|--------|------|
 | F1 | HIGH | `tradingagents/futures/risk_state.py` | `load_events` 坏行崩溃，与 alerts.py 容错不一致 | ✓ fixed 2026-08-02 |
-| F2 | HIGH | `tradingagents/futures/executor.py` | Binance Client 无 timeout | ☐ |
-| F3 | HIGH | `cli/main.py` + `approval.py` | decision 文件无重放保护 | ☐ |
+| F2 | HIGH | `tradingagents/futures/executor.py` | Binance Client 无 timeout | ✓ fixed 2026-08-02 |
+| F3 | HIGH | `cli/main.py` + `approval.py` | decision 文件无重放保护 | ✓ fixed 2026-08-02 |
 | F4 | HIGH | `tradingagents/futures/position_monitor.py` | 多 dangling intent 收养选"最新"可能配错单 | ✓ fixed 2026-08-02 |
-| F5 | HIGH | `tradingagents/futures/alerts.py` / `position_monitor.py` | `executor_errors`、`orphan_algo_orders_pending` 是死指标 | ☐ |
+| F5 | HIGH | `tradingagents/futures/alerts.py` / `position_monitor.py` | `executor_errors`、`orphan_algo_orders_pending` 是死指标 | ✓ fixed 2026-08-02 |
 | F6 | MED | `position_monitor.py` | 收养仓位不校验 side | ✓ fixed 2026-08-02 |
 | F7 | MED | `position_monitor.py` | outcome 推断：相对容差无下限 + PnL 含手续费/资金费 | ✓ fixed（费用半句 disputed，见注） |
 | F8 | MED | `position_monitor.py` | income history 失败/intent 重叠只写 log 不走 alerts | ✓ fixed 2026-08-02 |
-| F9 | MED | `executor.py` | 市价开仓不处理部分成交（记请求量非 executedQty） | ☐ |
-| F10 | MED | `risk_gate.py` | 宏观日历异常静默吞掉，无痕放行 | ☐ |
-| F11 | MED | `risk_state.py` / `alerts.py` | 事件回放假定文件行序=时间序，未按 ts 排序 | ☐ |
-| F12 | LOW | `cli/main.py` | ticker 缺失默认 "UNKNOWN" 不 fail-fast | ☐ |
-| F13 | LOW | `trade_review.py` | `pnl_usd` 缺失静默按 0 累加 | ☐ |
-| F14 | LOW | `executor.py` | `_try_unwind` 不检查响应 status | ☐ |
+| F9 | MED | `executor.py` | 市价开仓不处理部分成交（记请求量非 executedQty） | ✓ fixed 2026-08-02 |
+| F10 | MED | `risk_gate.py` | 宏观日历异常静默吞掉，无痕放行 | ✓ fixed 2026-08-02 |
+| F11 | MED | `risk_state.py` / `alerts.py` | 事件回放假定文件行序=时间序，未按 ts 排序 | ✓ fixed 2026-08-02 |
+| F12 | LOW | `cli/main.py` | ticker 缺失默认 "UNKNOWN" 不 fail-fast | ✓ fixed 2026-08-02 |
+| F13 | LOW | `trade_review.py` | `pnl_usd` 缺失静默按 0 累加 | ✓ fixed 2026-08-02（实际位置 `risk_state.derive_state:211`） |
+| F14 | LOW | `executor.py` | `_try_unwind` 不检查响应 status | ✓ fixed 2026-08-02 |
 
 修复顺序建议：F1 → F2 → F3 → F4+F6（同一函数）→ F5 → F7/F8 → 其余按复盘证据排。
 
@@ -54,6 +54,29 @@
 >   误标 `stop` 白白触发 cooldown。已修：容差按候选取 `min(1%×close, 0.5×|entry−trigger|)`。
 > - F8：`MonitorResult.dangling_remaining` 计数（monitor CLI 退出码 1），alerts 全量事件配对
 >   检测 dangling（无视扫描窗口，3 天前的也报）→ WARN（`…_ALERT_DANGLING_INTENT_THRESHOLD`）。
+
+> **2026-08-02 修复批次二（F2/F3/F5/F9/F10/F11/F12/F13/F14，全量 519 passed / 1 skipped）**：
+> 每条先在未修复的 `cfe5ab8` worktree 上跑红测试确认失败，再最小改动转绿；无 disputed。
+> - F2：`TestnetExecutor` / `TestnetExchange` 均以 `requests_params={"timeout": 10}` 构造 Client。
+>   monitor 侧不在原 finding 范围内，但同一缺陷同一后果（launchd 任务悬死＝对账停摆），一并修。
+> - F3：`approval.decision_fingerprint`（decision 体 + ts 的 sha256）+ `decision_executed` 事件。
+>   **在交易所调用之前**写指纹：进程中途死掉时重跑仍拒绝（仓位可能已在，交给 dangling 路径对账），
+>   而不是再开一笔。拒绝路径 / 过期 / gate 驳回都不消耗指纹，修好问题后可正常重试。
+> - F5a：`execute_with_ledger` 给执行失败的 `trade_skipped` 打 `origin="executor"`，
+>   `analyze_events` 据此填 `executor_errors`——与 gate 驳回区分开，阈值告警这才真正能触发。
+> - F5b：`cancel_all_algo_orders` 失败契约由「返回 0」改为「返回 None」（0 = 无单可撤，
+>   两者混淆时失败会读成干净收工）；失败递增 `orphan_algo_orders_pending`，进 CLI 退出码。
+> - F9：市价开仓后取 `executedQty` 作真实仓量，保护单 / unwind / 事件记录全部改用它——
+>   部分成交时按请求量下 reduceOnly 会超量被拒，正是"保护单失败→裸仓"的触发路径。
+> - F10：日历异常时 `logger.warning` + `GateResult.macro_check_failed=True`（仍 fail-open）。
+> - F11：`load_events` 返回前按 ts 稳定排序（无 ts / 不可解析的排最后，naive 视作 UTC）。
+>   附带影响：T12 两个 ledger 测试的夹具把 result 时间戳固定在过去、写前事件用 wall-clock，
+>   排序后顺序倒置——是夹具 artifact 不是生产问题，已把夹具改为同用 wall-clock。
+> - F12：`analysis.ticker` 缺失直接 `ValueError` 退出 2，不再默认 "UNKNOWN"。
+> - F13：**位置更正**——`pnl_usd` 静默按 0 累加在 `risk_state.derive_state`（`trade_review`
+>   只是它的调用方）。缺字段时 warning，值仍按 0 计（monitor 自己一贯写 `pnl_usd`，
+>   数据缺失走 `pnl_backfill_failed` 标记，所以缺字段只可能是写入方 schema 出问题）。
+> - F14：unwind 响应 status ∈ {REJECTED, EXPIRED, CANCELED} 视为未平仓 → 标记 `position_naked`。
 
 ---
 
@@ -113,8 +136,8 @@
 
 ## 测试观察（非缺陷）
 
-- 保护单失败→unwind 全路径**只有 mock 测试**，未在 testnet 实弹演练（尤其部分成交后 unwind 超量被拒的分支）。下次 testnet 验证可专门演一次。
-- 无测试覆盖：日回撤恰好等于阈值、cooldown 恰好到期时刻、乱序 JSONL 事件。
+- 保护单失败→unwind 全路径**只有 mock 测试**，未在 testnet 实弹演练。F9 修完后部分成交分支已有 mock 覆盖（`test_partial_fill_unwind_uses_executed_qty`），但实弹仍未演过，下次 testnet 验证可专门演一次。
+- 无测试覆盖：日回撤恰好等于阈值、cooldown 恰好到期时刻。（乱序 JSONL 事件已随 F11 补上。）
 - 建议把 ruff/mypy/bandit 装进 dev 依赖（免费，符合验证期原则）。
 
 ## 已剔除的误报（勿再报/勿"修复"）

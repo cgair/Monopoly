@@ -216,8 +216,10 @@ class TestTestnetExecutor:
     def test_places_three_orders_with_correct_kwargs(self):
         cls, client = _mock_binance_client_class()
         ex = TestnetExecutor("k", "s", client_cls=cls)
-        # Client constructed with testnet=True
-        cls.assert_called_once_with("k", "s", testnet=True)
+        # Client constructed with testnet=True and an HTTP timeout
+        cls.assert_called_once_with(
+            "k", "s", testnet=True, requests_params={"timeout": 10},
+        )
         result = ex.place_order(_intent_long_market(), equity_usd=1000.0, mark_price=64600.0)
         assert result.success
         assert result.mode == "testnet"
@@ -359,6 +361,108 @@ class TestTestnetExecutor:
         assert result.margin_required_usd == pytest.approx(
             result.notional_usd / 2.0
         )
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-02 review fixes (F2 / F9 / F14 / F5a)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestReviewFixes20260802:
+    def test_client_constructed_with_request_timeout(self):
+        """F2: python-binance defaults to NO HTTP timeout — a stalled
+        network call would hang the order placement indefinitely, leaving
+        a possibly-live position unmonitored until the next monitor run.
+        The real Client must be built with requests_params carrying a
+        timeout."""
+        cls, _ = _mock_binance_client_class()
+        TestnetExecutor("k", "s", client_cls=cls)
+        kwargs = cls.call_args.kwargs
+        assert kwargs.get("testnet") is True
+        requests_params = kwargs.get("requests_params") or {}
+        assert requests_params.get("timeout"), (
+            "Client built without requests_params timeout — order calls "
+            "can hang forever on a stalled connection"
+        )
+
+    def test_partial_fill_sizes_protection_off_executed_qty(self):
+        """F9: a partially filled market open must size the protective
+        stop/TP (and the recorded quantity) off executedQty, not the
+        requested qty — an over-sized reduceOnly order gets rejected,
+        leaving the position naked."""
+        cls, client = _mock_binance_client_class()
+        client.futures_create_order.side_effect = [
+            {"orderId": 1111, "avgPrice": "64500.5", "status": "FILLED",
+             "executedQty": "0.002"},                 # open: partial fill
+            {"orderId": 2222, "status": "NEW"},       # stop
+            {"orderId": 3333, "status": "NEW"},       # take-profit
+        ]
+        ex = TestnetExecutor("k", "s", client_cls=cls)
+        result = ex.place_order(
+            _intent_long_market(), equity_usd=1000.0, mark_price=64600.0,
+        )
+        assert result.success
+        requested = client.futures_create_order.call_args_list[0].kwargs["quantity"]
+        assert requested > 0.002  # sanity: this scenario IS a partial fill
+        stop_call = client.futures_create_order.call_args_list[1].kwargs
+        tp_call = client.futures_create_order.call_args_list[2].kwargs
+        assert stop_call["quantity"] == 0.002
+        assert tp_call["quantity"] == 0.002
+        assert result.quantity == 0.002
+
+    def test_partial_fill_unwind_uses_executed_qty(self):
+        """F9: the emergency unwind after a failed stop must also close
+        the executed quantity — unwinding the requested qty with
+        reduceOnly on a partial fill is over-sized and gets rejected."""
+        cls, client = _mock_binance_client_class()
+        client.futures_create_order.side_effect = [
+            {"orderId": 1111, "avgPrice": "64500.5", "status": "FILLED",
+             "executedQty": "0.002"},                 # open: partial fill
+            RuntimeError("API: -1001 stop rejected"),  # stop raises
+            {"orderId": 9999, "status": "FILLED"},     # unwind
+        ]
+        ex = TestnetExecutor("k", "s", client_cls=cls)
+        result = ex.place_order(
+            _intent_long_market(), equity_usd=1000.0, mark_price=64600.0,
+        )
+        assert not result.success
+        unwind_call = client.futures_create_order.call_args_list[2].kwargs
+        assert unwind_call["quantity"] == 0.002
+
+    def test_unwind_rejected_status_flags_naked(self):
+        """F14: an unwind order that comes back with an explicit rejection
+        status did NOT close the position — treating any non-raising
+        response as success would hide a naked position."""
+        cls, client = _mock_binance_client_class()
+        client.futures_create_order.side_effect = [
+            {"orderId": 1111, "avgPrice": "64500.5", "executedQty": "0.005"},
+            RuntimeError("API: -1001 stop rejected"),      # stop raises
+            {"orderId": 9999, "status": "REJECTED"},       # unwind rejected
+        ]
+        ex = TestnetExecutor("k", "s", client_cls=cls)
+        result = ex.place_order(
+            _intent_long_market(), equity_usd=1000.0, mark_price=64600.0,
+        )
+        assert not result.success
+        assert result.position_naked is True
+
+    def test_failed_execution_trade_skipped_carries_executor_origin(self, tmp_path):
+        """F5a: the alerts layer distinguishes executor failures from gate
+        rejections via origin=executor on trade_skipped — without the
+        field the executor_error_threshold alert can never fire."""
+        from tradingagents.futures.executor import execute_with_ledger
+
+        state = tmp_path / "state.jsonl"
+        ex = DryRunExecutor(tmp_path / "orders.jsonl")
+        # Tight stop + tiny equity → insufficient-equity executor failure.
+        intent = _intent_long(leverage=1.0, entry_price=64500.0, stop_loss=64499.0)
+        result = execute_with_ledger(
+            ex, intent, equity_usd=100.0, mark_price=64500.0, state_path=state,
+        )
+        assert not result.success
+        skipped = [e for e in load_events(state) if e["type"] == "trade_skipped"]
+        assert skipped and skipped[0].get("origin") == "executor"
 
 
 # ---------------------------------------------------------------------------

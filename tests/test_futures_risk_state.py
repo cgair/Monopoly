@@ -129,3 +129,78 @@ class TestDeriveState:
     def test_naive_now_rejected(self):
         with pytest.raises(ValueError):
             derive_state([], now=datetime(2026, 5, 31, 12, 0))  # no tzinfo
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-02 review fixes (F11: ts ordering; F13: silent pnl_usd default)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestEventOrdering:
+    """F11: concurrent appenders (gate CLI + monitor) can interleave lines
+    out of timestamp order; replay must sort by ts or order-sensitive
+    consumers (consecutive-stop counting, open/close folding) miscount."""
+
+    def test_load_events_returns_ts_sorted(self, tmp_path):
+        path = tmp_path / "state.jsonl"
+        t = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+        append_event(path, {"type": "position_closed", "ts": _ts(t), "outcome": "stop",
+                            "intent_id": "i-2", "symbol": "BTC-USD", "pnl_usd": -1.0})
+        append_event(path, {"type": "position_opened", "ts": _ts(t - timedelta(hours=2)),
+                            "intent_id": "i-1", "symbol": "BTC-USD"})
+        append_event(path, {"type": "position_closed", "ts": _ts(t - timedelta(hours=1)),
+                            "outcome": "stop", "intent_id": "i-1",
+                            "symbol": "BTC-USD", "pnl_usd": -1.0})
+        events = load_events(path)
+        assert [e["ts"] for e in events] == sorted(e["ts"] for e in events)
+
+    def test_out_of_order_stops_count_consecutively_after_sort(self, tmp_path):
+        """Three stop-outs interleaved in the file with an older opened
+        event: in raw file order the opened line resets the streak and the
+        consecutive-stop alert never fires; sorted by ts it must."""
+        from tradingagents.futures.alerts import (
+            AlertConfig, analyze_events, evaluate_alerts,
+        )
+
+        path = tmp_path / "state.jsonl"
+        t = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+        append_event(path, {"type": "position_closed", "ts": _ts(t - timedelta(minutes=30)),
+                            "outcome": "stop", "intent_id": "i-1",
+                            "symbol": "BTC-USD", "pnl_usd": -1.0})
+        append_event(path, {"type": "position_closed", "ts": _ts(t - timedelta(minutes=20)),
+                            "outcome": "stop", "intent_id": "i-2",
+                            "symbol": "BTC-USD", "pnl_usd": -1.0})
+        # Written late by another process, but ts precedes all the stops.
+        append_event(path, {"type": "position_opened", "ts": _ts(t - timedelta(hours=2)),
+                            "intent_id": "i-1", "symbol": "BTC-USD"})
+        append_event(path, {"type": "position_closed", "ts": _ts(t - timedelta(minutes=10)),
+                            "outcome": "stop", "intent_id": "i-3",
+                            "symbol": "BTC-USD", "pnl_usd": -1.0})
+        stats = analyze_events(load_events(path), window_hours=24, now=t)
+        assert max(stats.consecutive_stops, default=0) == 3
+        report = evaluate_alerts(stats, AlertConfig())
+        assert any("Consecutive stop" in f.message for f in report.findings)
+
+
+@pytest.mark.unit
+class TestMissingPnlField:
+    """F13: position_closed without pnl_usd silently accumulated 0 into the
+    daily drawdown — a schema break would blind the halt without a trace."""
+
+    def test_missing_pnl_usd_warns(self, tmp_path, caplog):
+        import logging
+
+        now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+        events = [
+            {"type": "position_opened", "ts": _ts(now - timedelta(hours=2)),
+             "intent_id": "i-1", "symbol": "BTC-USD"},
+            {"type": "position_closed", "ts": _ts(now - timedelta(hours=1)),
+             "intent_id": "i-1", "symbol": "BTC-USD", "outcome": "manual"},
+        ]
+        with caplog.at_level(logging.WARNING, logger="tradingagents.futures.risk_state"):
+            snap = derive_state(events, now=now)
+        assert snap.daily_realised_pnl_usd == 0.0
+        assert any("pnl_usd" in rec.message for rec in caplog.records), (
+            "missing pnl_usd must be logged, not silently treated as 0"
+        )

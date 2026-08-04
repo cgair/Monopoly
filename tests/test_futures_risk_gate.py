@@ -462,3 +462,40 @@ def test_from_config_reads_dangling_intent_minutes():
     cfg = from_config({"futures_dangling_intent_minutes": 15})
     assert cfg.dangling_intent_minutes == 15.0
     assert from_config({}).dangling_intent_minutes == 5.0
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-02 review fixes (F10: macro calendar failure must leave a trace)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_macro_calendar_failure_flags_result_and_logs(monkeypatch, caplog):
+    """F10: with macro_block_hours enabled, a calendar-source exception
+    silently disabled the macro fence. Fail-open stays (the hard ceilings
+    are the real floor) but the failure must be visible: a warning log +
+    macro_check_failed on the result."""
+    import logging
+
+    import tradingagents.dataflows.econ_calendar as cal
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("calendar source down")
+
+    monkeypatch.setattr(cal, "upcoming_high_impact", boom)
+    with caplog.at_level(logging.WARNING, logger="tradingagents.futures.risk_gate"):
+        result = evaluate(_ok_long(), symbol="BTC-USD", equity_usd=1000.0,
+                          config=RiskGateConfig(macro_block_hours=6.0), now=NOW,
+                          snapshot=_empty_snapshot())
+    assert result.approved is True  # fail-open by design
+    assert result.macro_check_failed is True
+    assert any("macro" in rec.message.lower() for rec in caplog.records)
+
+
+@pytest.mark.unit
+def test_macro_check_failed_defaults_false():
+    result = evaluate(_ok_long(), symbol="BTC-USD", equity_usd=1000.0,
+                      config=RiskGateConfig(), now=NOW,
+                      snapshot=_empty_snapshot())
+    assert result.approved is True
+    assert result.macro_check_failed is False

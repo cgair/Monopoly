@@ -18,6 +18,7 @@ captures the gate's decision history even when no orders hit the wire.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,8 @@ from tradingagents.futures.risk_state import (
     load_events,
     utcnow_iso,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +142,12 @@ class GateResult:
     intent: Optional[ExecutionIntent] = None
     reason: Optional[str] = None
     snapshot: Optional[RiskGateSnapshot] = None
+
+    macro_check_failed: bool = False
+    """True iff ``macro_block_hours`` was enabled but the calendar lookup
+    raised. The gate still approves (fail-open by design — the hard
+    ceilings are the real floor), but the macro fence did NOT run, so the
+    approval carries less protection than it looks like it does."""
 
 
 # ---------------------------------------------------------------------------
@@ -328,14 +337,25 @@ def evaluate(
     # 8) Optional macro-event window block (default off). Fail-open: a
     # calendar failure yields no events and therefore no block — the PM
     # advisory warning (L1) and the ceilings above remain the real floor.
+    # The failure is recorded (log + macro_check_failed) so a dead calendar
+    # source can't disable the fence without leaving a trace.
+    macro_check_failed = False
     if config.macro_block_hours > 0:
-        from tradingagents.dataflows.econ_calendar import upcoming_high_impact
+        from tradingagents.dataflows import econ_calendar
 
         try:
-            hits = upcoming_high_impact(config.macro_block_hours, now=now,
-                                        events=macro_events)
-        except Exception:
+            hits = econ_calendar.upcoming_high_impact(
+                config.macro_block_hours, now=now, events=macro_events,
+            )
+        except Exception as exc:
             hits = []
+            macro_check_failed = True
+            logger.warning(
+                "macro-event calendar lookup failed (%s: %s) — the "
+                "macro_block_hours fence did not run for this decision; "
+                "approving on the hard ceilings alone",
+                type(exc).__name__, exc,
+            )
         if hits:
             nxt = hits[0]
             return GateResult(
@@ -356,7 +376,8 @@ def evaluate(
         take_profit=decision.take_profit,
         created_at=now.replace(microsecond=0).isoformat(),
     )
-    return GateResult(approved=True, intent=intent, snapshot=snapshot)
+    return GateResult(approved=True, intent=intent, snapshot=snapshot,
+                      macro_check_failed=macro_check_failed)
 
 
 # ---------------------------------------------------------------------------

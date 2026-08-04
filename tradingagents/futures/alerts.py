@@ -233,7 +233,7 @@ class EventStats:
     pnl_backfill_failures: int = 0
     dangling_intents: int = 0
     malformed_lines: int = 0  # set by main() from the loader, not the event scan
-    executor_errors: list[str] = field(default_factory=list)  # runs of consecutive stop-closes
+    executor_errors: list[str] = field(default_factory=list)  # reasons from origin=executor trade_skipped
     consecutive_stops: list[int] = field(default_factory=list)  # runs of consecutive stop-closes
 
 
@@ -315,6 +315,11 @@ def analyze_events(
             if event_type == "trade_skipped":
                 reason = event.get("reason", "unknown")
                 stats.gate_rejections[reason] = stats.gate_rejections.get(reason, 0) + 1
+                # origin=executor means the exchange call itself failed
+                # (written by execute_with_ledger), not a gate rejection —
+                # a run of these is an outage, not a policy block.
+                if event.get("origin") == "executor":
+                    stats.executor_errors.append(reason)
                 consecutive_stop_run = 0  # Reset on any non-close event
 
             # Naked position (highest alert)

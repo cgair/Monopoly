@@ -1440,13 +1440,14 @@ def trade_execute(
     1. Read decision JSON (from --decision-file or stdin).
     2. Check staleness (default 15 min timeout, env TRADINGAGENTS_FUTURES_APPROVAL_TIMEOUT_MIN).
     3. Verify explicit approval: --approved + --approved-by REQUIRED (no defaults).
-    4. Re-evaluate through risk gate with current state (gate may now reject).
-    5. Execute via create_executor (dryrun default, env-selected).
-    6. Output JSON result to stdout, logs to stderr.
+    4. Refuse a decision that was already executed (replay protection).
+    5. Re-evaluate through risk gate with current state (gate may now reject).
+    6. Execute via create_executor (dryrun default, env-selected).
+    7. Output JSON result to stdout, logs to stderr.
 
     Rejection path: --rejected --approved-by <who> writes trade_skipped without executing.
 
-    Exit codes: 0=success, 1=rejection/timeout/gate-fail, 2=error.
+    Exit codes: 0=success, 1=rejection/timeout/gate-fail/duplicate, 2=error.
     """
     import json
     import os
@@ -1458,8 +1459,11 @@ def trade_execute(
     from tradingagents.futures.approval import (
         ApprovalMetadata,
         check_staleness,
+        decision_fingerprint,
+        find_prior_execution,
         parse_decision_json,
         reconstruct_intent_from_decision,
+        record_decision_execution,
         write_trade_skipped_event,
     )
     from tradingagents.futures.executor import create_executor
@@ -1475,7 +1479,15 @@ def trade_execute(
 
         # Extract decision and timestamp
         decision, decision_ts = parse_decision_json(decision_json)
-        symbol = decision_json.get("analysis", {}).get("ticker", "UNKNOWN")
+        # Fail fast on a missing ticker: defaulting to "UNKNOWN" only defers
+        # the failure to the exchange, where it surfaces as a baffling
+        # invalid-symbol rejection after the approval has been spent.
+        symbol = decision_json.get("analysis", {}).get("ticker")
+        if not symbol:
+            raise ValueError(
+                "decision JSON has no analysis.ticker — refusing to execute "
+                "a trade with an unknown symbol"
+            )
 
         # 2. Approval metadata
         now = datetime.now(timezone.utc)
@@ -1560,6 +1572,34 @@ def trade_execute(
             output_json(result)
             sys.exit(1)
 
+        # ===== Replay protection =====
+        # One approval authorises one position. Re-running the CLI on an
+        # already-executed decision file (an easy mistake in a manual
+        # flow) would open a second same-direction position — the gate's
+        # max_concurrent_positions is a total count, not a per-symbol
+        # re-entry guard. Checked after the approval gates so a rejected
+        # or gate-blocked decision can still be retried.
+        fingerprint = decision_fingerprint(decision_json)
+        prior = find_prior_execution(fingerprint)
+        if prior is not None:
+            reason = (
+                f"duplicate decision — already executed at {prior.get('ts')} "
+                f"(fingerprint {fingerprint}); generate a fresh analysis to trade again"
+            )
+            write_trade_skipped_event(
+                reason,
+                symbol=symbol,
+                approval_metadata=approval_meta,
+            )
+            output_json({
+                "status": "duplicate",
+                "symbol": symbol,
+                "reason": reason,
+                "first_executed_at": prior.get("ts"),
+                "timestamp": now.isoformat(),
+            })
+            sys.exit(1)
+
         # ===== Gate re-evaluation =====
         # Executor mode comes from config (dryrun default; testnet via
         # TRADINGAGENTS_FUTURES_EXECUTOR_MODE). Unlike analyze_json, this
@@ -1616,6 +1656,14 @@ def trade_execute(
                     "timestamp": now.isoformat(),
                 })
                 sys.exit(2)
+        # Claim the decision before the exchange call, not after: if this
+        # process dies mid-order, a re-run must still be refused — the
+        # position may be live, and the dangling-intent path is what
+        # reconciles it.
+        record_decision_execution(
+            fingerprint, symbol=symbol, approval_metadata=approval_meta,
+        )
+
         # execute_with_ledger writes the intent write-ahead (order_submitted)
         # before the exchange call and the paired result event after it
         # (position_opened / position_naked / trade_skipped) — same ledger

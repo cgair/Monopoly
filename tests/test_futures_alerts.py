@@ -460,3 +460,41 @@ class TestFinding:
         d = f.to_dict()
         assert d["message"] == "msg"
         assert "details" not in d
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-02 review fixes (F5a: executor_errors was a dead metric)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestExecutorErrorMetric:
+    """F5a: analyze_events never populated executor_errors, so the
+    executor_error_threshold alert could never fire — consecutive
+    executor crashes reported OK forever."""
+
+    def test_executor_origin_skips_counted_as_executor_errors(self):
+        now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+        events = []
+        for i in range(5):
+            events.append({
+                "type": "trade_skipped",
+                "ts": _ts(now - timedelta(minutes=30 - i)),
+                "symbol": "BTC-USD",
+                "reason": f"open failed: ConnectionError #{i}",
+                "origin": "executor",
+            })
+        stats = analyze_events(events, window_hours=24, now=now)
+        assert len(stats.executor_errors) == 5
+        report = evaluate_alerts(stats, AlertConfig())
+        assert report.level == AlertLevel.WARN
+        assert any("Executor errors" in f.message for f in report.findings)
+
+    def test_gate_rejections_not_counted_as_executor_errors(self):
+        now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+        events = [
+            {"type": "trade_skipped", "ts": _ts(now - timedelta(minutes=10)),
+             "symbol": "BTC-USD", "reason": "leverage exceeds configured max_leverage"},
+        ]
+        stats = analyze_events(events, window_hours=24, now=now)
+        assert stats.executor_errors == []

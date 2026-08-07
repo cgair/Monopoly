@@ -1,0 +1,149 @@
+"""Run the agent graph as of a past instant and capture what it decided.
+
+Wraps :func:`tradingagents.backtest.pit.point_in_time` around a normal
+graph run, with every side effect redirected into a scratch directory so
+a replay cannot touch the live memory log, risk-gate event stream, or
+order log.
+
+Scope is deliberately narrow. Only the market analyst is selected: its
+inputs (OHLCV, funding, open interest, the long/short ratios) all have
+dated archives, while news, Reddit and the newsflash relay do not. A
+replay that included them would be reading today's headlines while
+claiming to stand in the past, so the leak guard in ``pit`` fails the
+run instead.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+from tradingagents.agents.utils.symbol_utils import to_binance_symbol
+from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.futures import market_data as fmd
+
+from . import vision
+from .pit import point_in_time
+
+logger = logging.getLogger(__name__)
+
+_FIELD = {
+    "side": re.compile(r"\*\*Side\*\*:\s*(\w+)", re.I),
+    "leverage": re.compile(r"\*\*Leverage\*\*:\s*([\d.]+)", re.I),
+    "position_size_pct": re.compile(r"\*\*Position Size\*\*:\s*([\d.]+)", re.I),
+    "entry_price": re.compile(r"\*\*Entry Price\*\*:\s*([\d.]+)", re.I),
+    "stop_loss": re.compile(r"\*\*Stop Loss\*\*:\s*([\d.]+)", re.I),
+    "take_profit": re.compile(r"\*\*Take Profit\*\*:\s*([\d.]+)", re.I),
+    "time_horizon": re.compile(r"\*\*Time Horizon\*\*:\s*(.+)", re.I),
+}
+
+
+@dataclass
+class ReplayResult:
+    symbol: str
+    as_of: int                       # ms epoch UTC
+    side: str | None = None
+    leverage: float | None = None
+    position_size_pct: float | None = None
+    entry_price: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    time_horizon: str | None = None
+    reference_price: float | None = None   # last closed price at the cutoff
+    decision_text: str = ""
+    market_report: str = ""
+    gate_passed: bool | None = None
+    gate_reason: str | None = None
+    error: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+def _parse_decision(text: str) -> dict:
+    out: dict = {}
+    for key, rx in _FIELD.items():
+        m = rx.search(text or "")
+        if not m:
+            continue
+        raw = m.group(1).strip()
+        if key in ("side", "time_horizon"):
+            out[key] = raw
+        else:
+            try:
+                out[key] = float(raw)
+            except ValueError:
+                pass
+    return out
+
+
+def _scratch_config(scratch: Path, base: dict | None = None) -> dict:
+    """A config whose every write path lands inside ``scratch``."""
+    cfg = dict(base or DEFAULT_CONFIG)
+    scratch.mkdir(parents=True, exist_ok=True)
+    cfg.update({
+        "results_dir": str(scratch / "logs"),
+        "data_cache_dir": str(scratch / "cache"),
+        "memory_log_path": str(scratch / "memory" / "trading_memory.md"),
+        "futures_risk_state_path": str(scratch / "risk_gate_state.jsonl"),
+        "futures_executor_mode": "dryrun",
+        "futures_orders_log_path": str(scratch / "orders.jsonl"),
+        "checkpoint_enabled": False,
+        "online_tools": True,
+    })
+    return cfg
+
+
+def replay(symbol: str, as_of: datetime, *, scratch: Path,
+           config: dict | None = None,
+           selected_analysts: list[str] | None = None) -> ReplayResult:
+    """Run the graph as of ``as_of`` and return the decision it produced."""
+    as_of = as_of.astimezone(timezone.utc)
+    as_of_ms = int(as_of.timestamp() * 1000)
+    binance_symbol = to_binance_symbol(symbol)
+    result = ReplayResult(symbol=symbol, as_of=as_of_ms)
+
+    cfg = _scratch_config(scratch, config)
+    cfg["selected_analysts"] = selected_analysts or ["market"]
+
+    # Reference price = last bar closed at the cutoff. Also stands in for
+    # the live mark-price fetch the executor tail would otherwise make.
+    bars = vision.klines(binance_symbol, "1h", as_of_ms - 6 * 3_600_000, as_of_ms)
+    closed = [b for b in bars if b.close_time <= as_of_ms]
+    if not closed:
+        result.error = "no archived bars at cutoff"
+        return result
+    result.reference_price = closed[-1].close
+
+    original_mark = fmd.fetch_mark_price
+    fmd.fetch_mark_price = lambda _t: result.reference_price
+    try:
+        with point_in_time(as_of_ms, binance_symbol):
+            from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+            graph = TradingAgentsGraph(
+                selected_analysts=cfg["selected_analysts"], config=cfg,
+            )
+            final_state, _decision = graph.propagate(
+                symbol, as_of.strftime("%Y-%m-%d"))
+
+        text = final_state.get("final_trade_decision", "") or ""
+        result.decision_text = text
+        result.market_report = final_state.get("market_report", "") or ""
+        for k, v in _parse_decision(text).items():
+            setattr(result, k, v)
+
+        # The gate reports by absence: an intent means approved, a
+        # rejection reason means vetoed.
+        if "execution_intent" in final_state or "risk_gate_rejection_reason" in final_state:
+            reason = final_state.get("risk_gate_rejection_reason")
+            result.gate_reason = reason
+            result.gate_passed = final_state.get("execution_intent") is not None and not reason
+    except Exception as exc:                      # a failed window must not sink the sweep
+        logger.exception("replay failed for %s at %s", symbol, as_of)
+        result.error = f"{type(exc).__name__}: {exc}"
+    finally:
+        fmd.fetch_mark_price = original_mark
+
+    return result

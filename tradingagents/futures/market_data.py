@@ -1,9 +1,12 @@
 """Live mark-price fetch for the futures executor pipeline.
 
-The risk gate is a pure function over the FuturesDecision; the executor
-needs a current mark price when the decision uses market entry
-(``entry_price is None``). This module exposes a tiny fetcher and the
-LangGraph node that wires it into the crypto-mode pipeline.
+The risk gate and the executor both need a current mark price when the
+decision uses market entry (``entry_price is None``): the gate to check
+the stop sits on the losing side of the price, the executor to size the
+order. This module exposes a tiny fetcher and the LangGraph node that
+wires it into the crypto-mode pipeline *before* the gate — with the
+fetch after the gate, market-order stops went unvalidated (2026-08-08
+review gap: two replayed shorts with profit-side stops were approved).
 
 Both adapters (dryrun / testnet) can run without it when the PM sets an
 explicit ``entry_price`` — the node falls back to ``entry_price`` in
@@ -17,6 +20,7 @@ from typing import Optional
 
 import requests
 
+from tradingagents.agents.schemas import FuturesSide
 from tradingagents.agents.utils.symbol_utils import to_binance_symbol
 
 logger = logging.getLogger(__name__)
@@ -31,8 +35,8 @@ def fetch_mark_price(state_ticker: str) -> Optional[float]:
 
     Hits Binance Futures' ``premiumIndex`` endpoint (unauthenticated;
     no API key needed for reads). Returns ``None`` on any failure so
-    callers can degrade gracefully — the executor node maps a missing
-    mark price into a ``trade_skipped`` event with a clear reason.
+    callers can degrade gracefully — the risk gate maps a missing mark
+    price on a market order into a fail-closed rejection.
     """
     symbol = to_binance_symbol(state_ticker)
     try:
@@ -50,25 +54,27 @@ def fetch_mark_price(state_ticker: str) -> Optional[float]:
 
 
 def create_mark_price_node():
-    """LangGraph node that populates ``state["mark_price"]`` before the executor.
+    """LangGraph node that populates ``state["mark_price"]`` before the risk gate.
+
+    Runs between Portfolio Manager and Risk Gate, so it reads the PM's
+    ``final_decision_structured`` — no execution intent exists yet.
 
     Behavior:
-    - No intent (``execution_intent is None``) → write ``mark_price = None``.
-      The executor short-circuits on no-intent anyway.
-    - Limit order (``intent["entry_price"]`` set) → reuse entry_price as the
+    - No structured decision, or side == Flat → ``mark_price = None``.
+      Nothing to price; the gate no-ops on these anyway.
+    - Limit decision (``entry_price`` set) → reuse entry_price as the
       reference so we skip the HTTP fetch.
-    - Market order → fetch from Binance. Result may be ``None`` on
-      network failure; the executor node logs ``trade_skipped`` in that
-      case.
+    - Market decision → fetch from Binance. Result may be ``None`` on
+      network failure; the gate then rejects fail-closed.
     """
 
     def mark_price_node(state) -> dict:
-        intent = state.get("execution_intent")
-        if intent is None:
+        decision = state.get("final_decision_structured")
+        if decision is None or decision.side == FuturesSide.FLAT:
             return {"mark_price": None}
-        if intent.get("entry_price") is not None:
-            return {"mark_price": float(intent["entry_price"])}
-        price = fetch_mark_price(intent["symbol"])
+        if decision.entry_price is not None:
+            return {"mark_price": float(decision.entry_price)}
+        price = fetch_mark_price(state["company_of_interest"])
         return {"mark_price": price}
 
     return mark_price_node

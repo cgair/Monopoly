@@ -161,15 +161,18 @@ class GraphSetup:
             },
         )
 
-        # Futures tail: Portfolio Manager → Risk Gate → Mark Price → Executor.
+        # Futures tail: Portfolio Manager → Mark Price → Risk Gate → Executor.
+        # Mark Price runs before the gate so market-order stops are
+        # validated against a real reference price — with the fetch after
+        # the gate they went unvalidated (2026-08-08 review gap).
         if self.config is not None:
             workflow.add_node("Risk Gate", create_risk_gate_node(self.config))
             workflow.add_node("Mark Price", create_mark_price_node())
             workflow.add_node("Executor", create_executor_node(self.config))
 
-            workflow.add_edge("Portfolio Manager", "Risk Gate")
-            workflow.add_edge("Risk Gate", "Mark Price")
-            workflow.add_edge("Mark Price", "Executor")
+            workflow.add_edge("Portfolio Manager", "Mark Price")
+            workflow.add_edge("Mark Price", "Risk Gate")
+            workflow.add_edge("Risk Gate", "Executor")
             workflow.add_edge("Executor", END)
         else:
             workflow.add_edge("Portfolio Manager", END)

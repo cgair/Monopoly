@@ -119,13 +119,13 @@ def compute_sizing(
     reference_price = intent.entry_price if intent.entry_price is not None else mark_price
 
     # Stop-direction sanity against the actual reference price. The risk
-    # gate only validates stop side when a limit ``entry_price`` is set
-    # (it has no price feed); for market entries the first concrete price
-    # is here. A wrong-side stop on a market order would open the position
-    # and then have Binance reject the STOP_MARKET with -2021 ("would
-    # immediately trigger"), leaving a naked position — so we fail before
-    # placing anything. Raised as ValueError so both adapters' existing
-    # error paths surface it as success=False.
+    # gate validates this too (against the pre-gate mark price), but the
+    # executor may run on a different price than the gate saw — and a
+    # wrong-side stop on a market order would open the position and then
+    # have Binance reject the STOP_MARKET with -2021 ("would immediately
+    # trigger"), leaving a naked position — so we fail before placing
+    # anything. Raised as ValueError so both adapters' existing error
+    # paths surface it as success=False.
     if intent.side == FuturesSide.LONG and intent.stop_loss >= reference_price:
         raise ValueError(
             f"long stop_loss {intent.stop_loss} >= reference price {reference_price} "

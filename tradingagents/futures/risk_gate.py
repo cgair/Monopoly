@@ -164,6 +164,7 @@ REASON_RISK_OVER_CAP = "position_size_pct exceeds configured per_trade_risk_pct"
 REASON_RISK_NON_POSITIVE = "position_size_pct must be > 0"
 REASON_STOP_NON_POSITIVE = "stop_loss must be a positive price"
 REASON_STOP_WRONG_SIDE = "stop_loss is on the wrong side of entry"
+REASON_NO_REFERENCE_PRICE = "no reference price to validate market-order stop side"
 REASON_DAILY_DRAWDOWN_HALT = "daily drawdown halt active until next UTC day"
 REASON_COOLDOWN_ACTIVE = "cooldown window active after recent stop-out"
 REASON_MAX_POSITIONS = "max_concurrent_positions already open"
@@ -185,6 +186,7 @@ def evaluate(
     now: Optional[datetime] = None,
     snapshot: Optional[RiskGateSnapshot] = None,
     macro_events: Optional[list] = None,
+    reference_price: Optional[float] = None,
 ) -> GateResult:
     """Validate ``decision`` against ``config`` and optional cross-run state.
 
@@ -211,6 +213,12 @@ def evaluate(
         Injectable calendar events for the optional macro-window block.
         ``None`` → fetched lazily (only when ``config.macro_block_hours``
         > 0); tests pass synthetic events to stay offline.
+    reference_price
+        Current mark price, used to validate stop side on market orders
+        (``entry_price is None``). The graph's Mark Price node populates
+        it before the gate runs; the CLI approval path fetches it before
+        re-evaluating. A market order with no reference price is rejected
+        fail-closed.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -279,13 +287,25 @@ def evaluate(
             snapshot=snapshot,
         )
 
-    # 4) Stop on the correct side of entry. Entry is optional (market);
-    # only enforce when both stop and entry are set.
-    if decision.entry_price is not None:
-        if decision.side == FuturesSide.LONG and decision.stop_loss >= decision.entry_price:
-            return GateResult(approved=False, reason=REASON_STOP_WRONG_SIDE, snapshot=snapshot)
-        if decision.side == FuturesSide.SHORT and decision.stop_loss <= decision.entry_price:
-            return GateResult(approved=False, reason=REASON_STOP_WRONG_SIDE, snapshot=snapshot)
+    # 4) Stop on the correct side of the price the fill would happen at:
+    # entry_price for limit orders, reference (mark) price for market
+    # orders. Before 2026-08-08 the check only ran when entry_price was
+    # set, so market orders sailed through unvalidated — two replayed
+    # shorts carried stops on the profit side of the mark and the gate
+    # approved both. A market order with no reference price is rejected
+    # fail-closed: the executor cannot size it without a mark price
+    # anyway, and this surfaces the refusal as a structured gate reason.
+    stop_reference = (
+        decision.entry_price if decision.entry_price is not None else reference_price
+    )
+    if stop_reference is None:
+        return GateResult(
+            approved=False, reason=REASON_NO_REFERENCE_PRICE, snapshot=snapshot,
+        )
+    if decision.side == FuturesSide.LONG and decision.stop_loss >= stop_reference:
+        return GateResult(approved=False, reason=REASON_STOP_WRONG_SIDE, snapshot=snapshot)
+    if decision.side == FuturesSide.SHORT and decision.stop_loss <= stop_reference:
+        return GateResult(approved=False, reason=REASON_STOP_WRONG_SIDE, snapshot=snapshot)
 
     # 5) Cross-run policies: daily drawdown halt.
     drawdown_threshold_usd = -config.daily_drawdown_halt_pct * equity_usd
@@ -397,6 +417,8 @@ def create_risk_gate_node(config: dict):
       decision" and emits no intent.
     - ``equity_usd`` (float) — current account equity; defaults to
       ``config["futures_starting_equity_usd"]`` (default 1000) if absent.
+    - ``mark_price`` (float | None) — populated by the Mark Price node,
+      which runs before the gate; used to validate market-order stop side.
 
     Writes to state:
     - ``execution_intent``: :class:`ExecutionIntent` dict (or None if
@@ -419,6 +441,7 @@ def create_risk_gate_node(config: dict):
             symbol=state["company_of_interest"],
             equity_usd=equity_usd,
             config=gate_config,
+            reference_price=state.get("mark_price"),
         )
 
         if not result.approved:

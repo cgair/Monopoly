@@ -1609,12 +1609,23 @@ def trade_execute(
         config = DEFAULT_CONFIG.copy()
 
         equity_usd = float(config.get("futures_starting_equity_usd", 1000.0))
+
+        # Fetch the mark price BEFORE gate re-evaluation: the gate
+        # validates market-order stop side against it and rejects
+        # fail-closed when it is unavailable (2026-08-08 review gap —
+        # with the fetch after the gate, market-order stops on the wrong
+        # side of the price were approved).
+        from tradingagents.futures.market_data import fetch_mark_price
+
+        mark_price = fetch_mark_price(symbol)
+
         intent, gate_reason = reconstruct_intent_from_decision(
             decision,
             symbol=symbol,
             equity_usd=equity_usd,
             config=config,
             now=now,
+            reference_price=mark_price,
         )
 
         if intent is None:
@@ -1634,12 +1645,11 @@ def trade_execute(
 
         # ===== Execution =====
         executor = create_executor(config)
-        from tradingagents.futures.market_data import fetch_mark_price
-
-        mark_price = fetch_mark_price(symbol)
         if mark_price is None:
             # A LIMIT decision still carries a usable reference price; a
-            # market entry must never be sized off a fabricated number.
+            # market entry cannot reach here (the gate above rejects it
+            # fail-closed on a missing mark price) — this branch stays as
+            # a belt-and-braces guard.
             if decision.entry_price:
                 mark_price = decision.entry_price
             else:

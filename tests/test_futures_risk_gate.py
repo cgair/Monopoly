@@ -256,16 +256,6 @@ class TestEvaluateRejections:
         assert not result.approved
         assert result.reason == REASON_STOP_WRONG_SIDE
 
-    def test_stop_side_skipped_when_entry_market(self):
-        # entry_price=None → market order. The gate cannot validate stop side
-        # without a price feed, so it lets it through; the executor re-checks
-        # against the live mark price before placing any order (see
-        # compute_sizing) so a wrong-side market stop is still caught.
-        d = _ok_long(entry_price=None)
-        result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
-                          config=RiskGateConfig(), now=NOW, snapshot=_empty_snapshot())
-        assert result.approved
-
     def test_daily_drawdown_halt_blocks_new_entries(self):
         # Equity 1000, halt threshold -3% = -30. Snapshot at -35 should halt.
         snap = RiskGateSnapshot(

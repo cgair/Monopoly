@@ -169,6 +169,7 @@ def reconstruct_intent_from_decision(
     config: dict,
     now: Optional[datetime] = None,
     state_path: Optional[Path] = None,
+    reference_price: Optional[float] = None,
 ) -> tuple[Optional[ExecutionIntent], Optional[str]]:
     """Re-evaluate a decision through the risk gate and return the intent or reason.
 
@@ -190,6 +191,11 @@ def reconstruct_intent_from_decision(
         Current UTC time. Defaults to datetime.now(timezone.utc).
     state_path
         Path to risk_gate_state.jsonl. Defaults to standard location.
+    reference_price
+        Current mark price. Required for market-order decisions
+        (``entry_price is None``) — the gate validates stop side against
+        it and rejects fail-closed when it is missing. The CLI fetches it
+        before calling here.
 
     Returns
     -------
@@ -223,6 +229,7 @@ def reconstruct_intent_from_decision(
         config=gate_config,
         now=now,
         snapshot=snapshot,
+        reference_price=reference_price,
     )
 
     if result.approved and result.intent is not None:

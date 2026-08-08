@@ -675,7 +675,7 @@ class TestPortfolioManagerInjection:
             stop_loss=62800.0,
             executive_summary="Build the long gradually over the next two days.",
             investment_thesis="Funding reset and OI expansion support continuation.",
-            time_horizon="2-5 days",
+            time_horizon="1-3 days",
         )
         llm = _structured_pm_llm(captured, decision)
         pm_node = create_portfolio_manager(llm)
@@ -685,7 +685,7 @@ class TestPortfolioManagerInjection:
         assert "**Executive Summary**: Build the long gradually" in md
         assert "**Investment Thesis**: Funding reset" in md
         assert "**Leverage**: 2.0x" in md
-        assert "**Time Horizon**: 2-5 days" in md
+        assert "**Time Horizon**: 1-3 days" in md
 
     def test_pm_falls_back_to_freetext_when_structured_unavailable(self):
         """If a provider does not support with_structured_output, the agent

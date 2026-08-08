@@ -102,7 +102,7 @@ class TestRenderFuturesDecision:
             take_profit=68000.0,
             executive_summary="Enter long on retrace; stop tight below LTF demand.",
             investment_thesis="Macro tailwind + on-chain accumulation + funding reset all point up.",
-            time_horizon="2-5 days",
+            time_horizon="1-3 days",
         )
         md = render_futures_decision(d)
         assert "**Side**: Long" in md
@@ -111,7 +111,7 @@ class TestRenderFuturesDecision:
         assert "**Entry Price**: 64500.0" in md
         assert "**Stop Loss**: 62800.0" in md
         assert "**Take Profit**: 68000.0" in md
-        assert "**Time Horizon**: 2-5 days" in md
+        assert "**Time Horizon**: 1-3 days" in md
 
 
 @pytest.mark.unit

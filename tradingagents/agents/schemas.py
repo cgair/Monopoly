@@ -19,9 +19,9 @@ so that:
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +201,16 @@ def render_futures_proposal(proposal: FuturesProposal) -> str:
     return "\n".join(parts)
 
 
+TIME_HORIZON_BUCKETS = ("intraday", "1-3 days", "1-2 weeks", "2-4 weeks", "1 month+")
+"""Closed set of holding-period buckets for ``FuturesDecision.time_horizon``.
+
+A free-text field with an example in its description carried no
+information: 46/51 replayed decisions echoed the example verbatim
+(2026-08-08 review). A closed enum forces an actual choice and keeps
+the values comparable across runs.
+"""
+
+
 class FuturesDecision(BaseModel):
     """Final perp-futures decision produced by the Portfolio Manager (crypto-mode).
 
@@ -258,10 +268,30 @@ class FuturesDecision(BaseModel):
             "Detailed reasoning anchored in evidence from the analysts' debate."
         ),
     )
-    time_horizon: Optional[str] = Field(
+    time_horizon: Optional[
+        Literal["intraday", "1-3 days", "1-2 weeks", "2-4 weeks", "1 month+"]
+    ] = Field(
         default=None,
-        description="Optional intended holding period, e.g. '2-5 days' or 'intraday'.",
+        description=(
+            "Intended holding period for this position. Pick the single "
+            "bucket that matches how long the investment thesis needs to "
+            "play out; do not default to a middle value."
+        ),
     )
+
+    @field_validator("time_horizon", mode="before")
+    @classmethod
+    def _coerce_time_horizon(cls, value):
+        # An out-of-bucket string must not sink the whole decision: a
+        # structured-output validation failure falls back to free text,
+        # which the risk gate rejects for missing structured decision.
+        # Degrade the one optional, purely-informational field to None
+        # instead. (2026-08-08 review: the old free-text field echoed
+        # the description's example in 46/51 decisions.)
+        if value is None:
+            return None
+        normalised = str(value).strip().lower()
+        return normalised if normalised in TIME_HORIZON_BUCKETS else None
 
 
 def render_futures_decision(decision: FuturesDecision) -> str:

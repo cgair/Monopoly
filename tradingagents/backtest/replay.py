@@ -45,6 +45,7 @@ _FIELD = {
 class ReplayResult:
     symbol: str
     as_of: int                       # ms epoch UTC
+    rep: int = 0                     # repeat index — same instant, resampled
     side: str | None = None
     leverage: float | None = None
     position_size_pct: float | None = None
@@ -97,12 +98,17 @@ def _scratch_config(scratch: Path, base: dict | None = None) -> dict:
 
 def replay(symbol: str, as_of: datetime, *, scratch: Path,
            config: dict | None = None,
-           selected_analysts: list[str] | None = None) -> ReplayResult:
-    """Run the graph as of ``as_of`` and return the decision it produced."""
+           selected_analysts: list[str] | None = None,
+           rep: int = 0) -> ReplayResult:
+    """Run the graph as of ``as_of`` and return the decision it produced.
+
+    ``rep`` only labels the result: repeated runs of the same instant are
+    independent samples of a stochastic model, not a cached lookup.
+    """
     as_of = as_of.astimezone(timezone.utc)
     as_of_ms = int(as_of.timestamp() * 1000)
     binance_symbol = to_binance_symbol(symbol)
-    result = ReplayResult(symbol=symbol, as_of=as_of_ms)
+    result = ReplayResult(symbol=symbol, as_of=as_of_ms, rep=rep)
 
     cfg = _scratch_config(scratch, config)
     cfg["selected_analysts"] = selected_analysts or ["market"]

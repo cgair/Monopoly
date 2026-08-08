@@ -175,3 +175,66 @@ class TestMarkPriceBeforeRiskGate:
         assert ("Portfolio Manager", "Mark Price") in graph.edges
         assert ("Mark Price", "Risk Gate") in graph.edges
         assert ("Risk Gate", "Executor") in graph.edges
+
+
+# ---------------------------------------------------------------------------
+# Mark price venue (walkthrough §12 #4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMarkPriceVenue:
+    """Sizing reference price must come from the venue orders fill on.
+
+    dryrun conclusions are executed by a human on mainnet → mainnet
+    reference; testnet orders fill on testnet, whose thin books can sit
+    percent-level away from mainnet → testnet reference.
+    """
+
+    def _capture_fetch(self, monkeypatch):
+        from tradingagents.futures import market_data
+
+        captured = {}
+
+        def fake_get(url, params=None, timeout=None):
+            captured["url"] = url
+            resp = MagicMock()
+            resp.json.return_value = {"markPrice": "64000.0"}
+            return resp
+
+        monkeypatch.setattr(market_data.requests, "get", fake_get)
+        return captured
+
+    def test_dryrun_mode_fetches_mainnet(self, monkeypatch):
+        from tradingagents.futures.market_data import fetch_mark_price
+
+        captured = self._capture_fetch(monkeypatch)
+        assert fetch_mark_price("BTC-USD", mode="dryrun") == 64000.0
+        assert captured["url"].startswith("https://fapi.binance.com")
+
+    def test_default_mode_is_dryrun_mainnet(self, monkeypatch):
+        from tradingagents.futures.market_data import fetch_mark_price
+
+        captured = self._capture_fetch(monkeypatch)
+        assert fetch_mark_price("BTC-USD") == 64000.0
+        assert captured["url"].startswith("https://fapi.binance.com")
+
+    def test_testnet_mode_fetches_testnet(self, monkeypatch):
+        from tradingagents.futures.market_data import fetch_mark_price
+
+        captured = self._capture_fetch(monkeypatch)
+        assert fetch_mark_price("BTC-USD", mode="testnet") == 64000.0
+        assert captured["url"].startswith("https://testnet.binancefuture.com")
+
+    def test_node_follows_executor_mode_env(self, monkeypatch):
+        from tradingagents.futures.market_data import create_mark_price_node
+
+        captured = self._capture_fetch(monkeypatch)
+        monkeypatch.setenv("EXECUTOR_MODE", "testnet")
+        node = create_mark_price_node({})
+        result = node({
+            "final_decision_structured": _decision(entry_price=None),
+            "company_of_interest": "BTC-USD",
+        })
+        assert result == {"mark_price": 64000.0}
+        assert captured["url"].startswith("https://testnet.binancefuture.com")

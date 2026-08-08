@@ -613,3 +613,35 @@ class TestExecutorNode:
         assert "mark_price" in out["execution_result"]["error"]
         events = load_events(state_path)
         assert events[0]["type"] == "trade_skipped"
+
+
+@pytest.mark.unit
+class TestResolveExecutorMode:
+    """Single source of truth for the execution venue — shared by the
+    executor factory and the mark-price fetch (walkthrough §12 #4)."""
+
+    def test_env_beats_config(self, monkeypatch):
+        from tradingagents.futures.executor import resolve_executor_mode
+
+        monkeypatch.setenv("EXECUTOR_MODE", "testnet")
+        assert resolve_executor_mode({"futures_executor_mode": "dryrun"}) == "testnet"
+
+    def test_config_fallback(self, monkeypatch):
+        from tradingagents.futures.executor import resolve_executor_mode
+
+        monkeypatch.delenv("EXECUTOR_MODE", raising=False)
+        assert resolve_executor_mode({"futures_executor_mode": "testnet"}) == "testnet"
+
+    def test_default_dryrun(self, monkeypatch):
+        from tradingagents.futures.executor import resolve_executor_mode
+
+        monkeypatch.delenv("EXECUTOR_MODE", raising=False)
+        assert resolve_executor_mode({}) == "dryrun"
+        assert resolve_executor_mode(None) == "dryrun"
+
+    def test_unknown_mode_raises(self, monkeypatch):
+        from tradingagents.futures.executor import resolve_executor_mode
+
+        monkeypatch.setenv("EXECUTOR_MODE", "real-money-yolo")
+        with pytest.raises(ValueError, match="Unknown EXECUTOR_MODE"):
+            resolve_executor_mode({})

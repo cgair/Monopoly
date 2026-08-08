@@ -96,3 +96,13 @@ def test_unknown_env_var_is_ignored(monkeypatch):
         TRADINGAGENTS_NONEXISTENT_KEY="oops",
     )
     assert "nonexistent_key" not in dc.DEFAULT_CONFIG
+
+
+def test_executor_mode_default_dryrun(monkeypatch):
+    dc = _reload_with_env(monkeypatch)
+    assert dc.DEFAULT_CONFIG["futures_executor_mode"] == "dryrun"
+
+
+def test_executor_mode_override(monkeypatch):
+    dc = _reload_with_env(monkeypatch, TRADINGAGENTS_FUTURES_EXECUTOR_MODE="testnet")
+    assert dc.DEFAULT_CONFIG["futures_executor_mode"] == "testnet"

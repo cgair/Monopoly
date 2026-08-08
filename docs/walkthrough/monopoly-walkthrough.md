@@ -684,17 +684,17 @@ LangGraph 节点工厂。读 state：
 
 拒绝时调 `_log_skip`（line 415-419）写 `trade_skipped` 到 JSONL（gate 拒绝发生在 intent 存在之前，所以这类事件不带 `intent_id`——与 executor 失败写的 intent-携带型 `trade_skipped` 区分，见 §10.4.1）。
 
-### 10.2 Mark Price —— `tradingagents/futures/market_data.py:52-74`
+### 10.2 Mark Price —— `tradingagents/futures/market_data.py`（**已更新**：节点前移 + venue 跟随执行模式）
 
-简单。读 `state["execution_intent"]`：
+节点现在跑在 **PM 之后、gate 之前**（2026-08-08 review：fetch 在 gate 之后时市价单止损方向没人校验），读 `state["final_decision_structured"]`：
 
-- `None` → 写 `mark_price=None`
-- `intent["entry_price"]` 已设（限价单）→ 复用 entry_price，不发 HTTP
-- 市场单 → `fetch_mark_price(symbol)` 命中 Binance fapi `premiumIndex`（5s 超时，**mainnet endpoint，不需要 API key**）
+- 无 decision 或 side=Flat → 写 `mark_price=None`
+- `entry_price` 已设（限价单）→ 复用 entry_price，不发 HTTP
+- 市价单 → `fetch_mark_price(symbol, mode=...)` 命中所选场所的 `premiumIndex`（5s 超时，不需要 API key）
 
-失败返回 None，executor 看到 None 会写 `trade_skipped`。
+失败返回 None，gate 对市价单 fail-closed 拒绝。
 
-**关注点**：Mark Price 用 **mainnet**，executor 是 **testnet**。两者价差在大波动时几个点，影响 sizing 精度。短期可接受，上 mainnet 后建议同源。
+**Venue 规则（2026-08-09 修复 §12 #4）**：参考价必须来自订单成交的场所。模式由 `executor.resolve_executor_mode`（env `EXECUTOR_MODE` > config `futures_executor_mode` > `dryrun`）统一判定，executor 工厂、mark price 节点、`trade_execute` CLI 三处共用——dryrun 用 mainnet（结论由人在主网手动执行），testnet 用 `testnet.binancefuture.com`（成交在测试网，薄盘口可偏离主网百分点级）。同批闭合两个同族缺陷：`TRADINGAGENTS_FUTURES_EXECUTOR_MODE`（SKILL.md 文档化的开关）此前无 env 映射、读了个寂寞，现已进 `_ENV_OVERRIDES`；`analyze_json` 的"Force dryrun"此前设的正是这个没人读的变量——shell 里继承 `EXECUTOR_MODE=testnet` 时分析路径会真实下单，现改写最高优先级的 `EXECUTOR_MODE`。
 
 ### 10.3 Executor
 
@@ -1032,7 +1032,7 @@ Week 5 方案 A 的 Monopoly 侧已完成（T4 2026-07-14、T5 2026-07-19 `cf8e5
 | 1 | `position_closed` 没人写，3 条 cross-run 规则失效 | **已修**（T1 对账 + T12 真实 PnL 回填，8-02 实测） | `position_monitor.py` 三遍对账写入；T1 残留的 `pnl_usd=0.0` 回撤失明已由 income history 回填关闭（§10.5） |
 | 2 | 开仓成功后保护单失败 → 仓位裸奔，无 rollback | **已修** | `executor.py` two-phase + `_try_unwind` + `position_naked` 事件（§10.3.3） |
 | 3 | gate 频繁拒绝无告警（L4 缺位） | **已修**（T6 + T12 扩充）；Discord 推送未接 | `alerts.py`（§10.7）六项阈值检查 + 退出码；推送待 OpenClaw 部署后接线 |
-| 4 | mark_price 用 mainnet，executor 用 testnet | **未修** | `market_data.py:25` 仍是 `fapi.binance.com` |
+| 4 | mark_price 用 mainnet，executor 用 testnet | **已修**（2026-08-09，红测试先行，683 passed） | `resolve_executor_mode` 单一事实源 + venue-keyed `_PREMIUM_INDEX_URLS`（§10.2）；连带修复 `TRADINGAGENTS_FUTURES_EXECUTOR_MODE` 空映射与 `analyze_json` 伪 dryrun 强制 |
 | 5 | `final_decision_structured` 在 LangGraph state 透传，checkpointer 序列化未验证 | **未验证** | 建议跑一遍 `checkpoint_enabled=True` 的 crypto path |
 | 6 | `_round_qty` 硬编码 step=0.001 | **未修但更稳健** | 改成 floor 而非 round（`executor.py:490-498`），BTC/ETH 可接受；扩 symbol 前必须改 |
 | 7（T12 新识别并同批修复） | 事件全部在 `place_order` 返回后才写 → 进程死在「交易所成交、本地未落账」窗口 = 本地账本失明 | **已修**（T12，8-02 验证 A+B 全部实弹通过） | `execute_with_ledger` write-ahead（§10.3.4）+ gate 规则 7.5 dangling 阻断 + monitor Pass 2/3 收养/注销（§10.5） |

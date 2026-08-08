@@ -129,3 +129,63 @@ class TestFuturesSchemaValidation:
     def test_proposal_rejects_unknown_side(self):
         with pytest.raises(Exception):
             FuturesProposal(side="Sideways", reasoning="invalid")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# time_horizon: schema-example echo (2026-08-08 review, gap #2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestTimeHorizonBuckets:
+    """46/51 replayed decisions echoed the description's example string
+    ('2-5 days') verbatim, so the field carried zero information. The
+    field is now a closed set of buckets: the JSON schema advertises an
+    enum (no free-text example to echo), and values outside the buckets
+    degrade to None instead of failing the whole decision — a structured-
+    output validation failure would otherwise fall back to free text and
+    get the trade rejected by the gate.
+    """
+
+    def _decision(self, **overrides):
+        base = dict(
+            side=FuturesSide.LONG,
+            leverage=2.0,
+            position_size_pct=0.005,
+            stop_loss=62800.0,
+            executive_summary="s",
+            investment_thesis="t",
+        )
+        base.update(overrides)
+        return FuturesDecision(**base)
+
+    def test_description_carries_no_example_literal(self):
+        desc = FuturesDecision.model_fields["time_horizon"].description or ""
+        assert "2-5 days" not in desc
+        assert "e.g." not in desc
+
+    def test_json_schema_advertises_closed_enum(self):
+        import json as _json
+
+        prop = FuturesDecision.model_json_schema()["properties"]["time_horizon"]
+        blob = _json.dumps(prop)
+        assert "intraday" in blob          # enum choices are in the schema
+        assert "2-5 days" not in blob      # the old example is not
+
+    def test_bucket_values_accepted(self):
+        from tradingagents.agents.schemas import TIME_HORIZON_BUCKETS
+
+        assert len(TIME_HORIZON_BUCKETS) >= 3
+        for bucket in TIME_HORIZON_BUCKETS:
+            assert self._decision(time_horizon=bucket).time_horizon == bucket
+
+    def test_old_example_echo_degrades_to_none_not_error(self):
+        d = self._decision(time_horizon="2-5 days")
+        assert d.time_horizon is None
+
+    def test_whitespace_and_case_normalised(self):
+        d = self._decision(time_horizon="  Intraday ")
+        assert d.time_horizon == "intraday"
+
+    def test_none_still_allowed(self):
+        assert self._decision(time_horizon=None).time_horizon is None

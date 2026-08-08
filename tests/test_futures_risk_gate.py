@@ -499,3 +499,99 @@ def test_macro_check_failed_defaults_false():
                       snapshot=_empty_snapshot())
     assert result.approved is True
     assert result.macro_check_failed is False
+
+
+# ---------------------------------------------------------------------------
+# Market-order stop side vs reference price (2026-08-08 review, gap #1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMarketOrderStopSideVsReference:
+    """The gate must validate stop side for market orders against a
+    reference (mark) price instead of skipping the check.
+
+    The two rejection cases below are real decisions from
+    ``docs/reviews/2026-08-08-horizon-replays.jsonl`` that the gate
+    approved (``gate_passed=True``) before the fix: shorts whose stop
+    sat on the profit side of the mark price.
+    """
+
+    def test_replay_2026_05_27_r0_short_stop_below_mark_rejected(self):
+        d = FuturesDecision(
+            side=FuturesSide.SHORT,
+            leverage=2.0,
+            position_size_pct=0.003,
+            entry_price=None,          # market order
+            stop_loss=68500.0,         # below the mark — profit side for a short
+            take_profit=62000.0,
+            executive_summary="replay 2026-05-27 r0",
+            investment_thesis="replay 2026-05-27 r0",
+        )
+        result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
+                          config=RiskGateConfig(), now=NOW,
+                          snapshot=_empty_snapshot(),
+                          reference_price=75737.9)
+        assert not result.approved
+        assert result.reason == REASON_STOP_WRONG_SIDE
+
+    def test_replay_2026_06_28_r2_short_stop_below_mark_rejected(self):
+        d = FuturesDecision(
+            side=FuturesSide.SHORT,
+            leverage=2.0,
+            position_size_pct=0.005,
+            entry_price=None,
+            stop_loss=60140.0,
+            take_profit=58500.0,
+            executive_summary="replay 2026-06-28 r2",
+            investment_thesis="replay 2026-06-28 r2",
+        )
+        result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
+                          config=RiskGateConfig(), now=NOW,
+                          snapshot=_empty_snapshot(),
+                          reference_price=60314.9)
+        assert not result.approved
+        assert result.reason == REASON_STOP_WRONG_SIDE
+
+    def test_market_long_stop_above_mark_rejected(self):
+        d = _ok_long(entry_price=None, stop_loss=65000.0)
+        result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
+                          config=RiskGateConfig(), now=NOW,
+                          snapshot=_empty_snapshot(),
+                          reference_price=64500.0)
+        assert not result.approved
+        assert result.reason == REASON_STOP_WRONG_SIDE
+
+    def test_market_short_stop_above_mark_approved(self):
+        # _ok_short stop 66500 sits above the 64500 mark — correct side.
+        d = _ok_short(entry_price=None)
+        result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
+                          config=RiskGateConfig(), now=NOW,
+                          snapshot=_empty_snapshot(),
+                          reference_price=64500.0)
+        assert result.approved
+
+    def test_market_order_without_reference_price_rejected(self):
+        # Fail-closed: with no price to compare against, the gate must
+        # refuse rather than approve unvalidated (the executor would
+        # refuse to size the order anyway — this surfaces the refusal as
+        # a structured gate reason instead of an execution error).
+        from tradingagents.futures.risk_gate import REASON_NO_REFERENCE_PRICE
+
+        d = _ok_long(entry_price=None)
+        result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
+                          config=RiskGateConfig(), now=NOW,
+                          snapshot=_empty_snapshot())
+        assert not result.approved
+        assert REASON_NO_REFERENCE_PRICE in result.reason
+
+    def test_limit_order_checked_against_entry_not_reference(self):
+        # entry_price wins over reference_price: a limit fill happens at
+        # entry, so that is the price the stop must clear.
+        d = _ok_long(entry_price=64500.0, stop_loss=64600.0)
+        result = evaluate(d, symbol="BTC-USD", equity_usd=1000.0,
+                          config=RiskGateConfig(), now=NOW,
+                          snapshot=_empty_snapshot(),
+                          reference_price=70000.0)
+        assert not result.approved
+        assert result.reason == REASON_STOP_WRONG_SIDE

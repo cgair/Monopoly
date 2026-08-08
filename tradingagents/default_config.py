@@ -27,6 +27,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_FUTURES_MACRO_WARN_HOURS":          "futures_macro_warn_hours",
     "TRADINGAGENTS_FUTURES_MACRO_BLOCK_HOURS":         "futures_macro_block_hours",
     "TRADINGAGENTS_FUTURES_DANGLING_INTENT_MINUTES":   "futures_dangling_intent_minutes",
+    "TRADINGAGENTS_FUTURES_EXECUTOR_MODE":             "futures_executor_mode",
 }
 
 
@@ -118,6 +119,10 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # ----------------------------------------------------------------------
     # All can be overridden via TRADINGAGENTS_FUTURES_* env vars; see the
     # _ENV_OVERRIDES table above.
+    # Execution venue: "dryrun" (no orders; conclusions consumed manually)
+    # or "testnet". The EXECUTOR_MODE env var still wins over this key —
+    # see futures.executor.resolve_executor_mode.
+    "futures_executor_mode": "dryrun",
     "futures_max_leverage": 3.0,
     "futures_per_trade_risk_pct": 0.01,           # 1% of equity per trade
     "futures_daily_drawdown_halt_pct": 0.03,      # -3% halts new entries until next UTC day

@@ -453,7 +453,7 @@ class TestDecisionReplayProtection:
         )
         monkeypatch.setitem(cli_main.DEFAULT_CONFIG, "futures_executor_mode", "dryrun")
         import tradingagents.futures.market_data as market_data
-        monkeypatch.setattr(market_data, "fetch_mark_price", lambda s: 64500.0)
+        monkeypatch.setattr(market_data, "fetch_mark_price", lambda s, **_kw: 64500.0)
 
         decision_file = tmp_path / "decision.json"
         decision_file.write_text(json.dumps(_sample_decision_json()))

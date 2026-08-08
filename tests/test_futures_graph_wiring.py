@@ -107,7 +107,8 @@ class TestMarkPriceNodeFromDecision:
     """New contract: the node reads ``final_decision_structured`` (it runs
     before the gate, so no intent exists yet)."""
 
-    def test_market_decision_fetches_reference_price(self):
+    def test_market_decision_fetches_reference_price(self, monkeypatch):
+        monkeypatch.delenv("EXECUTOR_MODE", raising=False)
         node = create_mark_price_node()
         with patch(
             "tradingagents.futures.market_data.fetch_mark_price",
@@ -117,7 +118,7 @@ class TestMarkPriceNodeFromDecision:
                 "final_decision_structured": _decision(),
                 "company_of_interest": "BTC-USD",
             })
-        mock_fetch.assert_called_once_with("BTC-USD")
+        mock_fetch.assert_called_once_with("BTC-USD", mode="dryrun")
         assert result == {"mark_price": 75737.9}
 
     def test_limit_decision_reuses_entry_price_without_http(self):

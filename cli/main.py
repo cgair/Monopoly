@@ -1298,8 +1298,12 @@ def run_analysis_json(checkpoint: bool = False) -> int:
         config["llm_provider"] = os.getenv("TRADINGAGENTS_LLM_PROVIDER", "google").lower()
         config["output_language"] = os.getenv("TRADINGAGENTS_OUTPUT_LANGUAGE", "English")
         config["checkpoint_enabled"] = checkpoint
-        # Force dryrun mode
-        os.environ["TRADINGAGENTS_FUTURES_EXECUTOR_MODE"] = "dryrun"
+        # Force dryrun: analysis must never place orders. EXECUTOR_MODE is
+        # the highest-precedence switch (resolve_executor_mode), so overwrite
+        # it — an inherited EXECUTOR_MODE=testnet in the shell would otherwise
+        # have the analyze path submitting real testnet orders.
+        os.environ["EXECUTOR_MODE"] = "dryrun"
+        config["futures_executor_mode"] = "dryrun"
         
         stats_handler = StatsCallbackHandler()
         
@@ -1614,10 +1618,12 @@ def trade_execute(
         # validates market-order stop side against it and rejects
         # fail-closed when it is unavailable (2026-08-08 review gap —
         # with the fetch after the gate, market-order stops on the wrong
-        # side of the price were approved).
+        # side of the price were approved). Venue follows the executor
+        # mode so the price checked is the one the order will fill at.
+        from tradingagents.futures.executor import resolve_executor_mode
         from tradingagents.futures.market_data import fetch_mark_price
 
-        mark_price = fetch_mark_price(symbol)
+        mark_price = fetch_mark_price(symbol, mode=resolve_executor_mode(config))
 
         intent, gate_reason = reconstruct_intent_from_decision(
             decision,

@@ -624,15 +624,26 @@ def execute_with_ledger(
 # ---------------------------------------------------------------------------
 
 
-def create_executor(config: dict) -> ExecutorAdapter:
-    """Build the executor adapter based on config / env.
+def resolve_executor_mode(config: Optional[dict] = None) -> str:
+    """Single source of truth for the execution venue.
 
     Precedence: ``EXECUTOR_MODE`` env var > ``config["futures_executor_mode"]``
-    > default ``"dryrun"``.
+    > default ``"dryrun"``. Shared with the mark-price node so the sizing
+    reference price can never disagree with the venue orders fill on
+    (two components resolving the mode independently is how the
+    mainnet-reference-vs-testnet-fill gap happened in the first place).
     """
     mode = (os.getenv("EXECUTOR_MODE")
-            or config.get("futures_executor_mode")
+            or (config or {}).get("futures_executor_mode")
             or "dryrun").lower()
+    if mode not in ("dryrun", "testnet"):
+        raise ValueError(f"Unknown EXECUTOR_MODE: {mode!r} (expected 'dryrun' or 'testnet')")
+    return mode
+
+
+def create_executor(config: dict) -> ExecutorAdapter:
+    """Build the executor adapter for :func:`resolve_executor_mode`'s venue."""
+    mode = resolve_executor_mode(config)
     if mode == "testnet":
         api_key = os.environ.get("BINANCE_TESTNET_API_KEY")
         api_secret = os.environ.get("BINANCE_TESTNET_API_SECRET")
@@ -642,13 +653,11 @@ def create_executor(config: dict) -> ExecutorAdapter:
                 "BINANCE_TESTNET_API_SECRET not set in env"
             )
         return TestnetExecutor(api_key, api_secret)
-    if mode == "dryrun":
-        orders_log = Path(config.get(
-            "futures_orders_log_path",
-            os.path.join(os.path.expanduser("~"), ".tradingagents", "orders.jsonl"),
-        ))
-        return DryRunExecutor(orders_log)
-    raise ValueError(f"Unknown EXECUTOR_MODE: {mode!r} (expected 'dryrun' or 'testnet')")
+    orders_log = Path(config.get(
+        "futures_orders_log_path",
+        os.path.join(os.path.expanduser("~"), ".tradingagents", "orders.jsonl"),
+    ))
+    return DryRunExecutor(orders_log)
 
 
 def create_executor_node(config: dict):

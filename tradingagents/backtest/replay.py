@@ -123,7 +123,7 @@ def replay(symbol: str, as_of: datetime, *, scratch: Path,
     result.reference_price = closed[-1].close
 
     original_mark = fmd.fetch_mark_price
-    fmd.fetch_mark_price = lambda _t: result.reference_price
+    fmd.fetch_mark_price = lambda _t, **_kw: result.reference_price
     try:
         with point_in_time(as_of_ms, binance_symbol):
             from tradingagents.graph.trading_graph import TradingAgentsGraph

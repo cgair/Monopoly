@@ -167,7 +167,7 @@ class GraphSetup:
         # the gate they went unvalidated (2026-08-08 review gap).
         if self.config is not None:
             workflow.add_node("Risk Gate", create_risk_gate_node(self.config))
-            workflow.add_node("Mark Price", create_mark_price_node())
+            workflow.add_node("Mark Price", create_mark_price_node(self.config))
             workflow.add_node("Executor", create_executor_node(self.config))
 
             workflow.add_edge("Portfolio Manager", "Mark Price")

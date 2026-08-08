@@ -22,26 +22,35 @@ import requests
 
 from tradingagents.agents.schemas import FuturesSide
 from tradingagents.agents.utils.symbol_utils import to_binance_symbol
+from tradingagents.futures.executor import resolve_executor_mode
 
 logger = logging.getLogger(__name__)
 
 
-_PREMIUM_INDEX_URL = "https://fapi.binance.com/fapi/v1/premiumIndex"
+# Reference price must come from the venue orders fill on. dryrun places
+# no orders — its conclusions are executed by a human on mainnet, so
+# mainnet is the right reference. testnet fills on testnet, whose thin
+# books can sit percent-level away from mainnet — sizing against the
+# mainnet price there invalidates every margin/stop-distance check.
+_PREMIUM_INDEX_URLS = {
+    "dryrun": "https://fapi.binance.com/fapi/v1/premiumIndex",
+    "testnet": "https://testnet.binancefuture.com/fapi/v1/premiumIndex",
+}
 _HTTP_TIMEOUT = 5.0
 
 
-def fetch_mark_price(state_ticker: str) -> Optional[float]:
+def fetch_mark_price(state_ticker: str, *, mode: str = "dryrun") -> Optional[float]:
     """Return the current mark price for ``state_ticker`` (e.g. ``"BTC-USD"``).
 
-    Hits Binance Futures' ``premiumIndex`` endpoint (unauthenticated;
-    no API key needed for reads). Returns ``None`` on any failure so
-    callers can degrade gracefully — the risk gate maps a missing mark
-    price on a market order into a fail-closed rejection.
+    Hits the ``premiumIndex`` endpoint of the venue selected by ``mode``
+    (unauthenticated; no API key needed for reads). Returns ``None`` on
+    any failure so callers can degrade gracefully — the risk gate maps a
+    missing mark price on a market order into a fail-closed rejection.
     """
     symbol = to_binance_symbol(state_ticker)
     try:
         response = requests.get(
-            _PREMIUM_INDEX_URL,
+            _PREMIUM_INDEX_URLS[mode],
             params={"symbol": symbol},
             timeout=_HTTP_TIMEOUT,
         )
@@ -53,11 +62,13 @@ def fetch_mark_price(state_ticker: str) -> Optional[float]:
         return None
 
 
-def create_mark_price_node():
+def create_mark_price_node(config: Optional[dict] = None):
     """LangGraph node that populates ``state["mark_price"]`` before the risk gate.
 
     Runs between Portfolio Manager and Risk Gate, so it reads the PM's
     ``final_decision_structured`` — no execution intent exists yet.
+    The fetch venue follows :func:`resolve_executor_mode` so the price
+    the gate and executor size against is the one orders will fill at.
 
     Behavior:
     - No structured decision, or side == Flat → ``mark_price = None``.
@@ -68,13 +79,15 @@ def create_mark_price_node():
       network failure; the gate then rejects fail-closed.
     """
 
+    mode = resolve_executor_mode(config)
+
     def mark_price_node(state) -> dict:
         decision = state.get("final_decision_structured")
         if decision is None or decision.side == FuturesSide.FLAT:
             return {"mark_price": None}
         if decision.entry_price is not None:
             return {"mark_price": float(decision.entry_price)}
-        price = fetch_mark_price(state["company_of_interest"])
+        price = fetch_mark_price(state["company_of_interest"], mode=mode)
         return {"mark_price": price}
 
     return mark_price_node

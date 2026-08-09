@@ -224,3 +224,6 @@ __marimo__/
 # generated walkthrough artifacts (rebuild with docs/walkthrough/build_pdf.py)
 docs/walkthrough/monopoly-walkthrough.pdf
 docs/walkthrough/monopoly-walkthrough.html
+
+# Review artifacts stay local — regenerate via scripts/backtest_*.py; do not commit
+docs/reviews/

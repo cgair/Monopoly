@@ -5,6 +5,13 @@ graph run, with every side effect redirected into a scratch directory so
 a replay cannot touch the live memory log, risk-gate event stream, or
 order log.
 
+The execution venue is pinned separately, because it is the one side
+effect the scratch config cannot reach: ``resolve_executor_mode`` reads
+``EXECUTOR_MODE`` from the environment ahead of the config, so a
+``.env`` naming testnet outranks anything a replay asks for. The
+2026-08-08 sweep set the config, assumed it held, and sent 12 market
+orders to Binance testnet.
+
 Scope is deliberately narrow. Only the market analyst is selected: its
 inputs (OHLCV, funding, open interest, the long/short ratios) all have
 dated archives, while news, Reddit and the newsflash relay do not. A
@@ -15,7 +22,9 @@ run instead.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -24,6 +33,7 @@ from pathlib import Path
 from tradingagents.agents.utils.symbol_utils import to_binance_symbol
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.futures import market_data as fmd
+from tradingagents.futures.executor import resolve_executor_mode
 
 from . import vision
 from .pit import point_in_time
@@ -79,6 +89,45 @@ def _parse_decision(text: str) -> dict:
     return out
 
 
+_MODE_ENV = "EXECUTOR_MODE"
+_DRYRUN = "dryrun"
+
+
+@contextlib.contextmanager
+def _pinned_to_dryrun(cfg: dict):
+    """Pin the execution venue to ``dryrun`` for the duration of a replay.
+
+    Setting ``futures_executor_mode`` in the scratch config is not enough.
+    :func:`~tradingagents.futures.executor.resolve_executor_mode` reads
+    ``EXECUTOR_MODE`` from the environment first, and deliberately so —
+    one source of truth is what keeps the mark-price node and the
+    executor from resolving the venue independently. The override
+    therefore has to happen at the environment, and it has to be
+    *verified* rather than assumed.
+
+    An unpinnable venue is a global misconfiguration, not a bad window,
+    so this raises rather than being folded into ``ReplayResult.error``:
+    a sweep must stop, not quietly produce rows while pointed at a live
+    exchange.
+    """
+    previous = os.environ.get(_MODE_ENV)
+    os.environ[_MODE_ENV] = _DRYRUN
+    try:
+        resolved = resolve_executor_mode(cfg)
+        if resolved != _DRYRUN:
+            raise RuntimeError(
+                f"replay refuses to start: execution venue resolved to "
+                f"{resolved!r}, not {_DRYRUN!r} — a replay must never be able "
+                f"to reach a live venue"
+            )
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_MODE_ENV, None)
+        else:
+            os.environ[_MODE_ENV] = previous
+
+
 def _scratch_config(scratch: Path, base: dict | None = None) -> dict:
     """A config whose every write path lands inside ``scratch``."""
     cfg = dict(base or DEFAULT_CONFIG)
@@ -122,34 +171,37 @@ def replay(symbol: str, as_of: datetime, *, scratch: Path,
         return result
     result.reference_price = closed[-1].close
 
-    original_mark = fmd.fetch_mark_price
-    fmd.fetch_mark_price = lambda _t, **_kw: result.reference_price
-    try:
-        with point_in_time(as_of_ms, binance_symbol):
-            from tradingagents.graph.trading_graph import TradingAgentsGraph
+    with _pinned_to_dryrun(cfg):
+        original_mark = fmd.fetch_mark_price
+        fmd.fetch_mark_price = lambda _t, **_kw: result.reference_price
+        try:
+            with point_in_time(as_of_ms, binance_symbol):
+                from tradingagents.graph.trading_graph import TradingAgentsGraph
 
-            graph = TradingAgentsGraph(
-                selected_analysts=cfg["selected_analysts"], config=cfg,
-            )
-            final_state, _decision = graph.propagate(
-                symbol, as_of.strftime("%Y-%m-%d"))
+                graph = TradingAgentsGraph(
+                    selected_analysts=cfg["selected_analysts"], config=cfg,
+                )
+                final_state, _decision = graph.propagate(
+                    symbol, as_of.strftime("%Y-%m-%d"))
 
-        text = final_state.get("final_trade_decision", "") or ""
-        result.decision_text = text
-        result.market_report = final_state.get("market_report", "") or ""
-        for k, v in _parse_decision(text).items():
-            setattr(result, k, v)
+            text = final_state.get("final_trade_decision", "") or ""
+            result.decision_text = text
+            result.market_report = final_state.get("market_report", "") or ""
+            for k, v in _parse_decision(text).items():
+                setattr(result, k, v)
 
-        # The gate reports by absence: an intent means approved, a
-        # rejection reason means vetoed.
-        if "execution_intent" in final_state or "risk_gate_rejection_reason" in final_state:
-            reason = final_state.get("risk_gate_rejection_reason")
-            result.gate_reason = reason
-            result.gate_passed = final_state.get("execution_intent") is not None and not reason
-    except Exception as exc:                      # a failed window must not sink the sweep
-        logger.exception("replay failed for %s at %s", symbol, as_of)
-        result.error = f"{type(exc).__name__}: {exc}"
-    finally:
-        fmd.fetch_mark_price = original_mark
+            # The gate reports by absence: an intent means approved, a
+            # rejection reason means vetoed.
+            if "execution_intent" in final_state or "risk_gate_rejection_reason" in final_state:
+                reason = final_state.get("risk_gate_rejection_reason")
+                result.gate_reason = reason
+                result.gate_passed = (
+                    final_state.get("execution_intent") is not None and not reason
+                )
+        except Exception as exc:                  # a failed window must not sink the sweep
+            logger.exception("replay failed for %s at %s", symbol, as_of)
+            result.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            fmd.fetch_mark_price = original_mark
 
     return result

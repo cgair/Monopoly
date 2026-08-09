@@ -67,11 +67,11 @@ def create_sentiment_analyst(llm):
             [
                 (
                     "system",
+                    "For your reference, the current date is {current_date}. {instrument_context}\n"
                     "You are a helpful AI assistant, collaborating with other assistants."
                     " If you or any other assistant has the FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** or deliverable,"
                     " prefix your response with FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** so the team knows to stop."
-                    "\n{system_message}\n"
-                    "For your reference, the current date is {current_date}. {instrument_context}",
+                    "\n{system_message}",
                 ),
                 MessagesPlaceholder(variable_name="messages"),
             ]

@@ -238,7 +238,9 @@ tid = thread_id(company_name, str(trade_date))
 args["config"]["configurable"]["thread_id"] = tid
 ```
 
-`thread_id` 函数（`graph/checkpointer.py`）把 ticker + date 拼成稳定 id。同 ticker 同日的 run 续跑，换日就是新 thread——**回测时按日重跑是天然新 thread，不会续旧检查点**。
+`thread_id` 函数（`graph/checkpointer.py`）把 ticker + date 拼成稳定 id。同 ticker 同日的 run 续跑，换日就是新 thread——**回测时按日重跑是天然新 thread，不会续旧检查点**（重放路径还多一层保险：`backtest/replay.py:93` 强制 `checkpoint_enabled: False`，且在合并外部 config 之后才置，传入 True 也会被压回）。
+
+**已知缺口（2026-08-09 上游对照发现，未移植）**：thread_id 只含 ticker+date，**不含运行签名**（analyst 组合、辩论深度、asset mode）。checkpoint 又只在成功完成时清除（`trading_graph.py:359`），失败 run 的中间态会留在 per-ticker sqlite 里——同日崩溃后改配置重跑，会**静默 resume 旧图状态**，产出新旧配置杂交的 decision，日志上不可见。当前为潜伏风险：`checkpoint_enabled` 默认 False、`.env` 未开启、replay 强制关闭。**开启 checkpoint 之前必须先移植 upstream `daf1da9`**（把运行签名折进 thread_id，同 commit 还暴露了 `llm_max_retries`）。见 §12 #8。
 
 ---
 
@@ -404,6 +406,8 @@ else:
 所有工具都是 crypto-native（Binance / RSS 数据源）。2026-07-23 crypto-only 化后，Fundamentals analyst 及其 `get_fundamentals` / `get_balance_sheet` / `get_cashflow` / `get_income_statement` / `get_insider_transactions` 工具已整体删除——这些工具的 vendor 实现在 fork 时就没搬过来，真调用会直接报错，crypto 模式本就把该 analyst 过滤掉了。crypto 的"基本面"（资金费率、持仓量、清算）由 Market Analyst 覆盖。
 
 **T9 —— 多空持仓比（2026-08-02 合并）**：`get_long_short_ratio`（`agents/utils/core_market_tools.py:54-71` → `dataflows/crypto_binance.py`）走 Binance 免费 `/futures/data/*` 端点（无需鉴权，约 30 天历史），一次返回三个指标：全局多空账户比历史（sqlite cache-first + stale fallback，与兄弟端点同语义）、最新大户持仓比、最新主动买卖量比（这两个只渲染最新几行，用进程内 TTL memo 而非 sqlite——`_AUX_CACHE`，失败降级为 note 行不拖垮整报告）。Market analyst 的 prompt 同步注入解读指引：极端读数 = 拥挤持仓（反向/挤仓风险信号），散户与大户方向背离是经典分歧信号。Coinglass（清算数据）保持注册但 key 采购 wait-and-see（PLAN.md T9 结论），可经 `tool_vendors` 强制切换。
+
+**Prompt 日期前置（2026-08-09 合并）**：三个 analyst 的 system prompt 原来把 `For your reference, the current date is {current_date}. {instrument_context}` 放在约 80 行正文（工具清单/指标菜单/workflow）**之后**的末尾——长 prompt 尾部是注意力最弱的位置，弱模型会锚定训练截止日期推理"当前"行情与新闻新旧。已挪到 system prompt 最开头（instrument_context 连带前置），措辞与逻辑零改动，移植自 upstream TradingAgents `2b2d685`。红测试先行：`tests/test_analyst_date_position.py` 用 fake LLM 真实调用节点捕获渲染后 prompt，断言日期句位置在 analyst 正文之前（修复前 sentiment 的日期句在第 5131 字符）；全量 686 passed。
 
 **T10 —— 快讯源 + X 转述（2026-08-02 合并）**：`dataflows/crypto_news.py` 的默认源从 CoinDesk/CoinTelegraph 两个文章 RSS 扩到四个——加 BlockBeats、Odaily 两个**快讯台**（宏观数据 print、KOL 的 X 动态分钟级转述）。Odaily 是中文源，符号关键词表加了 CJK 别名（比特币/以太坊，CJK 边界上 `\b` 失效所以用纯子串）；BlockBeats 用 `language` 请求头选语言，**当前网络出口其 v2 feed 返回空 payload**——降级为 no-op 源，快讯负载由 Odaily 承担（已实测拿到真实 CZ/KOL X 转述）。`dataflows/crypto_twitter.py` 则从永久占位符重写为**编辑转述层**：契约不变（`Response[SocialPost]`，`platform="twitter"`），内部对快讯 feed 做分层筛选——符号相关 X 转述 → 全市场 X 转述 → 符号相关快讯 → 一般快讯（每层带解释性 note）；engagement 全空，sentiment prompt 明确禁止推断传播度（virality）。
 
@@ -1033,9 +1037,10 @@ Week 5 方案 A 的 Monopoly 侧已完成（T4 2026-07-14、T5 2026-07-19 `cf8e5
 | 2 | 开仓成功后保护单失败 → 仓位裸奔，无 rollback | **已修** | `executor.py` two-phase + `_try_unwind` + `position_naked` 事件（§10.3.3） |
 | 3 | gate 频繁拒绝无告警（L4 缺位） | **已修**（T6 + T12 扩充）；Discord 推送未接 | `alerts.py`（§10.7）六项阈值检查 + 退出码；推送待 OpenClaw 部署后接线 |
 | 4 | mark_price 用 mainnet，executor 用 testnet | **已修**（2026-08-09，红测试先行，683 passed） | `resolve_executor_mode` 单一事实源 + venue-keyed `_PREMIUM_INDEX_URLS`（§10.2）；连带修复 `TRADINGAGENTS_FUTURES_EXECUTOR_MODE` 空映射与 `analyze_json` 伪 dryrun 强制 |
-| 5 | `final_decision_structured` 在 LangGraph state 透传，checkpointer 序列化未验证 | **未验证** | 建议跑一遍 `checkpoint_enabled=True` 的 crypto path |
+| 5 | `final_decision_structured` 在 LangGraph state 透传，checkpointer 序列化未验证 | **未验证**（与 #8 一并处理） | 建议跑一遍 `checkpoint_enabled=True` 的 crypto path |
 | 6 | `_round_qty` 硬编码 step=0.001 | **未修但更稳健** | 改成 floor 而非 round（`executor.py:490-498`），BTC/ETH 可接受；扩 symbol 前必须改 |
 | 7（T12 新识别并同批修复） | 事件全部在 `place_order` 返回后才写 → 进程死在「交易所成交、本地未落账」窗口 = 本地账本失明 | **已修**（T12，8-02 验证 A+B 全部实弹通过） | `execute_with_ledger` write-ahead（§10.3.4）+ gate 规则 7.5 dangling 阻断 + monitor Pass 2/3 收养/注销（§10.5） |
+| 8（2026-08-09 上游对照新识别） | checkpoint thread_id 只含 ticker+date，不含运行签名——同日崩溃后改配置重跑会静默 resume 旧图状态（checkpoint 仅成功时清除） | **未修（潜伏）**：`checkpoint_enabled` 默认关、`.env` 未开、replay 强制关；**开启 checkpoint 前必须先修** | upstream `daf1da9`（运行签名折进 thread_id + `llm_max_retries`）；本地对应 `checkpointer.py:28`、`trading_graph.py:359`、`replay.py:93`（§3.5） |
 
 **T0 提交的新增防御**（上一版未列出的潜在风险）：
 
@@ -1091,7 +1096,7 @@ Week 5 方案 A 的 Monopoly 侧已完成（T4 2026-07-14、T5 2026-07-19 `cf8e5
 2. **gate 拒绝路径**：手动改 prompt 让 LLM 输出 `position_size_pct=0.5`，看到 gate 拒绝 + JSONL 写 `trade_skipped`
 3. **方向反路径**：手动改 prompt 让 LLM 输出 Long 但 stop > entry，看到 executor 在 `compute_sizing` 拒绝（而不是在 Binance API 上失败）
 4. **naked 模拟路径**：用 mock 让 stop 单的 `_extract_order_id` 抛 RuntimeError，验证 `_try_unwind` 真的发了反向 MARKET 单
-5. **checkpointer 路径**：`checkpoint_enabled=True` 跑一个 crypto run，中途 Ctrl+C，重启验证能从最后节点恢复（重点看 `final_decision_structured` 反序列化是否完整）
+5. **checkpointer 路径**：`checkpoint_enabled=True` 跑一个 crypto run，中途 Ctrl+C，重启验证能从最后节点恢复（重点看 `final_decision_structured` 反序列化是否完整）。**前置：先修 §12 #8**（thread_id 缺运行签名）；演练本身必须同配置重跑——改任何配置（analyst 组合/深度）再 resume 会静默续旧图状态，正是 #8 描述的坑
 6. ~~**untracked 路径（T12 验证 A）**：交易所 UI 手动开仓 → monitor 检出 `position_untracked` + CRITICAL、手动平仓后回填真实 PnL~~ ✅ 2026-08-02 实弹通过（demo.binance.com 开 BTCUSDT 0.002，untracked 检出/不重复/gate 计数正确，平仓回填 pnl -0.0382）
 7. ~~**真实止损路径（T12 验证 B）**：止损真实触发 → 对账事件带非零 `pnl_usd`、`outcome=stop`，其后 60min 内新开仓被 cooldown 拒绝~~ ✅ 2026-08-02 实弹通过（`trade_execute` 审批链开 0.033 BTC 多单，stop 63190/TP 64500 双保护单挂上 → 35min 后真实止损 → 对账回填 pnl -2.9172、outcome=stop、孤儿 TP 撤净 → cooldown 拒掉下一次开仓）
 8. **审批三路径（OpenClaw 部署验收）**：Discord 上批准（→ testnet 下单 + `position_opened`）、拒绝（→ `trade_skipped`）、超时 >15min 后再批（→ `stale` + `trade_skipped`）各跑一遍，`trade_review` 核对审计事件

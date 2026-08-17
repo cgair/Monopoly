@@ -219,16 +219,18 @@ class TestCardFixtures:
     """Tests that card formats match expected fixtures."""
 
     def test_decision_card_format_fixture(self):
-        """Decision card format matches fixture."""
+        """Decision card format matches fixture (realistic FuturesDecision
+        values: position_size_pct is a decimal fraction, cycle is a
+        time_horizon literal rendered in Chinese)."""
         card = format_decision_card(
             symbol="BTC-USD",
             direction="Long",
             leverage=2.0,
-            position_size_pct=0.5,
+            position_size_pct=0.005,
             entry_price=61500,
             stop_loss=60200,
             take_profit=64000,
-            cycle="swing_days",
+            cycle="1-3 days",
             summary="Strong uptrend with support at 60K",
             risk_gate_status="pass",
             risk_gate_reason=None,
@@ -238,9 +240,9 @@ class TestCardFixtures:
 
         expected_lines = [
             "🎯 **BTC-USD 决策** · 2026-08-09 18:00 UTC",
-            "**方向**: Long ｜ **杠杆**: 2.0x ｜ **仓位**: 0.5%",
+            "**方向**: Long ｜ **杠杆**: 2.0x ｜ **仓位**: 0.50%",
             "**入场**: 61,500 ｜ **止损**: 60,200 ｜ **止盈**: 64,000",
-            "**周期**: swing_days",
+            "**周期**: 1-3 天",
             "**摘要**: Strong uptrend with support at 60K",
             "**Risk Gate**: ✅ 通过",
             "**执行**: dryrun",
@@ -532,3 +534,74 @@ class TestCardFormatFixtures:
         expected = fixture_path.read_text().strip()
 
         assert card == expected
+
+
+# ---------------------------------------------------------------------------
+# Test: Chinese rendering at the display edge
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestChineseRendering:
+    """Values are translated at the card layer only; source strings
+    (alerts.py messages, time_horizon literals) stay English for grep."""
+
+    def test_render_finding_zh_known_type_with_count(self):
+        from tradingagents.notify.discord import render_finding_zh
+
+        line = render_finding_zh(
+            "naked_position", {"count": 2},
+            "CRITICAL: Naked position event(s) detected (2). Manual intervention required.",
+        )
+        assert "2 起裸持仓事件" in line
+
+    def test_render_finding_zh_unknown_type_falls_back_to_message(self):
+        from tradingagents.notify.discord import render_finding_zh
+
+        original = "Some new finding the mapping does not know yet"
+        assert render_finding_zh("future_type", None, original) == original
+        assert render_finding_zh(None, None, original) == original
+
+    def test_render_finding_zh_gate_rejections_includes_breakdown(self):
+        from tradingagents.notify.discord import render_finding_zh
+
+        line = render_finding_zh(
+            "gate_rejections",
+            {"reason_breakdown": {"leverage exceeds configured max_leverage": 3}},
+            "Gate rejections exceed threshold: 3 >= 3",
+        )
+        assert "Risk Gate 拒绝次数超阈值" in line
+        assert "×3" in line
+
+    def test_decision_card_translates_time_horizon(self):
+        card = format_decision_card(
+            symbol="BTC-USD", direction="Long", leverage=2.0,
+            position_size_pct=0.005, entry_price=61500, stop_loss=60200,
+            take_profit=64000, cycle="1-2 weeks", summary="s",
+            risk_gate_status="pass", risk_gate_reason=None,
+            executor_mode="dryrun", timestamp_utc="2026-08-18T12:00:00Z",
+        )
+        assert "**周期**: 1-2 周" in card
+
+    def test_decision_card_unknown_cycle_passes_through(self):
+        card = format_decision_card(
+            symbol="BTC-USD", direction="Long", leverage=2.0,
+            position_size_pct=0.005, entry_price=61500, stop_loss=60200,
+            take_profit=64000, cycle="whatever", summary="s",
+            risk_gate_status="pass", risk_gate_reason=None,
+            executor_mode="dryrun", timestamp_utc="2026-08-18T12:00:00Z",
+        )
+        assert "**周期**: whatever" in card
+
+    def test_decision_card_position_is_decimal_fraction(self):
+        """position_size_pct=0.005 (FuturesDecision semantics) → 0.50%,
+        not 0.005% — the decimal-vs-percent confusion must not reach
+        the approval channel."""
+        card = format_decision_card(
+            symbol="BTC-USD", direction="Long", leverage=2.0,
+            position_size_pct=0.005, entry_price=61500, stop_loss=60200,
+            take_profit=64000, cycle="intraday", summary="s",
+            risk_gate_status="pass", risk_gate_reason=None,
+            executor_mode="dryrun", timestamp_utc="2026-08-18T12:00:00Z",
+        )
+        assert "**仓位**: 0.50%" in card
+        assert "0.005%" not in card

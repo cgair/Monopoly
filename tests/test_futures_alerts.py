@@ -629,3 +629,54 @@ class TestAlertsFailOpenIsolation:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+@pytest.mark.unit
+class TestAlertsNotifyDelivery:
+    """Happy path: the card is actually built and handed to the sender.
+
+    Fail-open isolation alone can't catch a push block that dies before
+    send_discord (it would swallow the error and never deliver) — this
+    pins delivery: Chinese card content reaches the sender and the dedup
+    key is recorded from stable finding-type slugs.
+    """
+
+    NOW = datetime(2026, 8, 18, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_critical_alert_delivers_chinese_card(self, tmp_path, monkeypatch):
+        from tradingagents.default_config import DEFAULT_CONFIG
+        import tradingagents.notify.discord as notify_discord
+
+        state_file = tmp_path / "state.jsonl"
+        state_file.write_text(
+            '{"type": "position_naked", '
+            '"ts": "' + _ts(self.NOW - timedelta(hours=1)) + '", '
+            '"symbol": "BTCUSDT"}\n'
+        )
+
+        monkeypatch.setitem(
+            DEFAULT_CONFIG, "discord_webhook_url",
+            "https://discord.com/api/webhooks/123/test",
+        )
+        monkeypatch.setattr(notify_discord, "should_send_alert", lambda *a, **k: True)
+
+        sent_cards = []
+        monkeypatch.setattr(
+            notify_discord, "send_discord",
+            lambda content, **kw: sent_cards.append(content) or True,
+        )
+        recorded_keys = []
+        monkeypatch.setattr(
+            notify_discord, "record_alert_sent",
+            lambda key, **kw: recorded_keys.append(key),
+        )
+
+        result = main(
+            args=["--state-path", str(state_file), "--notify"], now=self.NOW,
+        )
+
+        assert result == 2
+        assert len(sent_cards) == 1
+        assert "🛑" in sent_cards[0]
+        assert "裸持仓事件" in sent_cards[0]
+        assert recorded_keys == ["alert:critical:naked_position"]

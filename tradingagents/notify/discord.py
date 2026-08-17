@@ -120,6 +120,66 @@ def record_alert_sent(
         logger.warning(f"Failed to record dedup: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Chinese rendering. Cards are read on a phone by a Chinese-speaking
+# operator; source strings (alerts.py messages, FuturesDecision literals)
+# stay English because logs and tests grep them. Translation happens here,
+# at the display edge, and unknown values fall back to the original text —
+# an untranslated line beats a lost one.
+# ---------------------------------------------------------------------------
+
+_TIME_HORIZON_ZH = {
+    "intraday": "日内",
+    "1-3 days": "1-3 天",
+    "1-2 weeks": "1-2 周",
+    "2-4 weeks": "2-4 周",
+    "1 month+": "1 个月以上",
+}
+
+
+def _breakdown_suffix(details: dict) -> str:
+    breakdown = (details or {}).get("reason_breakdown") or {}
+    if not breakdown:
+        return ""
+    items = ", ".join(f"{k}×{v}" for k, v in list(breakdown.items())[:3])
+    return f"（{items}）"
+
+
+_FINDING_ZH = {
+    "gate_rejections": lambda d, m: "Risk Gate 拒绝次数超阈值" + _breakdown_suffix(d),
+    "naked_position": lambda d, m: (
+        f"检测到 {d.get('count', '?')} 起裸持仓事件——保护单缺失，需人工处理"
+    ),
+    "untracked_position": lambda d, m: (
+        f"交易所侧发现 {d.get('count', '?')} 个未跟踪持仓——本地无记录，需人工处理"
+    ),
+    "pnl_backfill_failed": lambda d, m: (
+        f"{d.get('count', '?')} 笔平仓的真实盈亏回填失败——回撤/冷却统计对其失明"
+    ),
+    "dangling_intents": lambda d, m: (
+        f"{d.get('count', '?')} 个下单意图悬置待对账——Risk Gate 已拒绝一切新开仓"
+    ),
+    "malformed_lines": lambda d, m: (
+        f"状态文件有 {d.get('count', '?')} 行损坏——重放可能缺事件，请检查文件"
+    ),
+    "executor_errors": lambda d, m: "Executor 错误次数超阈值——检查交易所连通性与下单参数",
+    "consecutive_stops": lambda d, m: "连续止损次数达到阈值——复盘策略与当前行情的相性",
+}
+
+
+def render_finding_zh(
+    finding_type: str | None, details: dict | None, message: str,
+) -> str:
+    """Chinese alert line for a finding; unknown types fall back to ``message``."""
+    template = _FINDING_ZH.get(finding_type or "")
+    if template is None:
+        return message
+    try:
+        return template(details or {}, message)
+    except Exception:
+        return message
+
+
 def format_decision_card(
     symbol: str,
     direction: str,
@@ -155,15 +215,20 @@ def format_decision_card(
         f"🎯 **{symbol} 决策** · {ts_display}",
     ]
 
-    # For Flat decisions, omit position size
+    # For Flat decisions, omit position size. position_size_pct is the
+    # decimal fraction from FuturesDecision (0.005 = 0.5% of equity) —
+    # same *100 rendering as schemas.render_futures_decision.
     if position_size_pct is not None:
-        lines.append(f"**方向**: {direction} ｜ **杠杆**: {leverage}x ｜ **仓位**: {position_size_pct}%")
+        lines.append(
+            f"**方向**: {direction} ｜ **杠杆**: {leverage}x ｜ "
+            f"**仓位**: {position_size_pct * 100:.2f}%"
+        )
     else:
         lines.append(f"**方向**: {direction} ｜ **杠杆**: {leverage}x")
 
     lines.extend([
         f"**入场**: {fmt_price(entry_price)} ｜ **止损**: {fmt_price(stop_loss)} ｜ **止盈**: {fmt_price(take_profit)}",
-        f"**周期**: {cycle}",
+        f"**周期**: {_TIME_HORIZON_ZH.get(cycle, cycle)}",
         f"**摘要**: {summary}",
         f"**Risk Gate**: {gate_emoji} {gate_text}",
         f"**执行**: {executor_mode}",

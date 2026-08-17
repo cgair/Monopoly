@@ -140,9 +140,15 @@ class AlertLevel:
 
 @dataclass
 class Finding:
-    """A single finding (string description) + optional context."""
+    """A single finding (string description) + optional context.
+
+    ``finding_type`` is a stable slug (never localized, no dynamic parts)
+    used for notification dedup keys and Chinese card rendering; the
+    English ``message`` remains the grep/log contract and JSON payload.
+    """
     message: str
     details: Optional[dict] = None
+    finding_type: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = {"message": self.message}
@@ -376,6 +382,7 @@ def evaluate_alerts(stats: EventStats, config: AlertConfig) -> AlertReport:
             findings.append(Finding(
                 f"Gate rejections exceed threshold: {total_rejections} >= {config.rejection_threshold}",
                 {"reason_breakdown": reason_breakdown},
+                finding_type="gate_rejections",
             ))
 
     # 2. Naked position (highest priority)
@@ -385,6 +392,7 @@ def evaluate_alerts(stats: EventStats, config: AlertConfig) -> AlertReport:
             f"CRITICAL: Naked position event(s) detected ({stats.position_naked_count}). "
             "Manual intervention required.",
             {"count": stats.position_naked_count},
+            finding_type="naked_position",
         ))
 
     # 2b. Untracked exchange position (same severity as naked — the
@@ -395,6 +403,7 @@ def evaluate_alerts(stats: EventStats, config: AlertConfig) -> AlertReport:
             f"CRITICAL: Untracked exchange position(s) detected ({stats.position_untracked_count}). "
             "No local record and no dangling intent — manual intervention required.",
             {"count": stats.position_untracked_count},
+            finding_type="untracked_position",
         ))
 
     # 2c. P&L backfill failures (data gap: drawdown/cooldown blind to a close)
@@ -406,6 +415,7 @@ def evaluate_alerts(stats: EventStats, config: AlertConfig) -> AlertReport:
             "recorded with pnl_usd=0.0/outcome=unknown — daily drawdown and "
             "cooldown did not see the real result.",
             {"count": stats.pnl_backfill_failures},
+            finding_type="pnl_backfill_failed",
         ))
 
     # 2d. Dangling intents (gate is closed and the monitor couldn't clear it)
@@ -416,6 +426,7 @@ def evaluate_alerts(stats: EventStats, config: AlertConfig) -> AlertReport:
             f"Dangling order intent(s) awaiting manual reconciliation ({stats.dangling_intents}): "
             "the gate rejects all new entries until resolved.",
             {"count": stats.dangling_intents},
+            finding_type="dangling_intents",
         ))
 
     # 2e. Malformed state-file lines (torn writes — replay may be missing events)
@@ -426,6 +437,7 @@ def evaluate_alerts(stats: EventStats, config: AlertConfig) -> AlertReport:
             f"State file has {stats.malformed_lines} malformed line(s) — "
             "skipped on replay; derived state may be missing events, inspect the file.",
             {"count": stats.malformed_lines},
+            finding_type="malformed_lines",
         ))
 
     # 3. Executor error threshold
@@ -436,6 +448,7 @@ def evaluate_alerts(stats: EventStats, config: AlertConfig) -> AlertReport:
             findings.append(Finding(
                 f"Executor errors exceed threshold: {len(stats.executor_errors)} >= {config.executor_error_threshold}",
                 {"errors": stats.executor_errors[:5]},  # Include first 5 for context
+                finding_type="executor_errors",
             ))
 
     # 4. Consecutive stop losses
@@ -447,6 +460,7 @@ def evaluate_alerts(stats: EventStats, config: AlertConfig) -> AlertReport:
             findings.append(Finding(
                 f"Consecutive stop losses: {max_consecutive} >= {config.consecutive_stop_threshold}",
                 {"consecutive_stop_runs": stats.consecutive_stops},
+                finding_type="consecutive_stops",
             ))
 
     return AlertReport(
@@ -534,6 +548,7 @@ def main(args: Optional[list[str]] = None, now: Optional[datetime] = None) -> in
                 AlertLevel as NotifyAlertLevel,
                 format_alert_card,
                 record_alert_sent,
+                render_finding_zh,
                 send_discord,
                 should_send_alert,
             )
@@ -544,8 +559,10 @@ def main(args: Optional[list[str]] = None, now: Optional[datetime] = None) -> in
 
             # Only send for warn and critical (not ok)
             if report.level != "ok" and webhook_url:
-                # Dedup key from finding types (stable across time)
-                findings_str = "|".join(f.finding_type for f in report.findings)
+                # Dedup key from finding-type slugs (stable across time)
+                findings_str = "|".join(
+                    f.finding_type or "generic" for f in report.findings
+                )
                 dedup_key = (
                     f"alert:{report.level}:{findings_str}"
                     if findings_str else f"alert:{report.level}"
@@ -560,7 +577,10 @@ def main(args: Optional[list[str]] = None, now: Optional[datetime] = None) -> in
                     card = format_alert_card(
                         level=level_map.get(report.level, NotifyAlertLevel.OK),
                         window_hours=report.window_hours,
-                        findings=[f.finding_type for f in report.findings],
+                        findings=[
+                            render_finding_zh(f.finding_type, f.details, f.message)
+                            for f in report.findings
+                        ],
                         timestamp_utc=report.scanned_until_ts,
                     )
                     if send_discord(card, webhook_url=webhook_url):

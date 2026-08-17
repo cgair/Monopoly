@@ -175,6 +175,17 @@ python -m cli.main analyze_json 2>errors.log 1>decision.json
 - **LLM output is analyzed, not executed** — an external system (e.g., OpenClaw's `trade_execute` skill) handles order placement with human approval
 - **Risk gate is bypassed in JSON mode** (analysis only) — gate validation happens in the `trade_execute` step
 
+## Notification Routing Convention
+
+**Important**: When calling this skill from OpenClaw (Discord interaction), do **NOT** pass the `--notify` flag to the underlying CLI command.
+
+**Reason** (see `docs/design/notification-push.md` §2): The system uses two notification modes:
+1. **Scheduled (launchd) → static webhook push**: Launchd jobs invoke CLI with `--notify` to send alerts to Discord webhook.
+2. **Interactive (Discord → OpenClaw) → session-local reply**: OpenClaw receives the JSON output and replies directly in the chat session — passing `--notify` would cause **double-push** (both webhook and session reply), confusing the user.
+
+To prevent double-push, OpenClaw skills always call the CLI without `--notify`, letting the skill's own message handling deliver results into the chat.
+
+
 ## See Also
 
 - `trade_review`: Read historical decisions and position summaries

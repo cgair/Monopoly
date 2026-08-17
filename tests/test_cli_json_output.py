@@ -241,3 +241,67 @@ class TestOutputJson:
         captured = capsys.readouterr()
         parsed = json.loads(captured.out)
         assert isinstance(parsed["timestamp"], str)
+
+
+@pytest.mark.unit
+class TestDecisionNotifyCard:
+    """_build_decision_notify_card reads the structured decision + real
+    gate outcome from state — never the rating string, never a hardcoded
+    "pass"."""
+
+    def _decision(self, **overrides):
+        base = dict(
+            side=FuturesSide.LONG,
+            leverage=2.0,
+            position_size_pct=0.005,
+            entry_price=61500.0,
+            stop_loss=60200.0,
+            take_profit=64000.0,
+            executive_summary="test summary",
+            investment_thesis="test thesis",
+            time_horizon="1-3 days",
+        )
+        base.update(overrides)
+        return FuturesDecision(**base)
+
+    def test_card_uses_structured_decision_and_gate_pass(self):
+        from cli.main import _build_decision_notify_card
+
+        state = {
+            "final_decision_structured": self._decision(),
+            "execution_intent": {"intent_id": "x"},
+            "risk_gate_rejection_reason": None,
+        }
+        card = _build_decision_notify_card(state, "BTC-USD", "dryrun")
+        assert "BTC-USD" in card
+        assert "Long" in card
+        assert "✅" in card
+        assert "test summary" in card
+
+    def test_card_reports_gate_rejection(self):
+        from cli.main import _build_decision_notify_card
+
+        state = {
+            "final_decision_structured": self._decision(),
+            "execution_intent": None,
+            "risk_gate_rejection_reason": "leverage exceeds configured max_leverage",
+        }
+        card = _build_decision_notify_card(state, "BTC-USD", "dryrun")
+        assert "🛑" in card
+        assert "leverage exceeds configured max_leverage" in card
+
+    def test_no_structured_decision_returns_none(self):
+        from cli.main import _build_decision_notify_card
+
+        assert _build_decision_notify_card({}, "BTC-USD", "dryrun") is None
+
+    def test_dict_form_decision_accepted(self):
+        from cli.main import _build_decision_notify_card
+
+        state = {
+            "final_decision_structured": self._decision().model_dump(),
+            "execution_intent": {"intent_id": "x"},
+        }
+        card = _build_decision_notify_card(state, "ETH-USD", "testnet")
+        assert "ETH-USD" in card
+        assert "testnet" in card

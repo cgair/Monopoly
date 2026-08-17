@@ -845,6 +845,10 @@ def main(args: Optional[list] = None) -> int:
         "--state-path", type=str, default=None,
         help="Path to risk_gate_state.jsonl (default: standard state path)",
     )
+    parser.add_argument(
+        "--notify", action="store_true",
+        help="Send Discord notification if webhook URL is configured (default: False)",
+    )
     parsed = parser.parse_args(args)
 
     state_path = Path(parsed.state_path) if parsed.state_path else default_state_path()
@@ -861,6 +865,35 @@ def main(args: Optional[list] = None) -> int:
             "orphan_algo_orders_pending", "error",
         )},
     }, indent=2))
+
+    # Send Discord notification if requested and there were actions
+    if parsed.notify and (result.positions_closed > 0 or result.positions_adopted > 0 or result.untracked_found > 0):
+        from tradingagents.notify.discord import send_discord, format_action_card
+        from tradingagents.default_config import DEFAULT_CONFIG
+        from datetime import datetime, timezone
+
+        webhook_url = DEFAULT_CONFIG.get("discord_webhook_url")
+        
+        if webhook_url:
+            try:
+                actions = []
+                if result.positions_closed > 0:
+                    actions.append(f"平仓 {result.positions_closed} 个持仓")
+                if result.positions_adopted > 0:
+                    actions.append(f"采用 {result.positions_adopted} 个交易所持仓")
+                if result.untracked_found > 0:
+                    actions.append(f"发现 {result.untracked_found} 个未跟踪持仓")
+                
+                if actions:
+                    card = format_action_card(
+                        actions=actions,
+                        timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                    )
+                    send_discord(card, webhook_url=webhook_url)
+            except Exception as e:
+                # Fail-open: notification error doesn't affect main result
+                import logging
+                logging.getLogger(__name__).warning(f"Failed to send Discord notification: {e}")
 
     if not result.success:
         return 2

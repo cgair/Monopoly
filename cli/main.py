@@ -1267,7 +1267,49 @@ from cli.json_output import build_analysis_result, output_json
 from tradingagents.futures.trade_review import analyze_trade_review
 
 
-def run_analysis_json(checkpoint: bool = False) -> int:
+def _build_decision_notify_card(
+    final_state: dict, ticker: str, executor_mode: str,
+) -> Optional[str]:
+    """Build the Discord decision card from the structured PM decision.
+
+    Returns None when the run produced no structured ``FuturesDecision`` —
+    the 5-tier rating string alone would make a misleading card. The risk
+    gate outcome is read from state (``execution_intent`` /
+    ``risk_gate_rejection_reason``) so the card reports what actually
+    happened rather than assuming "pass".
+    """
+    structured = final_state.get("final_decision_structured")
+    if structured is None:
+        return None
+    if isinstance(structured, dict):
+        from tradingagents.agents.schemas import FuturesDecision
+        structured = FuturesDecision.model_validate(structured)
+
+    from datetime import datetime, timezone
+    from tradingagents.notify.discord import format_decision_card
+
+    side = getattr(structured.side, "value", structured.side)
+    approved = final_state.get("execution_intent") is not None
+    return format_decision_card(
+        symbol=ticker,
+        direction=str(side),
+        leverage=structured.leverage or 1.0,
+        position_size_pct=structured.position_size_pct,
+        entry_price=(
+            structured.entry_price if structured.entry_price is not None else "market"
+        ),
+        stop_loss=structured.stop_loss or 0.0,
+        take_profit=structured.take_profit or 0.0,
+        cycle=structured.time_horizon or "unknown",
+        summary=structured.executive_summary or "No summary",
+        risk_gate_status="pass" if approved else "reject",
+        risk_gate_reason=final_state.get("risk_gate_rejection_reason"),
+        executor_mode=executor_mode,
+        timestamp_utc=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def run_analysis_json(checkpoint: bool = False, notify: bool = False) -> int:
     """Non-interactive JSON analysis mode for OpenClaw integration.
     
     Runs full analysis with automated selections and outputs JSON to stdout.
@@ -1354,6 +1396,28 @@ def run_analysis_json(checkpoint: bool = False) -> int:
         }
         
         output_json(result)
+        
+        # Send Discord decision card if requested. Fail-open: a push
+        # failure must leave JSON stdout and the exit code untouched.
+        if notify:
+            try:
+                from tradingagents.notify.discord import send_discord
+                from tradingagents.default_config import DEFAULT_CONFIG
+
+                webhook_url = DEFAULT_CONFIG.get("discord_webhook_url")
+                if webhook_url:
+                    card = _build_decision_notify_card(
+                        final_state, ticker, config["futures_executor_mode"],
+                    )
+                    if card:
+                        send_discord(card, webhook_url=webhook_url)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "decision-card push failed — JSON output unaffected",
+                    exc_info=True,
+                )
+
         return 0
         
     except Exception as e:
@@ -1366,6 +1430,74 @@ def run_analysis_json(checkpoint: bool = False) -> int:
         return 1
 
 
+
+def check_notify_config() -> int:
+    """Check Discord notification configuration.
+    
+    Validates:
+    - webhook_url is configured
+    - webhook_url has valid format
+    - dedup state file is writable
+    
+    Returns 0 if ready, 1 if missing or invalid configuration.
+    """
+    import logging
+    from pathlib import Path
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    logger = logging.getLogger(__name__)
+    
+    webhook_url = DEFAULT_CONFIG.get("discord_webhook_url")
+    
+    # Check webhook URL
+    if not webhook_url:
+        print("❌ Discord webhook URL not configured")
+        print("   Set TRADINGAGENTS_DISCORD_WEBHOOK_URL environment variable")
+        return 1
+    
+    if not webhook_url.startswith("https://discord.com/api/webhooks/"):
+        print("❌ Invalid Discord webhook URL format")
+        print(f"   Expected: https://discord.com/api/webhooks/...")
+        print(f"   Got:      ...{webhook_url[-20:]}")
+        return 1
+    
+    print(f"✅ Webhook URL configured (ending with ...{webhook_url[-4:]})")
+    
+    # Check dedup file writeability
+    dedup_dir = Path.home() / ".tradingagents"
+    try:
+        dedup_dir.mkdir(parents=True, exist_ok=True)
+        dedup_file = dedup_dir / "notify_dedup.json"
+        
+        # Try to touch the file
+        if dedup_file.exists():
+            dedup_file.touch()
+        else:
+            dedup_file.write_text("{}")
+        
+        print(f"✅ Dedup state file writable ({dedup_file})")
+    except Exception as e:
+        print(f"❌ Cannot write dedup state file: {e}")
+        return 1
+    
+    # Check TTL setting
+    ttl = DEFAULT_CONFIG.get("notify_dedup_ttl_hours", 6)
+    if ttl == 0:
+        print("⚠️  Deduplication disabled (TTL = 0)")
+    else:
+        print(f"✅ Deduplication enabled (TTL = {ttl}h)")
+    
+    print()
+    print("✅ Discord notification ready")
+    return 0
+
+
+@app.command("check-notify")
+def check_notify():
+    """Check if Discord notification is properly configured."""
+    sys.exit(check_notify_config())
+
+
 @app.command("analyze_json")
 def analyze_json(
     checkpoint: bool = typer.Option(
@@ -1373,13 +1505,18 @@ def analyze_json(
         "--checkpoint",
         help="Enable checkpoint/resume mode.",
     ),
+    notify: bool = typer.Option(
+        False,
+        "--notify",
+        help="Send Discord notification if webhook URL is configured (default: False).",
+    ),
 ):
     """Run analysis in JSON mode for machine consumption (OpenClaw integration).
     
     Non-interactive. Outputs JSON to stdout, logs to stderr.
     Execution is forced to dryrun mode (no real trades).
     """
-    sys.exit(run_analysis_json(checkpoint=checkpoint))
+    sys.exit(run_analysis_json(checkpoint=checkpoint, notify=notify))
 
 
 @app.command("trade_review")

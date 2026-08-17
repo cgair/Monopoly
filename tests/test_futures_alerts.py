@@ -498,3 +498,134 @@ class TestExecutorErrorMetric:
         ]
         stats = analyze_events(events, window_hours=24, now=now)
         assert stats.executor_errors == []
+
+
+# ---------------------------------------------------------------------------
+# Test: --notify integration (fail-open property)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestAlertsNotifyIntegration:
+    """Tests for --notify flag in alerts.py."""
+
+    def test_notify_flag_not_sent_when_webhook_unconfigured(self, tmp_path):
+        """Alert with --notify but no webhook should not crash."""
+        # Create a minimal event log
+        state_file = tmp_path / "state.jsonl"
+        state_file.write_text('{"event": "gate_rejected", "ts": "2026-08-09T00:00:00Z", "reason": "test"}\n')
+
+        # Run with --notify but no webhook configured
+        result = main(
+            args=[
+                "--state-path", str(state_file),
+                "--notify",
+            ],
+            now=datetime(2026, 8, 9, 12, 0, 0, tzinfo=timezone.utc),
+        )
+
+        # Should still return success (0 for clean log)
+        assert result == 0
+
+    def test_notify_flag_parsed_without_error(self, tmp_path):
+        """--notify flag should parse without error."""
+        state_file = tmp_path / "state.jsonl"
+        state_file.write_text('')
+
+        # Should not raise
+        result = main(
+            args=["--state-path", str(state_file), "--notify"],
+            now=datetime(2026, 8, 9, 12, 0, 0, tzinfo=timezone.utc),
+        )
+        assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# Test: fail-open isolation (hard constraint from §5.5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAlertsFailOpenIsolation:
+    """§5.5 hard constraint: a failing push changes neither exit code nor stdout.
+
+    These tests arm the push path for real — webhook configured, a
+    ``position_naked`` event driving the report to critical, dedup
+    answering "send" — and then blow up inside it. The exit code must
+    still be exactly ``AlertReport.exit_code()`` (2 here): launchd's
+    escalation depends on it, and a push failure that flipped it would
+    mask the very alert it was trying to deliver.
+    """
+
+    NOW = datetime(2026, 8, 18, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _critical_log(self, tmp_path):
+        state_file = tmp_path / "state.jsonl"
+        state_file.write_text(
+            '{"type": "position_naked", '
+            '"ts": "' + _ts(self.NOW - timedelta(hours=1)) + '", '
+            '"symbol": "BTCUSDT"}\n'
+        )
+        return state_file
+
+    def _arm_push_path(self, monkeypatch):
+        from tradingagents.default_config import DEFAULT_CONFIG
+        import tradingagents.notify.discord as notify_discord
+
+        monkeypatch.setitem(
+            DEFAULT_CONFIG, "discord_webhook_url",
+            "https://discord.com/api/webhooks/123/test",
+        )
+        # Bypass the real dedup file (~/.tradingagents/) in tests.
+        monkeypatch.setattr(notify_discord, "should_send_alert", lambda *a, **k: True)
+        monkeypatch.setattr(notify_discord, "record_alert_sent", lambda *a, **k: None)
+        return notify_discord
+
+    def test_critical_exit_2_when_sender_raises(self, tmp_path, monkeypatch):
+        notify_discord = self._arm_push_path(monkeypatch)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("network down")
+
+        monkeypatch.setattr(notify_discord, "send_discord", boom)
+        result = main(
+            args=["--state-path", str(self._critical_log(tmp_path)), "--notify"],
+            now=self.NOW,
+        )
+        assert result == 2
+
+    def test_critical_exit_2_when_formatting_raises(self, tmp_path, monkeypatch):
+        notify_discord = self._arm_push_path(monkeypatch)
+
+        def boom(*args, **kwargs):
+            raise ValueError("bad template input")
+
+        monkeypatch.setattr(notify_discord, "format_alert_card", boom)
+        result = main(
+            args=["--state-path", str(self._critical_log(tmp_path)), "--notify"],
+            now=self.NOW,
+        )
+        assert result == 2
+
+    def test_stdout_identical_when_push_fails(self, tmp_path, monkeypatch, capsys):
+        state_file = self._critical_log(tmp_path)
+
+        baseline_code = main(args=["--state-path", str(state_file)], now=self.NOW)
+        baseline_out = capsys.readouterr().out
+
+        notify_discord = self._arm_push_path(monkeypatch)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("network down")
+
+        monkeypatch.setattr(notify_discord, "send_discord", boom)
+        notify_code = main(
+            args=["--state-path", str(state_file), "--notify"], now=self.NOW,
+        )
+        notify_out = capsys.readouterr().out
+
+        assert notify_code == baseline_code == 2
+        assert notify_out == baseline_out
+
+
+if __name__ == "__main__":
+    sys.exit(main())

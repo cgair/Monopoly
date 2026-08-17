@@ -28,6 +28,9 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_FUTURES_MACRO_BLOCK_HOURS":         "futures_macro_block_hours",
     "TRADINGAGENTS_FUTURES_DANGLING_INTENT_MINUTES":   "futures_dangling_intent_minutes",
     "TRADINGAGENTS_FUTURES_EXECUTOR_MODE":             "futures_executor_mode",
+    # Notifications (Discord, deduplication)
+    "TRADINGAGENTS_DISCORD_WEBHOOK_URL":         "discord_webhook_url",
+    "TRADINGAGENTS_NOTIFY_DEDUP_TTL_HOURS":      "notify_dedup_ttl_hours",
 }
 
 
@@ -141,4 +144,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Optional override for the risk-gate state file (JSONL event log).
     # ``None`` → ~/.tradingagents/risk_gate_state.jsonl
     "futures_risk_state_path": os.getenv("TRADINGAGENTS_RISK_GATE_STATE_PATH"),
+    # Notifications (Discord webhook + deduplication)
+    "discord_webhook_url": os.getenv("TRADINGAGENTS_DISCORD_WEBHOOK_URL"),
+    "notify_dedup_ttl_hours": 6,  # 6-hour default TTL for alert deduplication
 })

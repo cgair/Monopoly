@@ -610,3 +610,56 @@ class TestAlgoOrderCancellation:
         
         # Verify cancel_all_algo_orders was called
         mock_ex.cancel_all_algo_orders.assert_called_once_with("BTCUSDT")
+
+
+# ---------------------------------------------------------------------------
+# Test: --notify fail-open isolation (hard constraint from §5.5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMonitorNotifyFailOpen:
+    """A failing push must leave the monitor's exit code and JSON stdout
+    untouched — launchd escalates on 0/1/2 exactly like alerts."""
+
+    def _arm(self, monkeypatch):
+        import tradingagents.futures.position_monitor as pm
+        import tradingagents.notify.discord as notify_discord
+        from tradingagents.default_config import DEFAULT_CONFIG
+
+        result = pm.MonitorResult(
+            success=True,
+            positions_checked=1,
+            positions_closed=0,
+            orphan_basic_orders_cancelled=0,
+            orphan_algo_orders_pending=0,
+            untracked_found=1,  # exit 1 + triggers the notify path
+        )
+        monkeypatch.setattr(
+            pm, "create_monitor", lambda cfg: type("FakeEx", (), {"mode": "dryrun"})(),
+        )
+        monkeypatch.setattr(pm, "reconcile_positions", lambda path, ex: result)
+        monkeypatch.setitem(
+            DEFAULT_CONFIG, "discord_webhook_url",
+            "https://discord.com/api/webhooks/123/test",
+        )
+        return pm, notify_discord
+
+    def test_exit_code_and_stdout_preserved_when_push_fails(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        pm, notify_discord = self._arm(monkeypatch)
+        state = str(tmp_path / "state.jsonl")
+
+        baseline_code = pm.main(args=["--state-path", state])
+        baseline_out = capsys.readouterr().out
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(notify_discord, "format_action_card", boom)
+        notify_code = pm.main(args=["--state-path", state, "--notify"])
+        notify_out = capsys.readouterr().out
+
+        assert notify_code == baseline_code == 1
+        assert notify_out == baseline_out

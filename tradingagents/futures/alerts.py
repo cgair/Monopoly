@@ -15,16 +15,10 @@ alerts for operational visibility.
 Alerts can be consumed by:
   - Exit code: 0=ok, 1=warn, 2=critical (launchd/cron hook)
   - JSON stdout: structured AlertReport for downstream automation
-  - Discord/Slack: TODO (integrate with T5 bot once ready)
+  - Discord: via --notify flag (integrated in Week 5)
 
-TODO: Discord integration point:
-  send_alert(report, discord_webhook_url, ...) — to be wired up
-  after T5 (OpenClaw trade_review skill) bot is ready. Template:
-  ```
-  report_level_emoji = {"ok": ":white_check_mark:", "warn": ":warning:", "critical": ":octagonal_sign:"}
-  message = f"{emoji} **{report.level.upper()}**: {', '.join(report.findings)}"
-  requests.post(webhook_url, json={"content": message})
-  ```
+Deduplication: Alert messages are deduplicated per dedup_key across
+invocations via ~/.tradingagents/notify_dedup.json (TTL configurable).
 """
 
 from __future__ import annotations
@@ -492,6 +486,11 @@ def main(args: Optional[list[str]] = None, now: Optional[datetime] = None) -> in
         default=None,
         help="Path to risk_gate_state.jsonl. Overrides env var.",
     )
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send Discord notification if webhook URL is configured (default: False).",
+    )
 
     parsed = parser.parse_args(args)
 
@@ -524,6 +523,54 @@ def main(args: Optional[list[str]] = None, now: Optional[datetime] = None) -> in
 
     # Output JSON
     print(json.dumps(report.to_dict(), indent=2))
+
+    # Send Discord notification if requested. Fail-open (§5.5): nothing
+    # in this block may change the exit code — launchd's 0/1/2 escalation
+    # depends on it, and a push failure on the critical path would
+    # otherwise mask the very alert it was trying to deliver.
+    if parsed.notify:
+        try:
+            from tradingagents.notify.discord import (
+                AlertLevel as NotifyAlertLevel,
+                format_alert_card,
+                record_alert_sent,
+                send_discord,
+                should_send_alert,
+            )
+            from tradingagents.default_config import DEFAULT_CONFIG
+
+            webhook_url = DEFAULT_CONFIG.get("discord_webhook_url")
+            ttl_hours = DEFAULT_CONFIG.get("notify_dedup_ttl_hours", 6)
+
+            # Only send for warn and critical (not ok)
+            if report.level != "ok" and webhook_url:
+                # Dedup key from finding types (stable across time)
+                findings_str = "|".join(f.finding_type for f in report.findings)
+                dedup_key = (
+                    f"alert:{report.level}:{findings_str}"
+                    if findings_str else f"alert:{report.level}"
+                )
+
+                if should_send_alert(dedup_key, ttl_hours=ttl_hours):
+                    level_map = {
+                        "ok": NotifyAlertLevel.OK,
+                        "warn": NotifyAlertLevel.WARN,
+                        "critical": NotifyAlertLevel.CRITICAL,
+                    }
+                    card = format_alert_card(
+                        level=level_map.get(report.level, NotifyAlertLevel.OK),
+                        window_hours=report.window_hours,
+                        findings=[f.finding_type for f in report.findings],
+                        timestamp_utc=report.scanned_until_ts,
+                    )
+                    if send_discord(card, webhook_url=webhook_url):
+                        record_alert_sent(dedup_key)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning(
+                "alert push failed — exit code and JSON output unaffected",
+                exc_info=True,
+            )
 
     return report.exit_code()
 

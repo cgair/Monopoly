@@ -227,3 +227,6 @@ docs/walkthrough/monopoly-walkthrough.html
 
 # Review artifacts stay local — regenerate via scripts/backtest_*.py; do not commit
 docs/reviews/
+
+# Pre-deploy code review ledger — local working record, not committed
+docs/walkthrough/review-ledger.md

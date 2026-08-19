@@ -1002,7 +1002,7 @@ Week 5 方案 A 的 Monopoly 侧已完成（T4 2026-07-14、T5 2026-07-19 `cf8e5
 
 ### 10.7 L4 告警层 —— `alerts.py`（T6，2026-07-19 `01aa45e` 合并；T12 扩充）
 
-`python -m tradingagents.futures.alerts [--window-hours N] [--state-path P]`：扫描 JSONL 事件窗口（默认 24h），按阈值产出 findings，**无 LLM、无网络**——纯运维脚本，退出码 0 = OK / 1 = WARN 或 CRITICAL / 2 = 运行失败，适合 launchd 周期跑。
+`python -m tradingagents.futures.alerts [--window-hours N] [--state-path P] [--notify]`：扫描 JSONL 事件窗口（默认 24h），按阈值产出 findings，**无 LLM、默认无网络**——纯运维脚本，退出码 0 = OK / 1 = WARN 或 CRITICAL / 2 = 运行失败，适合 launchd 周期跑。
 
 | 检查 | 默认阈值 | 级别 |
 |---|---|---|
@@ -1013,9 +1013,26 @@ Week 5 方案 A 的 Monopoly 侧已完成（T4 2026-07-14、T5 2026-07-19 `cf8e5
 | executor 错误 | 窗口内 ≥5 | WARN |
 | 连续 stop-out | ≥3 连 | WARN（策略或市场状态恶化） |
 
-阈值全部可经 `TRADINGAGENTS_FUTURES_ALERT_*` env 覆盖（0 = 关闭该检查）。当前输出到 stdout/退出码；接 Discord 推送是后续接线（OpenClaw 侧部署后顺手挂）。
+阈值全部可经 `TRADINGAGENTS_FUTURES_ALERT_*` env 覆盖（0 = 关闭该检查）。~~接 Discord 推送是后续接线~~ → **已接（2026-08-18，§10.8）**：`--notify` 时 warn/critical 推 Discord 告警卡（ok 不推），跨进程去重。
 
 > T7（Hermes memory adapter，`futures/hermes_memory_adapter.py`，2026-07-19 `d242d0e`）是反思记忆的导出适配层，不在决策链路上，此处不展开。
+
+### 10.8 Discord 推送层 —— `tradingagents/notify/discord.py`（2026-08-18，`debad27` + `590e427`）
+
+设计稿：`docs/design/notification-push.md`（取舍理由、DSA 借鉴/不借鉴清单都在里面）。核心是**双触发路由防双推**：
+
+```
+定时触发（launchd → CLI 带 --notify）  → 格式化卡片 → Discord webhook 静态推送
+交互触发（Discord → OpenClaw → CLI 不带 --notify）→ JSON stdout → OpenClaw 在会话里回复
+```
+
+三个触发点（`--notify` 全部默认关）：`analyze_json` 推决策卡（从 `final_decision_structured` + gate 真实结果构建，`cli/main.py _build_decision_notify_card`）；`futures.alerts` 推告警卡（仅 warn/critical，跨进程去重 `~/.tradingagents/notify_dedup.json`、TTL 6h）；`position_monitor` 推动作卡（有实际动作才推）。OpenClaw 三份 SKILL.md 写死「不传 `--notify`」约定。`check-notify` CLI 做只读配置诊断（退出码 0/1，webhook URL 脱敏显示）。
+
+sender 行为：2000 字符分片 + 分页标记 + 片间 1s、429 按 `retry_after` / 5xx 指数退避（最多 3 次）、失败片不阻断后续片。**唯一硬约束（设计稿 §5.5）：推送任何失败不得改变主流程的 stdout 和退出码**——launchd 的 0/1/2 升级链路靠它。测试同时覆盖两个方向：失败隔离（sender/格式化抛异常 → critical 退出码仍是 2、stdout 逐字节一致）和**真送达**（capture sender 断言中文卡片内容 + dedup key）——后者是开发中两个「fail-open 吞掉功能性 bug」的教训（决策卡对 rating 字符串取属性、告警卡引用不存在的 `finding_type` 字段，都是永不发送但不报错）。
+
+展示层中文化：`_TIME_HORIZON_ZH` 映射周期、`render_finding_zh` 按 finding_type 翻译告警行（未知类型回退英文原文）；`alerts.py` 的英文源字符串不动——它们是日志 grep 和 JSON 输出的稳定契约。摘要语言跟随全局 `output_language` 配置，不在推送层翻。仓位显示为 `position_size_pct * 100`（小数分数语义，0.005 → `0.50%`——decimal-vs-percent 的老坑在展示层也埋过一次，已修 + 测试钉死）。
+
+**待办**：launchd plist 样例（设计稿 §7 步骤 4，配 Mac mini 时落地）；webhook 实弹验证（`check-notify` → 手动 `alerts --notify`）。
 
 ---
 
@@ -1035,7 +1052,7 @@ Week 5 方案 A 的 Monopoly 侧已完成（T4 2026-07-14、T5 2026-07-19 `cf8e5
 |---|---|---|---|
 | 1 | `position_closed` 没人写，3 条 cross-run 规则失效 | **已修**（T1 对账 + T12 真实 PnL 回填，8-02 实测） | `position_monitor.py` 三遍对账写入；T1 残留的 `pnl_usd=0.0` 回撤失明已由 income history 回填关闭（§10.5） |
 | 2 | 开仓成功后保护单失败 → 仓位裸奔，无 rollback | **已修** | `executor.py` two-phase + `_try_unwind` + `position_naked` 事件（§10.3.3） |
-| 3 | gate 频繁拒绝无告警（L4 缺位） | **已修**（T6 + T12 扩充）；Discord 推送未接 | `alerts.py`（§10.7）六项阈值检查 + 退出码；推送待 OpenClaw 部署后接线 |
+| 3 | gate 频繁拒绝无告警（L4 缺位） | **已修**（T6 + T12 扩充；Discord 推送已接，2026-08-18） | `alerts.py`（§10.7）六项阈值检查 + 退出码；`--notify` 推送 + §5.5 失败隔离 + 真送达测试（§10.8） |
 | 4 | mark_price 用 mainnet，executor 用 testnet | **已修**（2026-08-09，红测试先行，683 passed） | `resolve_executor_mode` 单一事实源 + venue-keyed `_PREMIUM_INDEX_URLS`（§10.2）；连带修复 `TRADINGAGENTS_FUTURES_EXECUTOR_MODE` 空映射与 `analyze_json` 伪 dryrun 强制 |
 | 5 | `final_decision_structured` 在 LangGraph state 透传，checkpointer 序列化未验证 | **未验证**（与 #8 一并处理） | 建议跑一遍 `checkpoint_enabled=True` 的 crypto path |
 | 6 | `_round_qty` 硬编码 step=0.001 | **未修但更稳健** | 改成 floor 而非 round（`executor.py:490-498`），BTC/ETH 可接受；扩 symbol 前必须改 |

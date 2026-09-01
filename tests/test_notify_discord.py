@@ -106,7 +106,7 @@ class TestCardFormatting:
 
         assert "🎯" in card
         assert "BTC-USD" in card
-        assert "Long" in card
+        assert "做多" in card
         assert "2026-08-09 18:00 UTC" in card
         assert "✅" in card
 
@@ -240,12 +240,12 @@ class TestCardFixtures:
 
         expected_lines = [
             "🎯 **BTC-USD 决策** · 2026-08-09 18:00 UTC",
-            "**方向**: Long ｜ **杠杆**: 2.0x ｜ **仓位**: 0.50%",
+            "**方向**: 做多 ｜ **杠杆**: 2.0x ｜ **仓位**: 0.50%",
             "**入场**: 61,500 ｜ **止损**: 60,200 ｜ **止盈**: 64,000",
             "**周期**: 1-3 天",
             "**摘要**: Strong uptrend with support at 60K",
             "**Risk Gate**: ✅ 通过",
-            "**执行**: dryrun",
+            "**执行**: dryrun — 人工下单",
         ]
 
         actual_lines = card.split("\n")
@@ -387,6 +387,35 @@ class TestSendDiscordRetryMechanics:
                 # One sleep between chunks
                 assert mock_sleep.call_count == 1
                 mock_sleep.assert_called_with(1)
+
+    def test_multichunk_payloads_never_exceed_discord_limit(self):
+        """The pagination marker is prepended AFTER splitting — a raw
+        2000-char chunk plus "(1/3)\\n" would be 2006 chars, and Discord
+        rejects content over 2000 with a 400. Assert what actually goes
+        over the wire fits, and that no content is lost."""
+        content = "x" * 5000
+        sent = []
+
+        def capture(url, json=None, timeout=None):
+            sent.append(json["content"])
+            response = Mock()
+            response.status_code = 204
+            return response
+
+        with patch('tradingagents.notify.discord.requests.post') as mock_post:
+            with patch('tradingagents.notify.discord.time.sleep'):
+                mock_post.side_effect = capture
+                result = send_discord(content, webhook_url="https://discord.com/api/webhooks/123/abc")
+
+        assert result is True
+        assert sent, "nothing was sent"
+        oversized = [len(c) for c in sent if len(c) > 2000]
+        assert not oversized, f"payloads over Discord's 2000-char limit: {oversized}"
+        # Strip the "(i/n)" marker lines and confirm nothing was dropped.
+        joined = "".join(
+            c.split("\n", 1)[1] if c.startswith("(") else c for c in sent
+        )
+        assert joined == content
 
     def test_429_with_json_body_retry_after(self):
         """429 can have retry_after in JSON body."""
@@ -591,6 +620,90 @@ class TestChineseRendering:
             executor_mode="dryrun", timestamp_utc="2026-08-18T12:00:00Z",
         )
         assert "**周期**: whatever" in card
+
+    def test_decision_card_translates_side_and_mode(self):
+        card = format_decision_card(
+            symbol="BTC-USD", direction="Short", leverage=2.0,
+            position_size_pct=0.005, entry_price=61500, stop_loss=62800,
+            take_profit=58000, cycle="intraday", summary="s",
+            risk_gate_status="pass", risk_gate_reason=None,
+            executor_mode="testnet", timestamp_utc="2026-09-01T12:00:00Z",
+        )
+        assert "**方向**: 做空" in card
+        assert "**执行**: testnet — 测试网自动下单" in card
+
+    def test_decision_card_unknown_side_and_mode_pass_through(self):
+        card = format_decision_card(
+            symbol="BTC-USD", direction="Sideways", leverage=2.0,
+            position_size_pct=0.005, entry_price=61500, stop_loss=60200,
+            take_profit=64000, cycle="intraday", summary="s",
+            risk_gate_status="pass", risk_gate_reason=None,
+            executor_mode="paper", timestamp_utc="2026-09-01T12:00:00Z",
+        )
+        assert "**方向**: Sideways" in card
+        assert "**执行**: paper" in card
+
+    def test_decision_card_translates_gate_reason(self):
+        card = format_decision_card(
+            symbol="BTC-USD", direction="Long", leverage=5.0,
+            position_size_pct=0.005, entry_price=61500, stop_loss=60200,
+            take_profit=64000, cycle="intraday", summary="s",
+            risk_gate_status="reject",
+            risk_gate_reason="leverage exceeds configured max_leverage",
+            executor_mode="dryrun", timestamp_utc="2026-09-01T12:00:00Z",
+        )
+        assert "🛑 拒绝（杠杆超过配置上限）" in card
+
+    def test_decision_card_unknown_gate_reason_falls_back(self):
+        card = format_decision_card(
+            symbol="BTC-USD", direction="Long", leverage=2.0,
+            position_size_pct=0.005, entry_price=61500, stop_loss=60200,
+            take_profit=64000, cycle="intraday", summary="s",
+            risk_gate_status="reject",
+            risk_gate_reason="some brand new reason",
+            executor_mode="dryrun", timestamp_utc="2026-09-01T12:00:00Z",
+        )
+        assert "拒绝（some brand new reason）" in card
+
+    def test_decision_card_absent_values_render_as_dash_not_zero(self):
+        """A legitimate no-TP decision must not read as 止盈 0 — absent
+        is not a price. Market entry (entry_price=None) renders 市价."""
+        card = format_decision_card(
+            symbol="BTC-USD", direction="Long", leverage=2.0,
+            position_size_pct=0.005, entry_price=None, stop_loss=60200,
+            take_profit=None, cycle="intraday", summary="s",
+            risk_gate_status="pass", risk_gate_reason=None,
+            executor_mode="dryrun", timestamp_utc="2026-09-01T12:00:00Z",
+        )
+        assert "**入场**: 市价" in card
+        assert "**止盈**: —" in card
+        assert "止盈**: 0" not in card
+
+    def test_decision_card_includes_truncated_thesis(self):
+        thesis = "理由 " * 500  # far over the 700-char cap
+        card = format_decision_card(
+            symbol="BTC-USD", direction="Long", leverage=2.0,
+            position_size_pct=0.005, entry_price=61500, stop_loss=60200,
+            take_profit=64000, cycle="intraday", summary="s",
+            risk_gate_status="pass", risk_gate_reason=None,
+            executor_mode="dryrun", timestamp_utc="2026-09-01T12:00:00Z",
+            thesis=thesis,
+        )
+        thesis_line = next(l for l in card.split("\n") if l.startswith("**依据**"))
+        assert thesis_line.endswith("…")
+        assert len(thesis_line) < 750
+        # And the whole card still fits one Discord message.
+        assert len(card) <= 2000
+
+    def test_decision_card_no_thesis_no_line(self):
+        card = format_decision_card(
+            symbol="BTC-USD", direction="Long", leverage=2.0,
+            position_size_pct=0.005, entry_price=61500, stop_loss=60200,
+            take_profit=64000, cycle="intraday", summary="s",
+            risk_gate_status="pass", risk_gate_reason=None,
+            executor_mode="dryrun", timestamp_utc="2026-09-01T12:00:00Z",
+        )
+        assert "依据" not in card
 
     def test_decision_card_position_is_decimal_fraction(self):
         """position_size_pct=0.005 (FuturesDecision semantics) → 0.50%,

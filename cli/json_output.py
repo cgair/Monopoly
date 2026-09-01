@@ -15,6 +15,9 @@ def serialize_decision(decision: Any) -> dict:
     if decision is None:
         return {}
 
+    if isinstance(decision, dict):
+        return decision
+
     if isinstance(decision, FuturesDecision):
         return {
             "type": "FuturesDecision",

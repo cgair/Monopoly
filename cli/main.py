@@ -1263,7 +1263,7 @@ def analyze(
 # ============================================================================
 
 import sys
-from cli.json_output import build_analysis_result, output_json
+from cli.json_output import build_analysis_result, output_json, serialize_decision
 from tradingagents.futures.trade_review import analyze_trade_review
 
 
@@ -1293,20 +1293,58 @@ def _build_decision_notify_card(
     return format_decision_card(
         symbol=ticker,
         direction=str(side),
-        leverage=structured.leverage or 1.0,
+        leverage=structured.leverage,
         position_size_pct=structured.position_size_pct,
-        entry_price=(
-            structured.entry_price if structured.entry_price is not None else "market"
-        ),
-        stop_loss=structured.stop_loss or 0.0,
-        take_profit=structured.take_profit or 0.0,
-        cycle=structured.time_horizon or "unknown",
-        summary=structured.executive_summary or "No summary",
+        entry_price=structured.entry_price,      # None → 市价
+        stop_loss=structured.stop_loss,          # None → — (absent ≠ 0)
+        take_profit=structured.take_profit,
+        cycle=structured.time_horizon or "未指定",
+        summary=structured.executive_summary or "(无摘要)",
+        thesis=structured.investment_thesis,
         risk_gate_status="pass" if approved else "reject",
         risk_gate_reason=final_state.get("risk_gate_rejection_reason"),
         executor_mode=executor_mode,
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
     )
+
+
+def _push_decision_card(final_state: dict, ticker: str, executor_mode: str) -> bool:
+    """Send the --notify decision card. Fail-open, but never silent.
+
+    In the manual-trading loop the card *is* the order ticket, so every
+    path that ends without a delivered card must leave a log trail —
+    a silently missing card reads as "no decision today". Returns True
+    only when send_discord reported success.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    try:
+        from tradingagents.default_config import DEFAULT_CONFIG
+        from tradingagents.notify.discord import send_discord
+
+        webhook_url = DEFAULT_CONFIG.get("discord_webhook_url")
+        if not webhook_url:
+            logger.warning(
+                "--notify set but discord_webhook_url is unconfigured "
+                "(TRADINGAGENTS_DISCORD_WEBHOOK_URL) — decision card skipped"
+            )
+            return False
+        card = _build_decision_notify_card(final_state, ticker, executor_mode)
+        if card is None:
+            logger.warning(
+                "--notify: run produced no structured decision — decision card skipped"
+            )
+            return False
+        ok = send_discord(card, webhook_url=webhook_url)
+        if not ok:
+            logger.warning("decision card push failed — see send_discord logs above")
+        return ok
+    except Exception:
+        logger.warning(
+            "decision-card push failed — JSON output unaffected", exc_info=True,
+        )
+        return False
 
 
 def run_analysis_json(checkpoint: bool = False, notify: bool = False) -> int:
@@ -1334,9 +1372,12 @@ def run_analysis_json(checkpoint: bool = False, notify: bool = False) -> int:
         # Create config with dryrun enforced
         config = DEFAULT_CONFIG.copy()
         config["max_debate_rounds"] = 1
-        config["quick_think_llm"] = "gemini"
-        config["deep_think_llm"] = "gemini"
-        config["backend_url"] = os.getenv("TRADINGAGENTS_BACKEND_URL", config.get("backend_url"))
+        # Cheap default for JSON mode; the documented TRADINGAGENTS_*_THINK_LLM
+        # overrides win. The default must be a servable model id: a bare
+        # "gemini" 404s, and gemini-2.5-flash is retired for new accounts —
+        # either one kills every analyze_json run at the first LLM call.
+        config["quick_think_llm"] = os.getenv("TRADINGAGENTS_QUICK_THINK_LLM", "gemini-3.6-flash")
+        config["deep_think_llm"] = os.getenv("TRADINGAGENTS_DEEP_THINK_LLM", "gemini-3.6-flash")
         config["llm_provider"] = os.getenv("TRADINGAGENTS_LLM_PROVIDER", "google").lower()
         config["output_language"] = os.getenv("TRADINGAGENTS_OUTPUT_LANGUAGE", "English")
         config["checkpoint_enabled"] = checkpoint
@@ -1394,29 +1435,24 @@ def run_analysis_json(checkpoint: bool = False, notify: bool = False) -> int:
             "open_positions": risk_snapshot.open_positions,
             "daily_realised_pnl_usd": risk_snapshot.daily_realised_pnl_usd,
         }
-        
+        # The 5-tier "decision" above is a rating string; the actionable
+        # ticket fields (side/leverage/stops/size) and the gate outcome live
+        # in state — surface both so a lost Discord card still leaves a
+        # complete order ticket on stdout.
+        result["decision_structured"] = serialize_decision(
+            final_state.get("final_decision_structured")
+        )
+        result["risk_gate"] = {
+            "approved": final_state.get("execution_intent") is not None,
+            "rejection_reason": final_state.get("risk_gate_rejection_reason"),
+        }
+
         output_json(result)
         
         # Send Discord decision card if requested. Fail-open: a push
         # failure must leave JSON stdout and the exit code untouched.
         if notify:
-            try:
-                from tradingagents.notify.discord import send_discord
-                from tradingagents.default_config import DEFAULT_CONFIG
-
-                webhook_url = DEFAULT_CONFIG.get("discord_webhook_url")
-                if webhook_url:
-                    card = _build_decision_notify_card(
-                        final_state, ticker, config["futures_executor_mode"],
-                    )
-                    if card:
-                        send_discord(card, webhook_url=webhook_url)
-            except Exception:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "decision-card push failed — JSON output unaffected",
-                    exc_info=True,
-                )
+            _push_decision_card(final_state, ticker, config["futures_executor_mode"])
 
         return 0
         

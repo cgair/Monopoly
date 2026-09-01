@@ -680,3 +680,157 @@ class TestAlertsNotifyDelivery:
         assert "🛑" in sent_cards[0]
         assert "裸持仓事件" in sent_cards[0]
         assert recorded_keys == ["alert:critical:naked_position"]
+
+
+# ---------------------------------------------------------------------------
+# Test: production time anchor (launchd path passes now=None)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestProductionTimeAnchor:
+    """main(now=None) is the launchd/cron call path — it must anchor to
+    wall clock, not the latest event timestamp. Anchoring to the event
+    stream hides exactly the crash it exists to catch: an order_submitted
+    that died mid-order is the newest event in the file, so its own
+    timestamp becomes "now" and it never looks aged."""
+
+    def test_stale_dangling_intent_fires_without_explicit_now(self, tmp_path, capsys):
+        path = tmp_path / "state.jsonl"
+        old = datetime.now(timezone.utc) - timedelta(days=3)
+        _append_event(path, {
+            "type": "position_opened", "ts": _ts(old - timedelta(minutes=10)),
+            "intent_id": "i-0", "symbol": "ETH-USD",
+        })
+        # Latest event: the write-ahead of an order whose process died.
+        _append_event(path, {
+            "type": "order_submitted", "ts": _ts(old),
+            "intent_id": "i-1", "symbol": "BTC-USD",
+        })
+
+        exit_code = main(["--state-path", str(path)])  # production: no now
+
+        assert exit_code == 1
+        report = json.loads(capsys.readouterr().out)
+        assert any("Dangling" in f["message"] for f in report["findings"])
+
+
+# ---------------------------------------------------------------------------
+# Test: Flat skips are routine, not gate anomalies
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestFlatSkipsAreNotRejections:
+    """A Flat decision writes trade_skipped with REASON_FLAT — that is
+    the PM's routine "no trade today", not an upstream anomaly. Counting
+    it toward the rejection threshold pages the operator on quiet weeks
+    and trains them to ignore the WARN that matters."""
+
+    NOW = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+
+    def test_flat_skips_do_not_trip_rejection_threshold(self, tmp_path):
+        path = tmp_path / "state.jsonl"
+        for i in range(4):  # over the default threshold of 3
+            _append_event(path, {
+                "type": "trade_skipped", "symbol": "BTC-USD",
+                "ts": _ts(self.NOW - timedelta(hours=i + 1)),
+                "reason": "side=Flat — no position requested",
+            })
+
+        assert main(["--state-path", str(path)], now=self.NOW) == 0
+
+    def test_real_rejections_still_trip_threshold(self, tmp_path):
+        path = tmp_path / "state.jsonl"
+        for i in range(4):
+            _append_event(path, {
+                "type": "trade_skipped", "symbol": "BTC-USD",
+                "ts": _ts(self.NOW - timedelta(hours=i + 1)),
+                "reason": "stop_loss is on the wrong side of entry",
+            })
+
+        assert main(["--state-path", str(path)], now=self.NOW) == 1
+
+
+# ---------------------------------------------------------------------------
+# Test: --notify without webhook leaves a log trail
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestNotifyUnconfiguredLeavesTrail:
+    NOW = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+
+    def test_unconfigured_webhook_logs_warning(self, tmp_path, monkeypatch, caplog):
+        import logging
+        from tradingagents.default_config import DEFAULT_CONFIG
+
+        now = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+        path = tmp_path / "state.jsonl"
+        _append_event(path, {
+            "type": "position_naked", "ts": _ts(now - timedelta(hours=1)),
+            "symbol": "BTCUSDT",
+        })
+        monkeypatch.setitem(DEFAULT_CONFIG, "discord_webhook_url", None)
+
+        with caplog.at_level(logging.WARNING, logger="tradingagents.futures.alerts"):
+            exit_code = main(["--state-path", str(path), "--notify"], now=now)
+
+        assert exit_code == 2  # exit code untouched by notify layer
+        assert any("unconfigured" in r.message for r in caplog.records)
+
+    def test_failed_send_does_not_record_dedup(self, tmp_path, monkeypatch):
+        """A failed push must not be recorded as sent — the next run
+        retries instead of the alert dying inside the dedup window."""
+        from tradingagents.default_config import DEFAULT_CONFIG
+        import tradingagents.notify.discord as notify_discord
+
+        state_file = tmp_path / "state.jsonl"
+        state_file.write_text(
+            '{"type": "position_naked", '
+            '"ts": "' + _ts(self.NOW - timedelta(hours=1)) + '", '
+            '"symbol": "BTCUSDT"}\n'
+        )
+        monkeypatch.setitem(
+            DEFAULT_CONFIG, "discord_webhook_url",
+            "https://discord.com/api/webhooks/123/test",
+        )
+        monkeypatch.setattr(notify_discord, "should_send_alert", lambda *a, **k: True)
+        monkeypatch.setattr(notify_discord, "send_discord", lambda *a, **kw: False)
+        recorded = []
+        monkeypatch.setattr(
+            notify_discord, "record_alert_sent",
+            lambda key, **kw: recorded.append(key),
+        )
+
+        result = main(args=["--state-path", str(state_file), "--notify"], now=self.NOW)
+
+        assert result == 2
+        assert recorded == []
+
+    def test_ok_level_is_not_pushed(self, tmp_path, monkeypatch):
+        """A clean log must not generate a Discord message even with
+        --notify and a configured webhook."""
+        from tradingagents.default_config import DEFAULT_CONFIG
+        import tradingagents.notify.discord as notify_discord
+
+        state_file = tmp_path / "state.jsonl"
+        state_file.write_text(
+            '{"type": "position_opened", '
+            '"ts": "' + _ts(self.NOW - timedelta(hours=1)) + '", '
+            '"symbol": "BTCUSDT", "intent_id": "i-1"}\n'
+        )
+        monkeypatch.setitem(
+            DEFAULT_CONFIG, "discord_webhook_url",
+            "https://discord.com/api/webhooks/123/test",
+        )
+        sent = []
+        monkeypatch.setattr(
+            notify_discord, "send_discord",
+            lambda *a, **kw: sent.append(1) or True,
+        )
+
+        result = main(args=["--state-path", str(state_file), "--notify"], now=self.NOW)
+
+        assert result == 0
+        assert sent == []

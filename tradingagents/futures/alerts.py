@@ -32,6 +32,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+from tradingagents.futures.risk_gate import REASON_FLAT
+
 
 # ---------------------------------------------------------------------------
 # Config: thresholds from environment, with sensible defaults
@@ -314,7 +316,12 @@ def analyze_events(
             # trade_skipped as potential gate issues.
             if event_type == "trade_skipped":
                 reason = event.get("reason", "unknown")
-                stats.gate_rejections[reason] = stats.gate_rejections.get(reason, 0) + 1
+                # A Flat decision is the PM's routine "no trade today", not
+                # a gate anomaly — counting it would page the operator on
+                # quiet weeks, and an alert that cries wolf gets ignored
+                # (which is how the real one gets missed).
+                if reason != REASON_FLAT:
+                    stats.gate_rejections[reason] = stats.gate_rejections.get(reason, 0) + 1
                 # origin=executor means the exchange call itself failed
                 # (written by execute_with_ledger), not a gate rejection —
                 # a run of these is an outage, not a policy block.
@@ -508,6 +515,14 @@ def main(args: Optional[list[str]] = None, now: Optional[datetime] = None) -> in
 
     parsed = parser.parse_args(args)
 
+    # Anchor the scan to wall clock. analyze_events falls back to the
+    # latest event timestamp when now is None — fine for tests, fatal in
+    # production: a dangling order_submitted that is the newest event
+    # would anchor "now" to its own timestamp and never look aged, so
+    # the one alert covering "process died mid-order" would never fire.
+    if now is None:
+        now = datetime.now(timezone.utc)
+
     # Load base config from environment
     config = AlertConfig.from_env()
 
@@ -557,8 +572,14 @@ def main(args: Optional[list[str]] = None, now: Optional[datetime] = None) -> in
             webhook_url = DEFAULT_CONFIG.get("discord_webhook_url")
             ttl_hours = DEFAULT_CONFIG.get("notify_dedup_ttl_hours", 6)
 
+            if not webhook_url:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "--notify set but discord_webhook_url is unconfigured "
+                    "(TRADINGAGENTS_DISCORD_WEBHOOK_URL) — alert card skipped"
+                )
             # Only send for warn and critical (not ok)
-            if report.level != "ok" and webhook_url:
+            elif report.level != "ok":
                 # Dedup key from finding-type slugs (stable across time)
                 findings_str = "|".join(
                     f.finding_type or "generic" for f in report.findings

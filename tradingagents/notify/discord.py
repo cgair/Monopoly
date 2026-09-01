@@ -136,6 +136,46 @@ _TIME_HORIZON_ZH = {
     "1 month+": "1 个月以上",
 }
 
+_SIDE_ZH = {
+    "Long": "做多",
+    "Short": "做空",
+    "Flat": "观望(不开仓)",
+}
+
+_MODE_ZH = {
+    "dryrun": "dryrun — 人工下单",
+    "testnet": "testnet — 测试网自动下单",
+}
+
+# Gate rejection reasons are stable strings (risk_gate.py REASON_* — log
+# scrapers and tests grep them), so an exact-match table is safe here.
+# Unknown reasons fall back to the original English text.
+_GATE_REASON_ZH = {
+    "side=Flat — no position requested": "观望决策——未请求任何仓位",
+    "leverage missing on non-Flat decision": "非观望决策缺少杠杆",
+    "position_size_pct missing on non-Flat decision": "非观望决策缺少仓位比例",
+    "stop_loss missing on non-Flat decision": "非观望决策缺少止损",
+    "leverage exceeds configured max_leverage": "杠杆超过配置上限",
+    "leverage below 1x — not a valid futures position": "杠杆低于 1x——不是有效的合约仓位",
+    "position_size_pct exceeds configured per_trade_risk_pct": "仓位比例超过单笔风险上限",
+    "position_size_pct must be > 0": "仓位比例必须大于 0",
+    "stop_loss must be a positive price": "止损必须为正数价格",
+    "stop_loss is on the wrong side of entry": "止损在入场价的错误一侧",
+    "no reference price to validate market-order stop side": "无参考价可校验市价单止损方向",
+    "daily drawdown halt active until next UTC day": "日回撤停机生效中(至下一 UTC 日)",
+    "cooldown window active after recent stop-out": "近期止损触发,冷却期生效中",
+    "max_concurrent_positions already open": "并发持仓数已达上限",
+    "high-impact macro event inside block window": "高影响宏观事件处于封锁窗口",
+    "dangling order intent awaiting reconciliation": "存在悬置下单意图,等待对账",
+}
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
 
 def _breakdown_suffix(details: dict) -> str:
     breakdown = (details or {}).get("reason_breakdown") or {}
@@ -183,21 +223,27 @@ def render_finding_zh(
 def format_decision_card(
     symbol: str,
     direction: str,
-    leverage: float,
+    leverage: float | None,
     position_size_pct: float | None,
-    entry_price: float,
-    stop_loss: float,
-    take_profit: float,
+    entry_price: float | str | None,
+    stop_loss: float | None,
+    take_profit: float | None,
     cycle: str,
     summary: str,
     risk_gate_status: str,
     risk_gate_reason: str | None,
     executor_mode: str,
     timestamp_utc: str,
+    thesis: str | None = None,
 ) -> str:
     """Format a decision card as markdown for Discord.
-    
-    For Flat decisions (§4.1), position_size_pct can be None to omit position size.
+
+    For Flat decisions (§4.1), position_size_pct can be None to omit
+    position size. ``entry_price=None`` renders 市价 (market entry);
+    ``stop_loss``/``take_profit``/``leverage`` of None render as —
+    (absent is not the same as zero). ``thesis`` adds a 依据 section
+    with the PM's investment thesis, truncated to keep the card inside
+    one Discord message.
     """
     try:
         dt = datetime.fromisoformat(timestamp_utc.replace("Z", "+00:00"))
@@ -206,10 +252,20 @@ def format_decision_card(
         ts_display = timestamp_utc
 
     gate_emoji = "✅" if risk_gate_status == "pass" else "🛑"
-    gate_text = "通过" if risk_gate_status == "pass" else f"拒绝（{risk_gate_reason or 'unknown'}）"
+    if risk_gate_status == "pass":
+        gate_text = "通过"
+    else:
+        reason = risk_gate_reason or "unknown"
+        gate_text = f"拒绝（{_GATE_REASON_ZH.get(reason, reason)}）"
 
-    def fmt_price(p: float) -> str:
+    def fmt_price(p) -> str:
+        if p is None:
+            return "—"
         return f"{p:,.0f}" if isinstance(p, (int, float)) else str(p)
+
+    entry_display = "市价" if entry_price in (None, "market") else fmt_price(entry_price)
+    leverage_display = f"{leverage}x" if leverage is not None else "—"
+    side_display = _SIDE_ZH.get(direction, direction)
 
     lines = [
         f"🎯 **{symbol} 决策** · {ts_display}",
@@ -220,18 +276,24 @@ def format_decision_card(
     # same *100 rendering as schemas.render_futures_decision.
     if position_size_pct is not None:
         lines.append(
-            f"**方向**: {direction} ｜ **杠杆**: {leverage}x ｜ "
+            f"**方向**: {side_display} ｜ **杠杆**: {leverage_display} ｜ "
             f"**仓位**: {position_size_pct * 100:.2f}%"
         )
     else:
-        lines.append(f"**方向**: {direction} ｜ **杠杆**: {leverage}x")
+        lines.append(f"**方向**: {side_display} ｜ **杠杆**: {leverage_display}")
 
     lines.extend([
-        f"**入场**: {fmt_price(entry_price)} ｜ **止损**: {fmt_price(stop_loss)} ｜ **止盈**: {fmt_price(take_profit)}",
+        f"**入场**: {entry_display} ｜ **止损**: {fmt_price(stop_loss)} ｜ **止盈**: {fmt_price(take_profit)}",
         f"**周期**: {_TIME_HORIZON_ZH.get(cycle, cycle)}",
-        f"**摘要**: {summary}",
+        f"**摘要**: {_truncate(summary, 400)}",
+    ])
+
+    if thesis:
+        lines.append(f"**依据**: {_truncate(thesis, 700)}")
+
+    lines.extend([
         f"**Risk Gate**: {gate_emoji} {gate_text}",
-        f"**执行**: {executor_mode}",
+        f"**执行**: {_MODE_ZH.get(executor_mode, executor_mode)}",
     ])
 
     return "\n".join(lines)
@@ -341,15 +403,22 @@ def send_discord(content: str, *, webhook_url: str | None = None) -> bool:
         return False
 
 
+# Multi-chunk sends prepend a "(i/n)\n" pagination marker after splitting,
+# so raw chunks must leave room for it — Discord rejects content over
+# 2000 chars with a 400, and a full-size chunk plus marker goes over.
+_MARKER_RESERVE = 12  # "(999/999)\n" and change
+
+
 def _split_chunks(content: str, chunk_size: int = 2000) -> list[str]:
-    """Split content into chunks of at most chunk_size characters."""
+    """Split content into chunks that still fit after the pagination marker."""
     if len(content) <= chunk_size:
         return [content]
 
+    effective = max(chunk_size - _MARKER_RESERVE, 1)
     chunks = []
     while content:
-        chunks.append(content[:chunk_size])
-        content = content[chunk_size:]
+        chunks.append(content[:effective])
+        content = content[effective:]
 
     return chunks
 

@@ -504,7 +504,14 @@ class TestRunAnalysisJson:
         """cli forces EXECUTOR_MODE=dryrun (env + config) before the graph —
         and therefore the executor and mark-price venue — is constructed.
         An inherited EXECUTOR_MODE=testnet must never reach the analyze path."""
+        from tradingagents.default_config import DEFAULT_CONFIG
+
         monkeypatch.setenv("EXECUTOR_MODE", "testnet")
+        # Poison the config path too: DEFAULT_CONFIG is snapshotted from .env
+        # at import time (dryrun on this machine), so without this the
+        # config-side assertion below can never fail — the forced
+        # config["futures_executor_mode"] line must overwrite a testnet copy.
+        monkeypatch.setitem(DEFAULT_CONFIG, "futures_executor_mode", "testnet")
         captured = {}
 
         rc = self._run(monkeypatch, tmp_path, captured)

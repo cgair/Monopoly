@@ -43,7 +43,11 @@ class TradingMemoryLog:
             for line in raw.splitlines():
                 if line.startswith(f"[{trade_date} | {ticker} |") and line.endswith("| pending]"):
                     return
-        rating = parse_rating(final_trade_decision)
+        # "Unrated" (not the parser's "Hold" default) when no rating/side is
+        # parseable: a free-text fallback decision must not masquerade in the
+        # log — and in future agents' past-context lessons — as a genuine
+        # Flat/Hold call.
+        rating = parse_rating(final_trade_decision, default="Unrated")
         tag = f"[{trade_date} | {ticker} | {rating} | pending]"
         entry = f"{tag}\n\nDECISION:\n{final_trade_decision}{self._SEPARATOR}"
         with open(self._log_path, "a", encoding="utf-8") as f:

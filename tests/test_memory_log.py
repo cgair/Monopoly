@@ -163,10 +163,24 @@ class TestTradingMemoryLogCore:
         log.store_decision("AAPL", "2026-01-11", DECISION_OVERWEIGHT)
         assert log.load_entries()[0]["rating"] == "Overweight"
 
-    def test_rating_fallback_hold(self, tmp_path):
+    def test_rating_fallback_unrated(self, tmp_path):
+        """A decision with no parseable rating/side is tagged Unrated, not
+        Hold — a free-text fallback must not masquerade in future agents'
+        past-context lessons as a genuine Flat/Hold call."""
         log = make_log(tmp_path)
         log.store_decision("MSFT", "2026-01-12", DECISION_NO_RATING)
-        assert log.load_entries()[0]["rating"] == "Hold"
+        assert log.load_entries()[0]["rating"] == "Unrated"
+
+    def test_unrated_entry_round_trips_into_past_context(self, tmp_path):
+        log = make_log(tmp_path)
+        log.store_decision("MSFT", "2026-01-12", DECISION_NO_RATING)
+        log.update_with_outcome(
+            ticker="MSFT", trade_date="2026-01-12",
+            raw_return=0.08, alpha_return=0.05, holding_days=5,
+            reflection="Direction was never recorded; outcome unattributable.",
+        )
+        context = log.get_past_context("MSFT")
+        assert "| Unrated |" in context
 
     def test_rating_priority_over_prose(self, tmp_path):
         """'Rating: X' label wins even when an opposing rating word appears earlier in prose."""

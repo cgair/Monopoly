@@ -189,3 +189,32 @@ class TestTimeHorizonBuckets:
 
     def test_none_still_allowed(self):
         assert self._decision(time_horizon=None).time_horizon is None
+
+class TestCardFacingFieldLanguage:
+    """The 2026-09-04 language decision: agents reason in English, but the
+    two prose fields that reach the operator's Discord card verbatim are
+    instructed (via their schema descriptions, which the LLM sees during
+    structured output) to be Simplified Chinese. If the directive drops
+    out of a description, the card silently reverts to English prose."""
+
+    def test_card_facing_fields_instruct_chinese(self):
+        from tradingagents.agents.schemas import FuturesDecision
+
+        for name in ("executive_summary", "investment_thesis"):
+            desc = FuturesDecision.model_fields[name].description or ""
+            assert "简体中文" in desc, (
+                f"{name} lost its Simplified-Chinese directive; the Discord "
+                "card would show English prose"
+            )
+
+    def test_no_other_field_instructs_chinese(self):
+        from tradingagents.agents.schemas import FuturesDecision
+
+        for name, field in FuturesDecision.model_fields.items():
+            if name in ("executive_summary", "investment_thesis"):
+                continue
+            desc = field.description or ""
+            assert "中文" not in desc, (
+                f"{name} unexpectedly carries a Chinese directive — analysis "
+                "fields must stay English"
+            )

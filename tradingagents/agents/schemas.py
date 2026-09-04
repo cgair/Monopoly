@@ -257,15 +257,25 @@ class FuturesDecision(BaseModel):
         default=None,
         description="Optional take-profit price (quote currency).",
     )
+    # The two fields below are the only free text that reaches the
+    # operator's Discord decision card verbatim (notify/discord.py
+    # translates labels and enums, never prose). Per the 2026-09-04
+    # language decision, agents reason in English but these two fields
+    # are written in Simplified Chinese so the card needs no
+    # translation step.
     executive_summary: str = Field(
         description=(
             "Concise action plan covering entry strategy, key risk levels, and "
-            "time horizon. Two to four sentences."
+            "time horizon. Two to four sentences. Write this field in "
+            "Simplified Chinese (简体中文); it is shown to the operator "
+            "verbatim."
         ),
     )
     investment_thesis: str = Field(
         description=(
-            "Detailed reasoning anchored in evidence from the analysts' debate."
+            "Detailed reasoning anchored in evidence from the analysts' debate. "
+            "Write this field in Simplified Chinese (简体中文); it is shown "
+            "to the operator verbatim."
         ),
     )
     time_horizon: Optional[

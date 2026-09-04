@@ -23,8 +23,10 @@ RATINGS_5_TIER: Tuple[str, ...] = (
 _RATING_SET = {r.lower() for r in RATINGS_5_TIER}
 
 # Matches "Rating: X" / "rating - X" / "Rating: **X**" — tolerates markdown
-# bold wrappers and either a colon or hyphen separator.
-_RATING_LABEL_RE = re.compile(r"rating.*?[:\-][\s*]*(\w+)", re.IGNORECASE)
+# bold wrappers and either a colon or hyphen separator. The \b keeps words
+# that merely end in "rating" (accelerating, deteriorating, moderating…)
+# from being read as a rating label.
+_RATING_LABEL_RE = re.compile(r"\brating.*?[:\-][\s*]*(\w+)", re.IGNORECASE)
 
 # Crypto futures decisions render a "**Side**: Long/Short/Flat" header instead
 # of a "Rating" line (see render_futures_decision). Map those to the shared
@@ -37,22 +39,26 @@ _SIDE_TO_RATING = {"long": "Buy", "short": "Sell", "flat": "Hold"}
 def parse_rating(text: str, default: str = "Hold") -> str:
     """Heuristically extract a 5-tier rating from prose text.
 
-    Two-pass strategy:
-    1. Look for an explicit "Rating: X" label (tolerant of markdown bold).
-    2. Fall back to the first 5-tier rating word found anywhere in the text.
+    Three-pass strategy:
+    1. Look for a "**Side**: Long/Short/Flat" header. render_futures_decision
+       emits it deterministically as the first line, so when present it is
+       authoritative and must win over any label pass 2/3 might dig out of
+       the free-prose summary/thesis fields.
+    2. Look for an explicit "Rating: X" label (tolerant of markdown bold).
+    3. Fall back to the first 5-tier rating word found anywhere in the text.
 
     Returns a Title-cased rating string, or ``default`` if no rating word appears.
     """
-    for line in text.splitlines():
-        m = _RATING_LABEL_RE.search(line)
-        if m and m.group(1).lower() in _RATING_SET:
-            return m.group(1).capitalize()
-
     # Crypto-mode decisions carry a "**Side**:" header rather than "Rating".
     for line in text.splitlines():
         m = _SIDE_LABEL_RE.search(line)
         if m and m.group(1).lower() in _SIDE_TO_RATING:
             return _SIDE_TO_RATING[m.group(1).lower()]
+
+    for line in text.splitlines():
+        m = _RATING_LABEL_RE.search(line)
+        if m and m.group(1).lower() in _RATING_SET:
+            return m.group(1).capitalize()
 
     for line in text.splitlines():
         for word in line.lower().split():

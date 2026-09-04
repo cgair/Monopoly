@@ -1,11 +1,12 @@
 """Tests for the shared rating heuristic and the SignalProcessor adapter.
 
-The Portfolio Manager produces a typed PortfolioDecision via structured
-output and renders it to markdown that always contains a ``**Rating**: X``
+The Portfolio Manager produces a typed FuturesDecision via structured
+output and renders it to markdown whose first line is a ``**Side**: X``
 header.  The deterministic heuristic in ``tradingagents.agents.utils.rating``
 is therefore sufficient to extract the rating downstream — no second LLM
 call is needed — and SignalProcessor is now a thin adapter that delegates
-to it.
+to it.  The legacy ``Rating: X`` label pass survives for free-text
+fallback decisions.
 """
 
 import pytest
@@ -69,7 +70,10 @@ class TestParseRating:
         assert parse_rating("**Side**: Short\n\n**Executive Summary**: ...") == "Sell"
 
     def test_crypto_side_flat_maps_to_hold(self):
-        assert parse_rating("**Side**: Flat\n\n**Executive Summary**: ...") == "Hold"
+        # Sentinel default: proves Hold comes from the Side mapping, not
+        # from falling through to the parser's default.
+        text = "**Side**: Flat\n\n**Executive Summary**: ..."
+        assert parse_rating(text, default="Underweight") == "Hold"
 
     def test_rendered_futures_decision_shape(self):
         # The exact shape produced by render_futures_decision must parse to a
@@ -89,6 +93,35 @@ class TestParseRating:
             investment_thesis="Funding overheated; OI divergence supports the short.",
         )
         assert parse_rating(render_futures_decision(decision)) == "Sell"
+
+    def test_word_ending_in_rating_is_not_a_label(self):
+        # Regression: "decelerating - sell" used to match the Rating-label
+        # regex ("rating" is a suffix of decelerating/accelerating/
+        # deteriorating…) and override the authoritative Side header,
+        # flipping a Flat decision's rating to Sell.
+        text = (
+            "**Side**: Flat\n\n"
+            "**Executive Summary**: 资金费率过热正在降温。\n\n"
+            "**Investment Thesis**: OI is decelerating - sell pressure fading."
+        )
+        assert parse_rating(text) == "Hold"
+
+    def test_real_rating_label_wins_over_rating_suffix_word(self):
+        text = (
+            "Momentum is accelerating - sell pressure is fading.\n"
+            "Rating: Buy"
+        )
+        assert parse_rating(text) == "Buy"
+
+    def test_side_header_wins_over_rating_label_in_prose(self):
+        # The Side header is rendered deterministically by our own code;
+        # a "rating: buy" citation inside the free-prose thesis must not
+        # override it.
+        text = (
+            "**Side**: Flat\n\n"
+            "**Investment Thesis**: desks cite a consensus analyst rating: buy."
+        )
+        assert parse_rating(text) == "Hold"
 
     def test_downside_in_prose_does_not_false_match_side(self):
         # "downside"/"upside" contain "side" — the anchored regex must not

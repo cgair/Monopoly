@@ -249,6 +249,11 @@ class TestCardFixtures:
         ]
 
         actual_lines = card.split("\n")
+        # zip() alone would silently pass if trailing lines vanished
+        # (mutation check 2026-09-03 proved it) — pin the line count too.
+        assert len(actual_lines) == len(expected_lines), (
+            f"Line count mismatch: expected {len(expected_lines)}, got {len(actual_lines)}:\n{card}"
+        )
         for expected, actual in zip(expected_lines, actual_lines):
             assert expected == actual, f"Mismatch:\n  Expected: {expected}\n  Got:      {actual}"
 
@@ -416,6 +421,75 @@ class TestSendDiscordRetryMechanics:
             c.split("\n", 1)[1] if c.startswith("(") else c for c in sent
         )
         assert joined == content
+
+    def test_network_error_retries_with_backoff_then_succeeds(self):
+        """requests.RequestException (timeout/DNS — the realistic failure on
+        a home network) must retry with 2^attempt backoff, not give up on
+        the first blip. Mutation check 2026-09-03: this path had zero
+        coverage — removing the retry loop entirely left 110 tests green."""
+        import requests as requests_lib
+
+        with patch('tradingagents.notify.discord.requests.post') as mock_post:
+            with patch('tradingagents.notify.discord.time.sleep') as mock_sleep:
+                response_204 = Mock()
+                response_204.status_code = 204
+
+                mock_post.side_effect = [
+                    requests_lib.ConnectionError("dns fail"),
+                    requests_lib.Timeout("timed out"),
+                    response_204,
+                ]
+
+                result = send_discord("test", webhook_url="https://discord.com/api/webhooks/123/abc")
+
+                assert result is True
+                assert mock_post.call_count == 3
+                sleep_calls = [c[0][0] for c in mock_sleep.call_args_list]
+                assert sleep_calls == [1, 2]
+
+    def test_network_error_exhausts_retries_returns_false(self):
+        """Persistent network failure: 1 initial + 3 retries, then False."""
+        import requests as requests_lib
+
+        with patch('tradingagents.notify.discord.requests.post') as mock_post:
+            with patch('tradingagents.notify.discord.time.sleep'):
+                mock_post.side_effect = requests_lib.ConnectionError("down")
+
+                result = send_discord("test", webhook_url="https://discord.com/api/webhooks/123/abc")
+
+                assert result is False
+                assert mock_post.call_count == 4
+
+    def test_invalid_webhook_url_format_returns_false_without_posting(self):
+        """Non-Discord URL is rejected before any network call — a typo'd
+        webhook must not leak card content to an arbitrary endpoint."""
+        with patch('tradingagents.notify.discord.requests.post') as mock_post:
+            result = send_discord("test", webhook_url="https://example.com/hook")
+
+            assert result is False
+            assert mock_post.call_count == 0
+
+    def test_429_huge_retry_after_is_capped(self):
+        """A webhook under a long global limit can answer Retry-After: 3600.
+        Honouring it would hang the scheduled run for an hour with no exit
+        code and no card — sleep must be capped (OI-N1-3, 2026-09-03)."""
+        from tradingagents.notify.discord import _MAX_RETRY_AFTER_S
+
+        with patch('tradingagents.notify.discord.requests.post') as mock_post:
+            with patch('tradingagents.notify.discord.time.sleep') as mock_sleep:
+                response_429 = Mock()
+                response_429.status_code = 429
+                response_429.headers = {'Retry-After': '3600'}
+
+                response_204 = Mock()
+                response_204.status_code = 204
+
+                mock_post.side_effect = [response_429, response_204]
+
+                result = send_discord("test", webhook_url="https://discord.com/api/webhooks/123/abc")
+
+                assert result is True
+                mock_sleep.assert_called_once_with(_MAX_RETRY_AFTER_S)
 
     def test_429_with_json_body_retry_after(self):
         """429 can have retry_after in JSON body."""

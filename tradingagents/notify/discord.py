@@ -423,6 +423,10 @@ def _split_chunks(content: str, chunk_size: int = 2000) -> list[str]:
     return chunks
 
 
+# Cap on honouring a 429's server-supplied retry_after (seconds).
+_MAX_RETRY_AFTER_S = 30.0
+
+
 def _send_chunk(
     content: str,
     *,
@@ -444,6 +448,13 @@ def _send_chunk(
 
             if response.status_code == 429:
                 retry_after = _parse_retry_after(response)
+                # Server-supplied value: a webhook under a long global limit
+                # can say thousands of seconds, and honouring it would hang
+                # the scheduled run (launchd sees neither output nor exit).
+                # Better to fail visibly after capped waits than block.
+                if retry_after > _MAX_RETRY_AFTER_S:
+                    logger.warning(f"Chunk {chunk_num}/{total_chunks} retry_after {retry_after}s exceeds cap; using {_MAX_RETRY_AFTER_S}s")
+                    retry_after = _MAX_RETRY_AFTER_S
                 logger.warning(f"Chunk {chunk_num}/{total_chunks} rate limited; retry after {retry_after}s (attempt {attempt + 1}/{max_retries})")
                 if attempt < max_retries:
                     time.sleep(retry_after)

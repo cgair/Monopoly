@@ -1352,9 +1352,14 @@ def run_analysis_json(checkpoint: bool = False, notify: bool = False) -> int:
     
     Runs full analysis with automated selections and outputs JSON to stdout.
     Logs go to stderr. Execution mode is forced to dryrun.
-    
+
     Returns:
-        0 on success, 1 on error.
+        0 on success, 1 on error, 3 when --notify was requested but no
+        decision card was delivered (send failure, unconfigured webhook,
+        or no structured decision to card). In the scheduled path the
+        Discord card is the only deliverable the operator sees, so an
+        undelivered card must be distinguishable from success by the
+        scheduler — stdout JSON is identical in both cases (OI-N1-1).
     """
     import json
     import os
@@ -1447,12 +1452,30 @@ def run_analysis_json(checkpoint: bool = False, notify: bool = False) -> int:
             "rejection_reason": final_state.get("risk_gate_rejection_reason"),
         }
 
+        # A run without a structured FuturesDecision has no actionable
+        # ticket — the 5-tier "decision" above is then only parse_rating's
+        # fallback (default Hold). Reporting that as status=success would
+        # dress a degraded run up as a real 观望 decision (the operator
+        # reads Hold and stays out of the market on bad information).
+        if final_state.get("final_decision_structured") is None:
+            result["status"] = "degraded"
+            result["error"] = (
+                "no structured FuturesDecision in state — the 5-tier "
+                "rating is a text-parse fallback, not an actionable ticket"
+            )
+
         output_json(result)
-        
-        # Send Discord decision card if requested. Fail-open: a push
-        # failure must leave JSON stdout and the exit code untouched.
+
+        # Send Discord decision card if requested. A push failure must
+        # leave the JSON stdout untouched (OpenClaw reads it), but the
+        # exit code must tell the scheduler the card never arrived —
+        # exit 0 with no card reads as "no decision today" (OI-N1-1).
         if notify:
-            _push_decision_card(final_state, ticker, config["futures_executor_mode"])
+            delivered = _push_decision_card(
+                final_state, ticker, config["futures_executor_mode"]
+            )
+            if not delivered:
+                return 3
 
         return 0
         

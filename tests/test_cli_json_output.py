@@ -578,11 +578,13 @@ class TestRunAnalysisJson:
         assert result["status"] == "error"
         assert "graph exploded" in result["error"]
 
-    def test_notify_failure_leaves_stdout_and_exit_code_untouched(
+    def test_notify_failure_keeps_stdout_but_exits_3(
         self, monkeypatch, tmp_path, capsys
     ):
-        """--notify is fail-open at run level: a dead webhook must not
-        corrupt the JSON contract or the exit code."""
+        """OI-N1-1 (contract change 2026-09-04): a dead webhook must not
+        corrupt the JSON stdout (OpenClaw reads it), but the exit code
+        must be 3 so the scheduler can tell "card never arrived" from
+        success — exit 0 with no card reads as "no decision today"."""
         from tradingagents.default_config import DEFAULT_CONFIG
         import tradingagents.notify.discord as notify_discord
 
@@ -595,6 +597,178 @@ class TestRunAnalysisJson:
         rc = self._run(monkeypatch, tmp_path, captured, notify=True)
         result = json.loads(capsys.readouterr().out)
 
-        assert rc == 0
+        assert rc == 3
         assert result["status"] == "success"
         assert result["decision_structured"]["side"] == "Long"
+
+    def test_notify_success_exits_zero(self, monkeypatch, tmp_path, capsys):
+        """Delivered card → plain success exit."""
+        from tradingagents.default_config import DEFAULT_CONFIG
+        import tradingagents.notify.discord as notify_discord
+
+        monkeypatch.setitem(
+            DEFAULT_CONFIG, "discord_webhook_url",
+            "https://discord.com/api/webhooks/123/abc",
+        )
+        monkeypatch.setattr(notify_discord, "send_discord", lambda *a, **kw: True)
+        captured = {}
+        rc = self._run(monkeypatch, tmp_path, captured, notify=True)
+        result = json.loads(capsys.readouterr().out)
+
+        assert rc == 0
+        assert result["status"] == "success"
+
+    def test_no_structured_decision_reports_degraded_not_success(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """A run whose PM produced no structured FuturesDecision has no
+        actionable ticket — the 5-tier rating is parse_rating's fallback
+        (default Hold). status=success would dress the degraded run up as
+        a real 观望 decision; it must say degraded, with the reason in
+        the error field (OI-N2-2)."""
+        captured = {}
+        rc = self._run(
+            monkeypatch, tmp_path, captured,
+            final_chunk={
+                "final_trade_decision": "unstructured prose, no side header",
+                "market_report": "report text",
+            },
+        )
+        result = json.loads(capsys.readouterr().out)
+
+        assert rc == 0
+        assert result["status"] == "degraded"
+        assert "structured" in result["error"]
+        assert result["decision_structured"] == {}
+
+    def test_degraded_run_with_notify_exits_3(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """Degraded run + --notify: the card is (rightly) skipped, so the
+        scheduler must still see exit 3 — the operator got nothing."""
+        from tradingagents.default_config import DEFAULT_CONFIG
+
+        monkeypatch.setitem(
+            DEFAULT_CONFIG, "discord_webhook_url",
+            "https://discord.com/api/webhooks/123/abc",
+        )
+        captured = {}
+        rc = self._run(
+            monkeypatch, tmp_path, captured, notify=True,
+            final_chunk={
+                "final_trade_decision": "unstructured prose",
+                "market_report": "report text",
+            },
+        )
+        result = json.loads(capsys.readouterr().out)
+
+        assert rc == 3
+        assert result["status"] == "degraded"
+
+
+@pytest.mark.unit
+class TestAnalyzeJsonCommandExit:
+    """The scheduler contract lives at the *command* level: launchd runs
+    `python -m cli.main analyze_json` and sees only the process exit code.
+    Mutation check 2026-09-04: deleting the sys.exit() wrapper in the
+    analyze_json command left the entire suite green — nothing exercised
+    the typer command itself. These tests pin exit-code propagation."""
+
+    def _fake_graph_cls(self, raise_in_stream=False, final_chunk=None):
+        if final_chunk is None:
+            final_chunk = {"final_trade_decision": "**Side**: Long"}
+
+        class _Propagator:
+            def create_initial_state(self, ticker, date):
+                return {"trade_date": date}
+
+            def get_graph_args(self, callbacks=None):
+                return {"stream_mode": "values"}
+
+        class _Compiled:
+            def stream(self, init_state, **kwargs):
+                if raise_in_stream:
+                    raise RuntimeError("graph exploded")
+                yield final_chunk
+
+        class _FakeGraph:
+            def __init__(self, analysts, config=None, debug=False, callbacks=None):
+                self.propagator = _Propagator()
+                self.graph = _Compiled()
+
+            def process_signal(self, full_signal):
+                return "Buy"
+
+        return _FakeGraph
+
+    def _invoke(self, monkeypatch, tmp_path, args, **fake_kwargs):
+        from typer.testing import CliRunner
+        import cli.main as cli_main
+        import tradingagents.futures.risk_state as risk_state
+
+        monkeypatch.setattr(
+            cli_main, "TradingAgentsGraph", self._fake_graph_cls(**fake_kwargs)
+        )
+        monkeypatch.setattr(
+            risk_state, "default_state_path",
+            lambda: tmp_path / "risk_gate_state.jsonl",
+        )
+        return CliRunner().invoke(cli_main.app, args)
+
+    def test_graph_failure_exits_1_at_command_level(self, monkeypatch, tmp_path):
+        result = self._invoke(
+            monkeypatch, tmp_path, ["analyze_json"], raise_in_stream=True
+        )
+        assert result.exit_code == 1
+
+    def test_notify_undelivered_exits_3_at_command_level(
+        self, monkeypatch, tmp_path
+    ):
+        from tradingagents.default_config import DEFAULT_CONFIG
+        import tradingagents.notify.discord as notify_discord
+
+        monkeypatch.setitem(
+            DEFAULT_CONFIG, "discord_webhook_url",
+            "https://discord.com/api/webhooks/123/abc",
+        )
+        monkeypatch.setattr(notify_discord, "send_discord", lambda *a, **kw: False)
+        result = self._invoke(monkeypatch, tmp_path, ["analyze_json", "--notify"])
+        assert result.exit_code == 3
+
+    def test_success_exits_0_at_command_level(self, monkeypatch, tmp_path):
+        result = self._invoke(monkeypatch, tmp_path, ["analyze_json"])
+        assert result.exit_code == 0
+
+
+@pytest.mark.unit
+class TestCheckNotifyConfig:
+    """check_notify_config is the G1/G2 deployment preflight; it had no
+    tests at all (N2 review 2026-09-04)."""
+
+    def test_unconfigured_webhook_returns_1(self, monkeypatch):
+        from tradingagents.default_config import DEFAULT_CONFIG
+        from cli.main import check_notify_config
+
+        monkeypatch.setitem(DEFAULT_CONFIG, "discord_webhook_url", None)
+        assert check_notify_config() == 1
+
+    def test_invalid_webhook_format_returns_1(self, monkeypatch):
+        from tradingagents.default_config import DEFAULT_CONFIG
+        from cli.main import check_notify_config
+
+        monkeypatch.setitem(
+            DEFAULT_CONFIG, "discord_webhook_url", "https://example.com/hook"
+        )
+        assert check_notify_config() == 1
+
+    def test_ready_config_returns_0(self, monkeypatch, tmp_path):
+        from tradingagents.default_config import DEFAULT_CONFIG
+        from cli.main import check_notify_config
+
+        monkeypatch.setitem(
+            DEFAULT_CONFIG, "discord_webhook_url",
+            "https://discord.com/api/webhooks/123/abc",
+        )
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        assert check_notify_config() == 0
+        assert (tmp_path / ".tradingagents" / "notify_dedup.json").exists()
